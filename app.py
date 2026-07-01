@@ -5,6 +5,18 @@ import fitz
 from PIL import Image
 from io import BytesIO
 
+import streamlit.components.v1 as components
+
+from row_constructor import (
+    DEFAULT_SETTINGS,
+    apply_1c_cell_numbers,
+    build_model,
+    build_visual_map_html,
+    import_1c_cells_from_excel,
+    import_segments_from_excel,
+    normalize_segments,
+)
+
 st.set_page_config(page_title="Симулятор сборки", layout="wide")
 
 st.title("Симулятор скорости сборки")
@@ -395,12 +407,133 @@ elif page == "Карта РЦ":
 elif page == "Карта склада":
     st.header("Карта склада")
 
-    st.write("Здесь дальше будем рисовать склад по объектам: ячейки, проходы, колонны, препятствия.")
+    st.info(
+        "Карту склада теперь можно загрузить прямо здесь: сначала Excel со схемой рядов, "
+        "затем при необходимости Excel-выгрузку 1С с фактическими адресами ячеек."
+    )
 
-    if "map_objects" in st.session_state:
-        st.dataframe(st.session_state["map_objects"])
+    with st.expander("Какие колонки нужны в Excel", expanded=True):
+        st.markdown(
+            """
+            **Схема рядов:** обязательны `Ряд` и `Кол-во ячеек` / `Количество ячеек`.
+            Дополнительно: `Склад`, `Часть ряда`, `Длина ячейки мм`, `Ширина ячейки мм`,
+            `Зазор мм`, `Проезд мм`, `Поворот мм`, `Следующий ряд`, `Комментарий`.
+
+            **Выгрузка 1С:** обязательны `Ряд` и `Ячейка`.
+            Дополнительно: `Склад`, `Адрес ячейки` / `Складская ячейка`.
+            """
+        )
+
+    upload_col, one_c_col = st.columns(2)
+
+    with upload_col:
+        default_zone = st.text_input(
+            "Склад/зона для строк без колонки склада",
+            value="Карта склада",
+            key="warehouse_map_default_zone",
+        )
+        layout_file = st.file_uploader(
+            "Загрузить Excel схемы склада",
+            type=["xlsx"],
+            key="warehouse_map_layout_upload",
+        )
+        if st.button("Построить карту склада", disabled=layout_file is None):
+            try:
+                sheet_name, segments = import_segments_from_excel(
+                    layout_file,
+                    default_zone.strip() or "Карта склада",
+                )
+                st.session_state["warehouse_map_segments"] = segments
+                st.session_state["warehouse_map_layout_sheet"] = sheet_name
+                st.success(
+                    f"Схема загружена: {len(segments)} строк из листа «{sheet_name}»."
+                )
+            except Exception as exc:
+                st.error(f"Не удалось загрузить схему склада: {exc}")
+
+    with one_c_col:
+        one_c_file = st.file_uploader(
+            "Загрузить Excel выгрузки 1С",
+            type=["xlsx"],
+            key="warehouse_map_1c_upload",
+        )
+        if st.button("Применить номера из 1С", disabled=one_c_file is None):
+            try:
+                sheet_name, one_c_cells = import_1c_cells_from_excel(one_c_file)
+                st.session_state["warehouse_map_1c_cells"] = one_c_cells
+                st.session_state["warehouse_map_1c_sheet"] = sheet_name
+                st.success(
+                    f"Выгрузка 1С загружена: {len(one_c_cells)} ячеек из листа «{sheet_name}»."
+                )
+            except Exception as exc:
+                st.error(f"Не удалось загрузить выгрузку 1С: {exc}")
+
+    if "warehouse_map_segments" not in st.session_state:
+        st.warning("Загрузите Excel схемы склада в блоке выше, чтобы построить карту.")
     else:
-        st.info("Сначала загрузите файл карты склада в разделе 'Загрузка данных'.")
+        segments = st.session_state["warehouse_map_segments"]
+        one_c_cells = st.session_state.get("warehouse_map_1c_cells")
+
+        st.subheader("Загруженная схема рядов")
+        st.caption(
+            f"Лист схемы: {st.session_state.get('warehouse_map_layout_sheet', 'не указан')}"
+        )
+        st.dataframe(segments, use_container_width=True)
+
+        settings = DEFAULT_SETTINGS.copy()
+        calc_segments = normalize_segments(segments)
+        (
+            cells,
+            gaps,
+            passages,
+            transitions,
+            row_summary,
+            zone_summary,
+        ) = build_model(calc_segments, settings)
+        cells = apply_1c_cell_numbers(cells, one_c_cells)
+
+        metric1, metric2, metric3, metric4 = st.columns(4)
+        metric1.metric("Рядов", len(row_summary))
+        metric2.metric("Ячеек", len(cells))
+        metric3.metric("Проездов", len(passages))
+        metric4.metric(
+            "Маршрут, м",
+            round(float(zone_summary["total_route_m"].sum()), 1) if not zone_summary.empty else 0,
+        )
+
+        map_scale = st.slider(
+            "Масштаб отрисовки",
+            min_value=0.02,
+            max_value=0.20,
+            value=0.08,
+            step=0.01,
+            key="warehouse_map_scale",
+        )
+        components.html(
+            build_visual_map_html(cells, passages, row_summary, map_scale),
+            height=760,
+            scrolling=True,
+        )
+
+        with st.expander("Сводка по складу"):
+            st.dataframe(zone_summary, use_container_width=True)
+
+        with st.expander("Сводка по рядам"):
+            st.dataframe(row_summary, use_container_width=True)
+
+        with st.expander("Первые 1000 ячеек"):
+            st.dataframe(cells.head(1000), use_container_width=True)
+
+        if st.button("Очистить загруженную карту склада"):
+            for key in [
+                "warehouse_map_segments",
+                "warehouse_map_layout_sheet",
+                "warehouse_map_1c_cells",
+                "warehouse_map_1c_sheet",
+            ]:
+                if key in st.session_state:
+                    del st.session_state[key]
+            st.rerun()
 
 # ---------- расчет маршрутов ----------
 

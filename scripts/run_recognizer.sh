@@ -10,7 +10,15 @@ fi
 
 # shellcheck source=/dev/null
 source venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+if ! python -c "import streamlit" >/dev/null 2>&1; then
+  rm -f "venv/.deps_installed"
+fi
 
-streamlit run app.py
+if [ ! -f "venv/.deps_installed" ]; then
+  echo "Installing Python dependencies. This may take a few minutes on first launch..."
+  python -m pip install --upgrade pip
+  python -m pip install -r requirements.txt
+  printf 'ok\n' > "venv/.deps_installed"
+fi
+
+python -m streamlit run app.py --server.port 8501
