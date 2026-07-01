@@ -61,14 +61,14 @@ def render_virtual_warehouse_excel(show_header=True):
     if show_header:
         st.header("Виртуальный склад по Excel-схеме")
     st.caption(
-        "Минимальная версия читает все листы .xlsx, ищет подписи рядов на визуальной схеме, "
-        "создаёт ячейки первого яруса, импортирует адреса/размещение и показывает диагностику."
+        "Упрощённый режим читает все листы .xlsx и сначала строит ячейки по цветной "
+        "заливке в Excel. Табличные колонки row_number/pallet_count для этого режима не нужны."
     )
 
     with st.expander("Форматы файлов", expanded=True):
         st.markdown(
             """
-            **Схема склада:** любой `.xlsx` с визуальной схемой. Обрабатываются все листы.
+            **Схема склада:** любой `.xlsx` с визуальной схемой. Если ячейки на схеме закрашены цветом, каждая цветная Excel-ячейка станет виртуальной ячейкой склада. Обрабатываются все листы.
 
             **Файл ячеек, опционально:** колонки `cell`/`ячейка`, `row`/`ряд`, `tier`/`ярус`
             или полная колонка `address`/`адрес` в формате `ячейка-ряд-ярус`.
@@ -95,7 +95,7 @@ def render_virtual_warehouse_excel(show_header=True):
         key="virtual_warehouse_placements_upload",
     )
 
-    if st.button("Построить виртуальный склад", disabled=schema_file is None):
+    if st.button("Построить склад по цветам Excel", disabled=schema_file is None):
         diagnostics = []
         try:
             model = parse_warehouse_excel(schema_file)
@@ -597,7 +597,25 @@ elif page == "Карта склада":
                     f"Схема загружена: {len(segments)} строк из листа «{sheet_name}»."
                 )
             except Exception as exc:
-                st.error(f"Не удалось загрузить схему склада: {exc}")
+                try:
+                    layout_file.seek(0)
+                    model = parse_warehouse_excel(layout_file)
+                    st.session_state["virtual_warehouse_model"] = model
+                    st.session_state["virtual_warehouse_diagnostics"] = [
+                        {
+                            "level": "warning",
+                            "message": (
+                                "Файл не похож на табличную схему рядов, поэтому он открыт "
+                                "в упрощённом режиме по цветной Excel-разметке."
+                            ),
+                        }
+                    ]
+                    st.warning(
+                        "Табличные колонки `Ряд` и `Кол-во ячеек` не найдены. "
+                        "Я построил склад по цветным ячейкам Excel в блоке выше."
+                    )
+                except Exception as fallback_exc:
+                    st.error(f"Не удалось загрузить схему склада: {exc}. Упрощённый режим тоже не сработал: {fallback_exc}")
 
     with one_c_col:
         one_c_file = st.file_uploader(

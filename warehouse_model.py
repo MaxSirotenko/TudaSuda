@@ -14,6 +14,8 @@ class WarehouseCell:
     height: int = 1
     source: str = "auto"
     item: str = ""
+    fill_color: str = ""
+    value: str = ""
     warnings: list[str] = field(default_factory=list)
 
 @dataclass
