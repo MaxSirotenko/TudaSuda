@@ -1,13 +1,13 @@
-from collections import Counter
+﻿from collections import Counter
 import pandas as pd
 from warehouse_addressing import FIRST_TIER, normalize_address
 from row_constructor import find_column
 
-CELL_ALIASES = ["cell", "ячейка", "номер ячейки", "место"]
-ROW_ALIASES = ["row", "ряд", "номер ряда", "№ ряда"]
-TIER_ALIASES = ["tier", "ярус", "level", "уровень"]
-ADDRESS_ALIASES = ["address", "адрес", "адрес ячейки", "складская ячейка"]
-ITEM_ALIASES = ["item", "товар", "номенклатура", "product", "sku"]
+CELL_ALIASES = ["cell", "СЏС‡РµР№РєР°", "РЅРѕРјРµСЂ СЏС‡РµР№РєРё", "РјРµСЃС‚Рѕ"]
+ROW_ALIASES = ["row", "СЂСЏРґ", "РЅРѕРјРµСЂ СЂСЏРґР°", "в„– СЂСЏРґР°"]
+TIER_ALIASES = ["tier", "СЏСЂСѓСЃ", "level", "СѓСЂРѕРІРµРЅСЊ"]
+ADDRESS_ALIASES = ["address", "Р°РґСЂРµСЃ", "Р°РґСЂРµСЃ СЏС‡РµР№РєРё", "СЃРєР»Р°РґСЃРєР°СЏ СЏС‡РµР№РєР°"]
+ITEM_ALIASES = ["item", "С‚РѕРІР°СЂ", "РЅРѕРјРµРЅРєР»Р°С‚СѓСЂР°", "product", "sku"]
 
 
 def _read_table(file_obj):
@@ -27,7 +27,7 @@ def _read_table(file_obj):
 def import_cell_addresses(file_obj):
     df = _read_table(file_obj)
     if df.empty:
-        return {}, [{"level": "error", "message": "Файл адресов пуст."}]
+        return {}, [{"level": "error", "message": "Р¤Р°Р№Р» Р°РґСЂРµСЃРѕРІ РїСѓСЃС‚."}]
     mapping = {
         "cell": find_column(df.columns, CELL_ALIASES),
         "row": find_column(df.columns, ROW_ALIASES),
@@ -51,7 +51,7 @@ def import_cell_addresses(file_obj):
 def import_placements(file_obj):
     df = _read_table(file_obj)
     if df.empty:
-        return [], [{"level": "error", "message": "Файл размещения пуст."}]
+        return [], [{"level": "error", "message": "Р¤Р°Р№Р» СЂР°Р·РјРµС‰РµРЅРёСЏ РїСѓСЃС‚."}]
     mapping = {
         "cell": find_column(df.columns, CELL_ALIASES),
         "row": find_column(df.columns, ROW_ALIASES),
@@ -70,10 +70,10 @@ def import_placements(file_obj):
         )
         diagnostics.extend({"level": "warning", "message": w, "line": str(line_no + 2)} for w in warnings)
         if not item:
-            diagnostics.append({"level": "warning", "message": "Адрес найден, но товар не указан.", "line": str(line_no + 2)})
+            diagnostics.append({"level": "warning", "message": "РђРґСЂРµСЃ РЅР°Р№РґРµРЅ, РЅРѕ С‚РѕРІР°СЂ РЅРµ СѓРєР°Р·Р°РЅ.", "line": str(line_no + 2)})
         if addr is None:
             if item:
-                diagnostics.append({"level": "error", "message": f"Товар '{item}' указан без корректного адреса.", "line": str(line_no + 2)})
+                diagnostics.append({"level": "error", "message": f"РўРѕРІР°СЂ '{item}' СѓРєР°Р·Р°РЅ Р±РµР· РєРѕСЂСЂРµРєС‚РЅРѕРіРѕ Р°РґСЂРµСЃР°.", "line": str(line_no + 2)})
             continue
         if addr.tier_number != FIRST_TIER:
             continue
@@ -81,7 +81,7 @@ def import_placements(file_obj):
     counts = Counter(p["address"] for p in placements)
     for address, count in counts.items():
         if count > 1:
-            diagnostics.append({"level": "warning", "message": f"Дубль адреса {address}: {count} записей; будет показан список товаров."})
+            diagnostics.append({"level": "warning", "message": f"Р”СѓР±Р»СЊ Р°РґСЂРµСЃР° {address}: {count} Р·Р°РїРёСЃРµР№; Р±СѓРґРµС‚ РїРѕРєР°Р·Р°РЅ СЃРїРёСЃРѕРє С‚РѕРІР°СЂРѕРІ."})
     return placements, diagnostics
 
 
@@ -98,7 +98,7 @@ def apply_cell_addresses(model, addresses_by_row):
                 cell.address = addr.address
                 cell.source = "imported_cells"
             if len(imported) != len(row.potential_cells):
-                diagnostics.append({"level": "warning", "message": f"Ряд {row.row_number} листа '{sheet.name}': импортировано {len(imported)} адресов, а на схеме создано {len(row.potential_cells)} ячеек."})
+                diagnostics.append({"level": "warning", "message": f"Р СЏРґ {row.row_number} Р»РёСЃС‚Р° '{sheet.name}': РёРјРїРѕСЂС‚РёСЂРѕРІР°РЅРѕ {len(imported)} Р°РґСЂРµСЃРѕРІ, Р° РЅР° СЃС…РµРјРµ СЃРѕР·РґР°РЅРѕ {len(row.potential_cells)} СЏС‡РµРµРє."})
     return diagnostics
 
 
@@ -108,16 +108,16 @@ def apply_placements(model, placements):
     by_addr = {}
     for placement in placements:
         if placement["address"] not in index:
-            diagnostics.append({"level": "error", "message": f"Адрес {placement['address']} есть в размещении, но не найден на схеме."})
+            diagnostics.append({"level": "error", "message": f"РђРґСЂРµСЃ {placement['address']} РµСЃС‚СЊ РІ СЂР°Р·РјРµС‰РµРЅРёРё, РЅРѕ РЅРµ РЅР°Р№РґРµРЅ РЅР° СЃС…РµРјРµ."})
             continue
         by_addr.setdefault(placement["address"], []).append(placement["item"])
     for address, items in by_addr.items():
         cell = index[address]
         cell.item = "; ".join(item for item in items if item)
         if len([i for i in items if i]) > 1:
-            cell.warnings.append("Несколько товаров в одной ячейке.")
-            diagnostics.append({"level": "warning", "message": f"В ячейке {address} несколько товаров: {cell.item}."})
+            cell.warnings.append("РќРµСЃРєРѕР»СЊРєРѕ С‚РѕРІР°СЂРѕРІ РІ РѕРґРЅРѕР№ СЏС‡РµР№РєРµ.")
+            diagnostics.append({"level": "warning", "message": f"Р’ СЏС‡РµР№РєРµ {address} РЅРµСЃРєРѕР»СЊРєРѕ С‚РѕРІР°СЂРѕРІ: {cell.item}."})
     for address, cell in index.items():
         if not cell.item:
-            diagnostics.append({"level": "info", "message": f"Адрес {address} найден на схеме, но товара в файле нет."})
+            diagnostics.append({"level": "info", "message": f"РђРґСЂРµСЃ {address} РЅР°Р№РґРµРЅ РЅР° СЃС…РµРјРµ, РЅРѕ С‚РѕРІР°СЂР° РІ С„Р°Р№Р»Рµ РЅРµС‚."})
     return diagnostics

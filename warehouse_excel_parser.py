@@ -1,9 +1,9 @@
-import re
+﻿import re
 from openpyxl import load_workbook
 from warehouse_addressing import FIRST_TIER
 from warehouse_model import WarehouseCell, WarehouseModel, WarehouseRow, WarehouseSheet
 
-ROW_LABEL_RE = re.compile(r"(?:^|\b)(?:ряд\s*)?(\d{1,4}|[A-Za-zА-Яа-яЁё]{1,3}\d{0,3})(?:\b|$)", re.IGNORECASE)
+ROW_LABEL_RE = re.compile(r"(?:^|\b)(?:СЂСЏРґ\s*)?(\d{1,4}|[A-Za-zРђ-РЇР°-СЏРЃС‘]{1,3}\d{0,3})(?:\b|$)", re.IGNORECASE)
 
 
 def _text(value) -> str:
@@ -34,9 +34,8 @@ def _fill_color(cell) -> str:
 def _is_painted_cell(cell) -> bool:
     return bool(_fill_color(cell))
 
-=======
 def _row_number(label: str) -> str:
-    match = ROW_LABEL_RE.search(label.replace("№", ""))
+    match = ROW_LABEL_RE.search(label.replace("в„–", ""))
     return match.group(1) if match else label.strip()
 
 
@@ -45,7 +44,7 @@ def _looks_like_row_label(text: str) -> bool:
     if not clean or len(clean) > 30:
         return False
     low = clean.lower()
-    return "ряд" in low or bool(re.fullmatch(r"\d{1,4}|[A-Za-zА-Яа-яЁё]{1,3}\d{0,3}", clean))
+    return "СЂСЏРґ" in low or bool(re.fullmatch(r"\d{1,4}|[A-Za-zРђ-РЇР°-СЏРЃС‘]{1,3}\d{0,3}", clean))
 
 
 def _find_extent(ws, r: int, c: int) -> tuple[int, int, int, int, str, float, list[str]]:
@@ -68,7 +67,7 @@ def _find_extent(ws, r: int, c: int) -> tuple[int, int, int, int, str, float, li
         min_col, max_col = c, c
     confidence = 0.75 if max(horizontal_span, vertical_span) >= 3 else 0.45
     if confidence < 0.6:
-        warnings.append("Ряд найден по подписи, но область ячеек рядом с подписью определена сомнительно.")
+        warnings.append("Р СЏРґ РЅР°Р№РґРµРЅ РїРѕ РїРѕРґРїРёСЃРё, РЅРѕ РѕР±Р»Р°СЃС‚СЊ СЏС‡РµРµРє СЂСЏРґРѕРј СЃ РїРѕРґРїРёСЃСЊСЋ РѕРїСЂРµРґРµР»РµРЅР° СЃРѕРјРЅРёС‚РµР»СЊРЅРѕ.")
     return min_row, min_col, max_row, max_col, direction, confidence, warnings
 
 
@@ -136,7 +135,7 @@ def parse_warehouse_excel(file_obj) -> WarehouseModel:
                         )
                     )
                 sheet.rows.append(wh_row)
-            sheet.warnings.append("Ячейки построены по заливкам Excel; табличные колонки row_number/pallet_count не требуются.")
+            sheet.warnings.append("РЇС‡РµР№РєРё РїРѕСЃС‚СЂРѕРµРЅС‹ РїРѕ Р·Р°Р»РёРІРєР°Рј Excel; С‚Р°Р±Р»РёС‡РЅС‹Рµ РєРѕР»РѕРЅРєРё row_number/pallet_count РЅРµ С‚СЂРµР±СѓСЋС‚СЃСЏ.")
         else:
             seen = set()
             for r, c, label in labels:
@@ -153,11 +152,10 @@ def parse_warehouse_excel(file_obj) -> WarehouseModel:
                         y = min_row if direction == "left_to_right" else min_row + idx - 1
                         wh_row.potential_cells.append(WarehouseCell(ws.title, row_number, str(idx), FIRST_TIER, f"{idx}-{row_number}-{FIRST_TIER}", x, y))
                 else:
-                    sheet.warnings.append(f"Ряд '{label}' на {r}:{c} не получил автоматические ячейки из-за низкой уверенности.")
+                    sheet.warnings.append(f"Р СЏРґ '{label}' РЅР° {r}:{c} РЅРµ РїРѕР»СѓС‡РёР» Р°РІС‚РѕРјР°С‚РёС‡РµСЃРєРёРµ СЏС‡РµР№РєРё РёР·-Р·Р° РЅРёР·РєРѕР№ СѓРІРµСЂРµРЅРЅРѕСЃС‚Рё.")
                 sheet.rows.append(wh_row)
             if not sheet.rows:
-                sheet.warnings.append("На листе не найдены цветные ячейки или уверенные текстовые подписи рядов.")
-=======
+                sheet.warnings.append("РќР° Р»РёСЃС‚Рµ РЅРµ РЅР°Р№РґРµРЅС‹ С†РІРµС‚РЅС‹Рµ СЏС‡РµР№РєРё РёР»Рё СѓРІРµСЂРµРЅРЅС‹Рµ С‚РµРєСЃС‚РѕРІС‹Рµ РїРѕРґРїРёСЃРё СЂСЏРґРѕРІ.")
         seen = set()
         for r, c, label in labels:
             row_number = _row_number(label)
@@ -173,10 +171,10 @@ def parse_warehouse_excel(file_obj) -> WarehouseModel:
                     y = min_row if direction == "left_to_right" else min_row + idx - 1
                     wh_row.potential_cells.append(WarehouseCell(ws.title, row_number, str(idx), FIRST_TIER, f"{idx}-{row_number}-{FIRST_TIER}", x, y))
             else:
-                sheet.warnings.append(f"Ряд '{label}' на {r}:{c} не получил автоматические ячейки из-за низкой уверенности.")
+                sheet.warnings.append(f"Р СЏРґ '{label}' РЅР° {r}:{c} РЅРµ РїРѕР»СѓС‡РёР» Р°РІС‚РѕРјР°С‚РёС‡РµСЃРєРёРµ СЏС‡РµР№РєРё РёР·-Р·Р° РЅРёР·РєРѕР№ СѓРІРµСЂРµРЅРЅРѕСЃС‚Рё.")
             sheet.rows.append(wh_row)
         if not sheet.rows:
-            sheet.warnings.append("На листе не найдены уверенные текстовые подписи рядов.")
+            sheet.warnings.append("РќР° Р»РёСЃС‚Рµ РЅРµ РЅР°Р№РґРµРЅС‹ СѓРІРµСЂРµРЅРЅС‹Рµ С‚РµРєСЃС‚РѕРІС‹Рµ РїРѕРґРїРёСЃРё СЂСЏРґРѕРІ.")
 
         model.sheets.append(sheet)
     return model

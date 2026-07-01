@@ -1,4 +1,4 @@
-from streamlit_image_coordinates import streamlit_image_coordinates
+﻿from streamlit_image_coordinates import streamlit_image_coordinates
 import streamlit as st
 import pandas as pd
 import fitz
@@ -27,11 +27,11 @@ from row_constructor import (
     normalize_segments,
 )
 
-st.set_page_config(page_title="Симулятор сборки", layout="wide")
+st.set_page_config(page_title="РЎРёРјСѓР»СЏС‚РѕСЂ СЃР±РѕСЂРєРё", layout="wide")
 
-st.title("Симулятор скорости сборки")
+st.title("РЎРёРјСѓР»СЏС‚РѕСЂ СЃРєРѕСЂРѕСЃС‚Рё СЃР±РѕСЂРєРё")
 
-# ---------- функции ----------
+# ---------- С„СѓРЅРєС†РёРё ----------
 
 def make_excel_file(sheets: dict):
     output = BytesIO()
@@ -59,43 +59,43 @@ def download_excel_button(label, sheets, file_name):
 
 def render_virtual_warehouse_excel(show_header=True):
     if show_header:
-        st.header("Виртуальный склад по Excel-схеме")
+        st.header("Р’РёСЂС‚СѓР°Р»СЊРЅС‹Р№ СЃРєР»Р°Рґ РїРѕ Excel-СЃС…РµРјРµ")
     st.caption(
-        "Упрощённый режим читает все листы .xlsx и сначала строит ячейки по цветной "
-        "заливке в Excel. Табличные колонки row_number/pallet_count для этого режима не нужны."
+        "РЈРїСЂРѕС‰С‘РЅРЅС‹Р№ СЂРµР¶РёРј С‡РёС‚Р°РµС‚ РІСЃРµ Р»РёСЃС‚С‹ .xlsx Рё СЃРЅР°С‡Р°Р»Р° СЃС‚СЂРѕРёС‚ СЏС‡РµР№РєРё РїРѕ С†РІРµС‚РЅРѕР№ "
+        "Р·Р°Р»РёРІРєРµ РІ Excel. РўР°Р±Р»РёС‡РЅС‹Рµ РєРѕР»РѕРЅРєРё row_number/pallet_count РґР»СЏ СЌС‚РѕРіРѕ СЂРµР¶РёРјР° РЅРµ РЅСѓР¶РЅС‹."
     )
 
-    with st.expander("Форматы файлов", expanded=True):
+    with st.expander("Р¤РѕСЂРјР°С‚С‹ С„Р°Р№Р»РѕРІ", expanded=True):
         st.markdown(
             """
-            **Схема склада:** любой `.xlsx` с визуальной схемой. Если ячейки на схеме закрашены цветом, каждая цветная Excel-ячейка станет виртуальной ячейкой склада. Обрабатываются все листы.
+            **РЎС…РµРјР° СЃРєР»Р°РґР°:** Р»СЋР±РѕР№ `.xlsx` СЃ РІРёР·СѓР°Р»СЊРЅРѕР№ СЃС…РµРјРѕР№. Р•СЃР»Рё СЏС‡РµР№РєРё РЅР° СЃС…РµРјРµ Р·Р°РєСЂР°С€РµРЅС‹ С†РІРµС‚РѕРј, РєР°Р¶РґР°СЏ С†РІРµС‚РЅР°СЏ Excel-СЏС‡РµР№РєР° СЃС‚Р°РЅРµС‚ РІРёСЂС‚СѓР°Р»СЊРЅРѕР№ СЏС‡РµР№РєРѕР№ СЃРєР»Р°РґР°. РћР±СЂР°Р±Р°С‚С‹РІР°СЋС‚СЃСЏ РІСЃРµ Р»РёСЃС‚С‹.
 
-            **Файл ячеек, опционально:** колонки `cell`/`ячейка`, `row`/`ряд`, `tier`/`ярус`
-            или полная колонка `address`/`адрес` в формате `ячейка-ряд-ярус`.
+            **Р¤Р°Р№Р» СЏС‡РµРµРє, РѕРїС†РёРѕРЅР°Р»СЊРЅРѕ:** РєРѕР»РѕРЅРєРё `cell`/`СЏС‡РµР№РєР°`, `row`/`СЂСЏРґ`, `tier`/`СЏСЂСѓСЃ`
+            РёР»Рё РїРѕР»РЅР°СЏ РєРѕР»РѕРЅРєР° `address`/`Р°РґСЂРµСЃ` РІ С„РѕСЂРјР°С‚Рµ `СЏС‡РµР№РєР°-СЂСЏРґ-СЏСЂСѓСЃ`.
 
-            **Файл размещения, опционально:** `address`/`адрес` + `item`/`товар`/`номенклатура`
-            или раздельные колонки `cell`, `row`, `tier`, `item`.
-            На этом этапе используются только адреса первого яруса; отсутствие яруса считается первым ярусом и попадает в диагностику.
+            **Р¤Р°Р№Р» СЂР°Р·РјРµС‰РµРЅРёСЏ, РѕРїС†РёРѕРЅР°Р»СЊРЅРѕ:** `address`/`Р°РґСЂРµСЃ` + `item`/`С‚РѕРІР°СЂ`/`РЅРѕРјРµРЅРєР»Р°С‚СѓСЂР°`
+            РёР»Рё СЂР°Р·РґРµР»СЊРЅС‹Рµ РєРѕР»РѕРЅРєРё `cell`, `row`, `tier`, `item`.
+            РќР° СЌС‚РѕРј СЌС‚Р°РїРµ РёСЃРїРѕР»СЊР·СѓСЋС‚СЃСЏ С‚РѕР»СЊРєРѕ Р°РґСЂРµСЃР° РїРµСЂРІРѕРіРѕ СЏСЂСѓСЃР°; РѕС‚СЃСѓС‚СЃС‚РІРёРµ СЏСЂСѓСЃР° СЃС‡РёС‚Р°РµС‚СЃСЏ РїРµСЂРІС‹Рј СЏСЂСѓСЃРѕРј Рё РїРѕРїР°РґР°РµС‚ РІ РґРёР°РіРЅРѕСЃС‚РёРєСѓ.
             """
         )
 
     schema_file = st.file_uploader(
-        "Excel-схема склада",
+        "Excel-СЃС…РµРјР° СЃРєР»Р°РґР°",
         type=["xlsx"],
         key="virtual_warehouse_schema_upload",
     )
     cell_file = st.file_uploader(
-        "Файл номеров ячеек (необязательно)",
+        "Р¤Р°Р№Р» РЅРѕРјРµСЂРѕРІ СЏС‡РµРµРє (РЅРµРѕР±СЏР·Р°С‚РµР»СЊРЅРѕ)",
         type=["xlsx", "csv"],
         key="virtual_warehouse_cells_upload",
     )
     placement_file = st.file_uploader(
-        "Файл размещения товаров (необязательно)",
+        "Р¤Р°Р№Р» СЂР°Р·РјРµС‰РµРЅРёСЏ С‚РѕРІР°СЂРѕРІ (РЅРµРѕР±СЏР·Р°С‚РµР»СЊРЅРѕ)",
         type=["xlsx", "csv"],
         key="virtual_warehouse_placements_upload",
     )
 
-    if st.button("Построить склад по цветам Excel", disabled=schema_file is None):
+    if st.button("РџРѕСЃС‚СЂРѕРёС‚СЊ СЃРєР»Р°Рґ РїРѕ С†РІРµС‚Р°Рј Excel", disabled=schema_file is None):
         diagnostics = []
         try:
             model = parse_warehouse_excel(schema_file)
@@ -109,28 +109,28 @@ def render_virtual_warehouse_excel(show_header=True):
                 diagnostics.extend(apply_placements(model, placements))
             st.session_state["virtual_warehouse_model"] = model
             st.session_state["virtual_warehouse_diagnostics"] = diagnostics
-            st.success(f"Виртуальный склад построен: {len(model.sheets)} листов, {len(model.cells)} ячеек.")
+            st.success(f"Р’РёСЂС‚СѓР°Р»СЊРЅС‹Р№ СЃРєР»Р°Рґ РїРѕСЃС‚СЂРѕРµРЅ: {len(model.sheets)} Р»РёСЃС‚РѕРІ, {len(model.cells)} СЏС‡РµРµРє.")
         except Exception as exc:
-            st.error(f"Не удалось построить виртуальный склад: {exc}")
+            st.error(f"РќРµ СѓРґР°Р»РѕСЃСЊ РїРѕСЃС‚СЂРѕРёС‚СЊ РІРёСЂС‚СѓР°Р»СЊРЅС‹Р№ СЃРєР»Р°Рґ: {exc}")
 
     model = st.session_state.get("virtual_warehouse_model")
     if model is None:
-        st.info("Загрузите Excel-схему склада и нажмите кнопку построения.")
+        st.info("Р—Р°РіСЂСѓР·РёС‚Рµ Excel-СЃС…РµРјСѓ СЃРєР»Р°РґР° Рё РЅР°Р¶РјРёС‚Рµ РєРЅРѕРїРєСѓ РїРѕСЃС‚СЂРѕРµРЅРёСЏ.")
     else:
         diagnostics = st.session_state.get("virtual_warehouse_diagnostics", [])
         sheet_names = [sheet.name for sheet in model.sheets]
-        selected_sheet_name = st.selectbox("Лист склада", sheet_names, key="virtual_warehouse_sheet_select")
+        selected_sheet_name = st.selectbox("Р›РёСЃС‚ СЃРєР»Р°РґР°", sheet_names, key="virtual_warehouse_sheet_select")
         selected_sheet = next(sheet for sheet in model.sheets if sheet.name == selected_sheet_name)
 
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Листов", len(model.sheets))
-        m2.metric("Рядов на листе", len(selected_sheet.rows))
-        m3.metric("Ячеек всего", len(model.cells))
-        m4.metric("Товаров размещено", sum(1 for cell in model.cells if cell.item))
+        m1.metric("Р›РёСЃС‚РѕРІ", len(model.sheets))
+        m2.metric("Р СЏРґРѕРІ РЅР° Р»РёСЃС‚Рµ", len(selected_sheet.rows))
+        m3.metric("РЇС‡РµРµРє РІСЃРµРіРѕ", len(model.cells))
+        m4.metric("РўРѕРІР°СЂРѕРІ СЂР°Р·РјРµС‰РµРЅРѕ", sum(1 for cell in model.cells if cell.item))
 
-        tab_map, tab_rows, tab_cells, tab_diag = st.tabs(["Визуализация", "Ряды", "Ячейки", "Диагностика"])
+        tab_map, tab_rows, tab_cells, tab_diag = st.tabs(["Р’РёР·СѓР°Р»РёР·Р°С†РёСЏ", "Р СЏРґС‹", "РЇС‡РµР№РєРё", "Р”РёР°РіРЅРѕСЃС‚РёРєР°"])
         with tab_map:
-            scale = st.slider("Масштаб сетки", min_value=18, max_value=60, value=34, step=2)
+            scale = st.slider("РњР°СЃС€С‚Р°Р± СЃРµС‚РєРё", min_value=18, max_value=60, value=34, step=2)
             components.html(build_virtual_warehouse_html(selected_sheet, scale), height=760, scrolling=True)
         with tab_rows:
             st.dataframe(
@@ -172,50 +172,50 @@ def render_virtual_warehouse_excel(show_header=True):
             diag_df = pd.DataFrame(build_diagnostics(model, diagnostics))
             st.dataframe(diag_df, use_container_width=True)
             st.download_button(
-                "Скачать диагностику CSV",
+                "РЎРєР°С‡Р°С‚СЊ РґРёР°РіРЅРѕСЃС‚РёРєСѓ CSV",
                 diag_df.to_csv(index=False).encode("utf-8-sig"),
                 file_name="virtual_warehouse_diagnostics.csv",
                 mime="text/csv",
             )
 
-        if st.button("Очистить виртуальный склад"):
+        if st.button("РћС‡РёСЃС‚РёС‚СЊ РІРёСЂС‚СѓР°Р»СЊРЅС‹Р№ СЃРєР»Р°Рґ"):
             for key in ["virtual_warehouse_model", "virtual_warehouse_diagnostics"]:
                 st.session_state.pop(key, None)
             st.rerun()
 
-# ---------- меню ----------
+# ---------- РјРµРЅСЋ ----------
 
-st.sidebar.header("Разделы")
+st.sidebar.header("Р Р°Р·РґРµР»С‹")
 
 page = st.sidebar.radio(
-    "Выберите раздел",
+    "Р’С‹Р±РµСЂРёС‚Рµ СЂР°Р·РґРµР»",
     [
-    "Шаблоны файлов",
-    "Загрузка данных",
-    "Карта РЦ",
-    "Карта склада",
-    "Виртуальный склад Excel",
-    "Расчет маршрутов"
+    "РЁР°Р±Р»РѕРЅС‹ С„Р°Р№Р»РѕРІ",
+    "Р—Р°РіСЂСѓР·РєР° РґР°РЅРЅС‹С…",
+    "РљР°СЂС‚Р° Р Р¦",
+    "РљР°СЂС‚Р° СЃРєР»Р°РґР°",
+    "Р’РёСЂС‚СѓР°Р»СЊРЅС‹Р№ СЃРєР»Р°Рґ Excel",
+    "Р Р°СЃС‡РµС‚ РјР°СЂС€СЂСѓС‚РѕРІ"
 ]
 )
 
-# ---------- шаблоны ----------
+# ---------- С€Р°Р±Р»РѕРЅС‹ ----------
 
-if page == "Шаблоны файлов":
-    st.header("Шаблоны Excel-файлов")
+if page == "РЁР°Р±Р»РѕРЅС‹ С„Р°Р№Р»РѕРІ":
+    st.header("РЁР°Р±Р»РѕРЅС‹ Excel-С„Р°Р№Р»РѕРІ")
 
-    st.write("Скачай шаблоны, заполни их своими данными и потом загрузи в приложение.")
+    st.write("РЎРєР°С‡Р°Р№ С€Р°Р±Р»РѕРЅС‹, Р·Р°РїРѕР»РЅРё РёС… СЃРІРѕРёРјРё РґР°РЅРЅС‹РјРё Рё РїРѕС‚РѕРј Р·Р°РіСЂСѓР·Рё РІ РїСЂРёР»РѕР¶РµРЅРёРµ.")
 
-    # 1. Шаблон складов
+    # 1. РЁР°Р±Р»РѕРЅ СЃРєР»Р°РґРѕРІ
     warehouses_df = pd.DataFrame({
         "warehouse_id": ["veshki_day", "veshki_night"],
-        "warehouse_name": ["Дневной Вешки", "Ночной Вешки"],
+        "warehouse_name": ["Р”РЅРµРІРЅРѕР№ Р’РµС€РєРё", "РќРѕС‡РЅРѕР№ Р’РµС€РєРё"],
         "width_mm": [80000, 80000],
         "height_mm": [50000, 50000],
-        "comment": ["Основной дневной склад", "Пример второго склада"]
+        "comment": ["РћСЃРЅРѕРІРЅРѕР№ РґРЅРµРІРЅРѕР№ СЃРєР»Р°Рґ", "РџСЂРёРјРµСЂ РІС‚РѕСЂРѕРіРѕ СЃРєР»Р°РґР°"]
     })
 
-    # 2. Шаблон объектов карты
+    # 2. РЁР°Р±Р»РѕРЅ РѕР±СЉРµРєС‚РѕРІ РєР°СЂС‚С‹
     map_objects_df = pd.DataFrame({
         "warehouse_id": [
             "veshki_day",
@@ -247,27 +247,27 @@ if page == "Шаблоны файлов":
         "level_num": [1, 1, 1, None, None],
         "side": ["left", "left", "left", None, None],
         "comment": [
-            "Ячейка хранения",
-            "Ячейка хранения",
-            "Ячейка хранения",
-            "Проход",
-            "Колонна"
+            "РЇС‡РµР№РєР° С…СЂР°РЅРµРЅРёСЏ",
+            "РЇС‡РµР№РєР° С…СЂР°РЅРµРЅРёСЏ",
+            "РЇС‡РµР№РєР° С…СЂР°РЅРµРЅРёСЏ",
+            "РџСЂРѕС…РѕРґ",
+            "РљРѕР»РѕРЅРЅР°"
         ]
     })
 
-    # 3. Шаблон расходников
+    # 3. РЁР°Р±Р»РѕРЅ СЂР°СЃС…РѕРґРЅРёРєРѕРІ
     orders_df = pd.DataFrame({
         "period": ["09.06.2026 6:12:16", "09.06.2026 6:12:16"],
-        "warehouse_name": ["Дневной Вешки", "Дневной Вешки"],
+        "warehouse_name": ["Р”РЅРµРІРЅРѕР№ Р’РµС€РєРё", "Р”РЅРµРІРЅРѕР№ Р’РµС€РєРё"],
         "order_id": [
-            "Расходный ордер В20539431",
-            "Расходный ордер В20539431"
+            "Р Р°СЃС…РѕРґРЅС‹Р№ РѕСЂРґРµСЂ Р’20539431",
+            "Р Р°СЃС…РѕРґРЅС‹Р№ РѕСЂРґРµСЂ Р’20539431"
         ],
         "nomenclature": [
-            "Пиво Бельгийское безалкогольное, 500 мл",
-            "Вода родниковая газированная, 1,5 л"
+            "РџРёРІРѕ Р‘РµР»СЊРіРёР№СЃРєРѕРµ Р±РµР·Р°Р»РєРѕРіРѕР»СЊРЅРѕРµ, 500 РјР»",
+            "Р’РѕРґР° СЂРѕРґРЅРёРєРѕРІР°СЏ РіР°Р·РёСЂРѕРІР°РЅРЅР°СЏ, 1,5 Р»"
         ],
-        "characteristic": ["ВАРНИЦА ООО", "СВЕТЛОЯР ООО"],
+        "characteristic": ["Р’РђР РќРР¦Рђ РћРћРћ", "РЎР’Р•РўР›РћРЇР  РћРћРћ"],
         "production_date": ["14.04.2026", "17.05.2026"],
         "cell_id": ["24-09-01", "19-58-01"],
         "quantity": [12, 30],
@@ -275,7 +275,7 @@ if page == "Шаблоны файлов":
         "print_order": [53722, 53702]
     })
 
-    # 4. Шаблон параметров сборщика
+    # 4. РЁР°Р±Р»РѕРЅ РїР°СЂР°РјРµС‚СЂРѕРІ СЃР±РѕСЂС‰РёРєР°
     picker_params_df = pd.DataFrame({
         "parameter": [
             "walk_speed_m_s",
@@ -296,42 +296,42 @@ if page == "Шаблоны файлов":
             0
         ],
         "comment": [
-            "Скорость движения сборщика, м/с",
-            "Время на подбор одной строки",
-            "Время на сканирование одной строки",
-            "X стартовой точки",
-            "Y стартовой точки",
-            "X точки завершения",
-            "Y точки завершения"
+            "РЎРєРѕСЂРѕСЃС‚СЊ РґРІРёР¶РµРЅРёСЏ СЃР±РѕСЂС‰РёРєР°, Рј/СЃ",
+            "Р’СЂРµРјСЏ РЅР° РїРѕРґР±РѕСЂ РѕРґРЅРѕР№ СЃС‚СЂРѕРєРё",
+            "Р’СЂРµРјСЏ РЅР° СЃРєР°РЅРёСЂРѕРІР°РЅРёРµ РѕРґРЅРѕР№ СЃС‚СЂРѕРєРё",
+            "X СЃС‚Р°СЂС‚РѕРІРѕР№ С‚РѕС‡РєРё",
+            "Y СЃС‚Р°СЂС‚РѕРІРѕР№ С‚РѕС‡РєРё",
+            "X С‚РѕС‡РєРё Р·Р°РІРµСЂС€РµРЅРёСЏ",
+            "Y С‚РѕС‡РєРё Р·Р°РІРµСЂС€РµРЅРёСЏ"
         ]
     })
 
     download_excel_button(
-        "Скачать шаблон складов",
+        "РЎРєР°С‡Р°С‚СЊ С€Р°Р±Р»РѕРЅ СЃРєР»Р°РґРѕРІ",
         {"warehouses": warehouses_df},
         "template_warehouses.xlsx"
     )
 
     download_excel_button(
-        "Скачать шаблон карты склада",
+        "РЎРєР°С‡Р°С‚СЊ С€Р°Р±Р»РѕРЅ РєР°СЂС‚С‹ СЃРєР»Р°РґР°",
         {"map_objects": map_objects_df},
         "template_warehouse_map.xlsx"
     )
 
     download_excel_button(
-        "Скачать шаблон расходников",
+        "РЎРєР°С‡Р°С‚СЊ С€Р°Р±Р»РѕРЅ СЂР°СЃС…РѕРґРЅРёРєРѕРІ",
         {"orders": orders_df},
         "template_orders.xlsx"
     )
 
     download_excel_button(
-        "Скачать шаблон параметров сборщика",
+        "РЎРєР°С‡Р°С‚СЊ С€Р°Р±Р»РѕРЅ РїР°СЂР°РјРµС‚СЂРѕРІ СЃР±РѕСЂС‰РёРєР°",
         {"picker_params": picker_params_df},
         "template_picker_params.xlsx"
     )
 
     download_excel_button(
-        "Скачать все шаблоны одним файлом",
+        "РЎРєР°С‡Р°С‚СЊ РІСЃРµ С€Р°Р±Р»РѕРЅС‹ РѕРґРЅРёРј С„Р°Р№Р»РѕРј",
         {
             "warehouses": warehouses_df,
             "map_objects": map_objects_df,
@@ -341,44 +341,44 @@ if page == "Шаблоны файлов":
         "templates_all.xlsx"
     )
 
-# ---------- загрузка данных ----------
+# ---------- Р·Р°РіСЂСѓР·РєР° РґР°РЅРЅС‹С… ----------
 
-elif page == "Загрузка данных":
-    st.header("Загрузка данных")
+elif page == "Р—Р°РіСЂСѓР·РєР° РґР°РЅРЅС‹С…":
+    st.header("Р—Р°РіСЂСѓР·РєР° РґР°РЅРЅС‹С…")
 
     uploaded_file = st.file_uploader(
-        "Загрузите заполненный Excel-файл",
+        "Р—Р°РіСЂСѓР·РёС‚Рµ Р·Р°РїРѕР»РЅРµРЅРЅС‹Р№ Excel-С„Р°Р№Р»",
         type=["xlsx"]
     )
 
     if uploaded_file:
         xls = pd.ExcelFile(uploaded_file)
 
-        st.subheader("Листы в файле")
+        st.subheader("Р›РёСЃС‚С‹ РІ С„Р°Р№Р»Рµ")
         st.write(xls.sheet_names)
 
         selected_sheet = st.selectbox(
-            "Выберите лист для просмотра",
+            "Р’С‹Р±РµСЂРёС‚Рµ Р»РёСЃС‚ РґР»СЏ РїСЂРѕСЃРјРѕС‚СЂР°",
             xls.sheet_names
         )
 
         df = pd.read_excel(uploaded_file, sheet_name=selected_sheet)
 
-        st.subheader("Данные")
+        st.subheader("Р”Р°РЅРЅС‹Рµ")
         st.dataframe(df)
 
         st.session_state[selected_sheet] = df
 
-        st.success(f"Лист '{selected_sheet}' загружен в приложение")
+        st.success(f"Р›РёСЃС‚ '{selected_sheet}' Р·Р°РіСЂСѓР¶РµРЅ РІ РїСЂРёР»РѕР¶РµРЅРёРµ")
 
-# ---------- карта РЦ ----------
+# ---------- РєР°СЂС‚Р° Р Р¦ ----------
 
-elif page == "Карта РЦ":
+elif page == "РљР°СЂС‚Р° Р Р¦":
 
-    st.header("Карта распределительного центра")
+    st.header("РљР°СЂС‚Р° СЂР°СЃРїСЂРµРґРµР»РёС‚РµР»СЊРЅРѕРіРѕ С†РµРЅС‚СЂР°")
 
     uploaded_pdf = st.file_uploader(
-        "Загрузите PDF-план РЦ",
+        "Р—Р°РіСЂСѓР·РёС‚Рµ PDF-РїР»Р°РЅ Р Р¦",
         type=["pdf"]
     )
 
@@ -388,12 +388,12 @@ elif page == "Карта РЦ":
 
     if "rc_pdf_bytes" not in st.session_state:
 
-        st.info("Загрузите PDF план склада")
+        st.info("Р—Р°РіСЂСѓР·РёС‚Рµ PDF РїР»Р°РЅ СЃРєР»Р°РґР°")
 
     else:
 
         st.success(
-            f"Загружен файл: {st.session_state['rc_pdf_name']}"
+            f"Р—Р°РіСЂСѓР¶РµРЅ С„Р°Р№Р»: {st.session_state['rc_pdf_name']}"
         )
 
         pdf_doc = fitz.open(
@@ -402,14 +402,14 @@ elif page == "Карта РЦ":
         )
 
         page_num = st.number_input(
-            "Страница",
+            "РЎС‚СЂР°РЅРёС†Р°",
             min_value=1,
             max_value=len(pdf_doc),
             value=1
         )
 
         zoom = st.slider(
-            "Масштаб",
+            "РњР°СЃС€С‚Р°Р±",
             min_value=0.5,
             max_value=8.0,
             value=2.0,
@@ -431,7 +431,7 @@ elif page == "Карта РЦ":
         )
 
         st.write(
-            "Кликни по плану для получения координат"
+            "РљР»РёРєРЅРё РїРѕ РїР»Р°РЅСѓ РґР»СЏ РїРѕР»СѓС‡РµРЅРёСЏ РєРѕРѕСЂРґРёРЅР°С‚"
         )
 
         clicked_point = streamlit_image_coordinates(
@@ -460,12 +460,12 @@ elif page == "Карта РЦ":
 
         st.divider()
 
-        st.subheader("Масштаб плана")
+        st.subheader("РњР°СЃС€С‚Р°Р± РїР»Р°РЅР°")
 
         col1, col2 = st.columns(2)
 
         with col1:
-            if st.button("Запомнить точку A"):
+            if st.button("Р—Р°РїРѕРјРЅРёС‚СЊ С‚РѕС‡РєСѓ A"):
 
                 if "last_click_x" in st.session_state:
 
@@ -475,7 +475,7 @@ elif page == "Карта РЦ":
                     )
 
         with col2:
-            if st.button("Запомнить точку B"):
+            if st.button("Р—Р°РїРѕРјРЅРёС‚СЊ С‚РѕС‡РєСѓ B"):
 
                 if "last_click_x" in st.session_state:
 
@@ -487,11 +487,11 @@ elif page == "Карта РЦ":
         point_a = st.session_state.get("point_a")
         point_b = st.session_state.get("point_b")
 
-        st.write("Точка A:", point_a)
-        st.write("Точка B:", point_b)
+        st.write("РўРѕС‡РєР° A:", point_a)
+        st.write("РўРѕС‡РєР° B:", point_b)
 
         real_length_mm = st.number_input(
-            "Реальная длина между точками (мм)",
+            "Р РµР°Р»СЊРЅР°СЏ РґР»РёРЅР° РјРµР¶РґСѓ С‚РѕС‡РєР°РјРё (РјРј)",
             min_value=1,
             value=12000
         )
@@ -506,12 +506,12 @@ elif page == "Карта РЦ":
             ) ** 0.5
 
             st.metric(
-                "Расстояние в пикселях",
+                "Р Р°СЃСЃС‚РѕСЏРЅРёРµ РІ РїРёРєСЃРµР»СЏС…",
                 f"{distance_px:.2f}"
             )
 
             if distance_px == 0:
-                st.warning("Точки A и B совпадают. Выбери две разные точки для расчета масштаба.")
+                st.warning("РўРѕС‡РєРё A Рё B СЃРѕРІРїР°РґР°СЋС‚. Р’С‹Р±РµСЂРё РґРІРµ СЂР°Р·РЅС‹Рµ С‚РѕС‡РєРё РґР»СЏ СЂР°СЃС‡РµС‚Р° РјР°СЃС€С‚Р°Р±Р°.")
             else:
                 mm_per_px = (
                     real_length_mm /
@@ -519,7 +519,7 @@ elif page == "Карта РЦ":
                 )
 
                 st.metric(
-                    "мм на пиксель",
+                    "РјРј РЅР° РїРёРєСЃРµР»СЊ",
                     f"{mm_per_px:.4f}"
                 )
 
@@ -527,7 +527,7 @@ elif page == "Карта РЦ":
                     "mm_per_px"
                 ] = mm_per_px
 
-        if st.button("Очистить PDF"):
+        if st.button("РћС‡РёСЃС‚РёС‚СЊ PDF"):
 
             for key in [
                 "rc_pdf_bytes",
@@ -541,34 +541,34 @@ elif page == "Карта РЦ":
                     del st.session_state[key]
 
             st.rerun()
-# ---------- карта склада ----------
+# ---------- РєР°СЂС‚Р° СЃРєР»Р°РґР° ----------
 
-elif page == "Карта склада":
-    st.header("Карта склада")
+elif page == "РљР°СЂС‚Р° СЃРєР»Р°РґР°":
+    st.header("РљР°СЂС‚Р° СЃРєР»Р°РґР°")
 
     st.warning(
-        "Новый модуль Excel-схемы склада доступен прямо здесь ниже и отдельным пунктом меню "
-        "«Виртуальный склад Excel». Если пункт меню не появился, перезапустите Streamlit/start.cmd."
+        "РќРѕРІС‹Р№ РјРѕРґСѓР»СЊ Excel-СЃС…РµРјС‹ СЃРєР»Р°РґР° РґРѕСЃС‚СѓРїРµРЅ РїСЂСЏРјРѕ Р·РґРµСЃСЊ РЅРёР¶Рµ Рё РѕС‚РґРµР»СЊРЅС‹Рј РїСѓРЅРєС‚РѕРј РјРµРЅСЋ "
+        "В«Р’РёСЂС‚СѓР°Р»СЊРЅС‹Р№ СЃРєР»Р°Рґ ExcelВ». Р•СЃР»Рё РїСѓРЅРєС‚ РјРµРЅСЋ РЅРµ РїРѕСЏРІРёР»СЃСЏ, РїРµСЂРµР·Р°РїСѓСЃС‚РёС‚Рµ Streamlit/start.cmd."
     )
 
-    st.subheader("Виртуальный склад Excel — построить по визуальной Excel-схеме")
+    st.subheader("Р’РёСЂС‚СѓР°Р»СЊРЅС‹Р№ СЃРєР»Р°Рґ Excel вЂ” РїРѕСЃС‚СЂРѕРёС‚СЊ РїРѕ РІРёР·СѓР°Р»СЊРЅРѕР№ Excel-СЃС…РµРјРµ")
     render_virtual_warehouse_excel(show_header=False)
     st.divider()
 
     st.info(
-        "Карту склада теперь можно загрузить прямо здесь: сначала Excel со схемой рядов, "
-        "затем при необходимости Excel-выгрузку 1С с фактическими адресами ячеек."
+        "РљР°СЂС‚Сѓ СЃРєР»Р°РґР° С‚РµРїРµСЂСЊ РјРѕР¶РЅРѕ Р·Р°РіСЂСѓР·РёС‚СЊ РїСЂСЏРјРѕ Р·РґРµСЃСЊ: СЃРЅР°С‡Р°Р»Р° Excel СЃРѕ СЃС…РµРјРѕР№ СЂСЏРґРѕРІ, "
+        "Р·Р°С‚РµРј РїСЂРё РЅРµРѕР±С…РѕРґРёРјРѕСЃС‚Рё Excel-РІС‹РіСЂСѓР·РєСѓ 1РЎ СЃ С„Р°РєС‚РёС‡РµСЃРєРёРјРё Р°РґСЂРµСЃР°РјРё СЏС‡РµРµРє."
     )
 
-    with st.expander("Какие колонки нужны в Excel", expanded=True):
+    with st.expander("РљР°РєРёРµ РєРѕР»РѕРЅРєРё РЅСѓР¶РЅС‹ РІ Excel", expanded=True):
         st.markdown(
             """
-            **Схема рядов:** обязательны `Ряд` и `Кол-во ячеек` / `Количество ячеек`.
-            Дополнительно: `Склад`, `Часть ряда`, `Длина ячейки мм`, `Ширина ячейки мм`,
-            `Зазор мм`, `Проезд мм`, `Поворот мм`, `Следующий ряд`, `Комментарий`.
+            **РЎС…РµРјР° СЂСЏРґРѕРІ:** РѕР±СЏР·Р°С‚РµР»СЊРЅС‹ `Р СЏРґ` Рё `РљРѕР»-РІРѕ СЏС‡РµРµРє` / `РљРѕР»РёС‡РµСЃС‚РІРѕ СЏС‡РµРµРє`.
+            Р”РѕРїРѕР»РЅРёС‚РµР»СЊРЅРѕ: `РЎРєР»Р°Рґ`, `Р§Р°СЃС‚СЊ СЂСЏРґР°`, `Р”Р»РёРЅР° СЏС‡РµР№РєРё РјРј`, `РЁРёСЂРёРЅР° СЏС‡РµР№РєРё РјРј`,
+            `Р—Р°Р·РѕСЂ РјРј`, `РџСЂРѕРµР·Рґ РјРј`, `РџРѕРІРѕСЂРѕС‚ РјРј`, `РЎР»РµРґСѓСЋС‰РёР№ СЂСЏРґ`, `РљРѕРјРјРµРЅС‚Р°СЂРёР№`.
 
-            **Выгрузка 1С:** обязательны `Ряд` и `Ячейка`.
-            Дополнительно: `Склад`, `Адрес ячейки` / `Складская ячейка`.
+            **Р’С‹РіСЂСѓР·РєР° 1РЎ:** РѕР±СЏР·Р°С‚РµР»СЊРЅС‹ `Р СЏРґ` Рё `РЇС‡РµР№РєР°`.
+            Р”РѕРїРѕР»РЅРёС‚РµР»СЊРЅРѕ: `РЎРєР»Р°Рґ`, `РђРґСЂРµСЃ СЏС‡РµР№РєРё` / `РЎРєР»Р°РґСЃРєР°СЏ СЏС‡РµР№РєР°`.
             """
         )
 
@@ -576,25 +576,25 @@ elif page == "Карта склада":
 
     with upload_col:
         default_zone = st.text_input(
-            "Склад/зона для строк без колонки склада",
-            value="Карта склада",
+            "РЎРєР»Р°Рґ/Р·РѕРЅР° РґР»СЏ СЃС‚СЂРѕРє Р±РµР· РєРѕР»РѕРЅРєРё СЃРєР»Р°РґР°",
+            value="РљР°СЂС‚Р° СЃРєР»Р°РґР°",
             key="warehouse_map_default_zone",
         )
         layout_file = st.file_uploader(
-            "Загрузить Excel схемы склада",
+            "Р—Р°РіСЂСѓР·РёС‚СЊ Excel СЃС…РµРјС‹ СЃРєР»Р°РґР°",
             type=["xlsx"],
             key="warehouse_map_layout_upload",
         )
-        if st.button("Построить карту склада", disabled=layout_file is None):
+        if st.button("РџРѕСЃС‚СЂРѕРёС‚СЊ РєР°СЂС‚Сѓ СЃРєР»Р°РґР°", disabled=layout_file is None):
             try:
                 sheet_name, segments = import_segments_from_excel(
                     layout_file,
-                    default_zone.strip() or "Карта склада",
+                    default_zone.strip() or "РљР°СЂС‚Р° СЃРєР»Р°РґР°",
                 )
                 st.session_state["warehouse_map_segments"] = segments
                 st.session_state["warehouse_map_layout_sheet"] = sheet_name
                 st.success(
-                    f"Схема загружена: {len(segments)} строк из листа «{sheet_name}»."
+                    f"РЎС…РµРјР° Р·Р°РіСЂСѓР¶РµРЅР°: {len(segments)} СЃС‚СЂРѕРє РёР· Р»РёСЃС‚Р° В«{sheet_name}В»."
                 )
             except Exception as exc:
                 try:
@@ -605,44 +605,44 @@ elif page == "Карта склада":
                         {
                             "level": "warning",
                             "message": (
-                                "Файл не похож на табличную схему рядов, поэтому он открыт "
-                                "в упрощённом режиме по цветной Excel-разметке."
+                                "Р¤Р°Р№Р» РЅРµ РїРѕС…РѕР¶ РЅР° С‚Р°Р±Р»РёС‡РЅСѓСЋ СЃС…РµРјСѓ СЂСЏРґРѕРІ, РїРѕСЌС‚РѕРјСѓ РѕРЅ РѕС‚РєСЂС‹С‚ "
+                                "РІ СѓРїСЂРѕС‰С‘РЅРЅРѕРј СЂРµР¶РёРјРµ РїРѕ С†РІРµС‚РЅРѕР№ Excel-СЂР°Р·РјРµС‚РєРµ."
                             ),
                         }
                     ]
                     st.warning(
-                        "Табличные колонки `Ряд` и `Кол-во ячеек` не найдены. "
-                        "Я построил склад по цветным ячейкам Excel в блоке выше."
+                        "РўР°Р±Р»РёС‡РЅС‹Рµ РєРѕР»РѕРЅРєРё `Р СЏРґ` Рё `РљРѕР»-РІРѕ СЏС‡РµРµРє` РЅРµ РЅР°Р№РґРµРЅС‹. "
+                        "РЇ РїРѕСЃС‚СЂРѕРёР» СЃРєР»Р°Рґ РїРѕ С†РІРµС‚РЅС‹Рј СЏС‡РµР№РєР°Рј Excel РІ Р±Р»РѕРєРµ РІС‹С€Рµ."
                     )
                 except Exception as fallback_exc:
-                    st.error(f"Не удалось загрузить схему склада: {exc}. Упрощённый режим тоже не сработал: {fallback_exc}")
+                    st.error(f"РќРµ СѓРґР°Р»РѕСЃСЊ Р·Р°РіСЂСѓР·РёС‚СЊ СЃС…РµРјСѓ СЃРєР»Р°РґР°: {exc}. РЈРїСЂРѕС‰С‘РЅРЅС‹Р№ СЂРµР¶РёРј С‚РѕР¶Рµ РЅРµ СЃСЂР°Р±РѕС‚Р°Р»: {fallback_exc}")
 
     with one_c_col:
         one_c_file = st.file_uploader(
-            "Загрузить Excel выгрузки 1С",
+            "Р—Р°РіСЂСѓР·РёС‚СЊ Excel РІС‹РіСЂСѓР·РєРё 1РЎ",
             type=["xlsx"],
             key="warehouse_map_1c_upload",
         )
-        if st.button("Применить номера из 1С", disabled=one_c_file is None):
+        if st.button("РџСЂРёРјРµРЅРёС‚СЊ РЅРѕРјРµСЂР° РёР· 1РЎ", disabled=one_c_file is None):
             try:
                 sheet_name, one_c_cells = import_1c_cells_from_excel(one_c_file)
                 st.session_state["warehouse_map_1c_cells"] = one_c_cells
                 st.session_state["warehouse_map_1c_sheet"] = sheet_name
                 st.success(
-                    f"Выгрузка 1С загружена: {len(one_c_cells)} ячеек из листа «{sheet_name}»."
+                    f"Р’С‹РіСЂСѓР·РєР° 1РЎ Р·Р°РіСЂСѓР¶РµРЅР°: {len(one_c_cells)} СЏС‡РµРµРє РёР· Р»РёСЃС‚Р° В«{sheet_name}В»."
                 )
             except Exception as exc:
-                st.error(f"Не удалось загрузить выгрузку 1С: {exc}")
+                st.error(f"РќРµ СѓРґР°Р»РѕСЃСЊ Р·Р°РіСЂСѓР·РёС‚СЊ РІС‹РіСЂСѓР·РєСѓ 1РЎ: {exc}")
 
     if "warehouse_map_segments" not in st.session_state:
-        st.warning("Загрузите Excel схемы склада в блоке выше, чтобы построить карту.")
+        st.warning("Р—Р°РіСЂСѓР·РёС‚Рµ Excel СЃС…РµРјС‹ СЃРєР»Р°РґР° РІ Р±Р»РѕРєРµ РІС‹С€Рµ, С‡С‚РѕР±С‹ РїРѕСЃС‚СЂРѕРёС‚СЊ РєР°СЂС‚Сѓ.")
     else:
         segments = st.session_state["warehouse_map_segments"]
         one_c_cells = st.session_state.get("warehouse_map_1c_cells")
 
-        st.subheader("Загруженная схема рядов")
+        st.subheader("Р—Р°РіСЂСѓР¶РµРЅРЅР°СЏ СЃС…РµРјР° СЂСЏРґРѕРІ")
         st.caption(
-            f"Лист схемы: {st.session_state.get('warehouse_map_layout_sheet', 'не указан')}"
+            f"Р›РёСЃС‚ СЃС…РµРјС‹: {st.session_state.get('warehouse_map_layout_sheet', 'РЅРµ СѓРєР°Р·Р°РЅ')}"
         )
         st.dataframe(segments, use_container_width=True)
 
@@ -659,16 +659,16 @@ elif page == "Карта склада":
         cells = apply_1c_cell_numbers(cells, one_c_cells)
 
         metric1, metric2, metric3, metric4 = st.columns(4)
-        metric1.metric("Рядов", len(row_summary))
-        metric2.metric("Ячеек", len(cells))
-        metric3.metric("Проездов", len(passages))
+        metric1.metric("Р СЏРґРѕРІ", len(row_summary))
+        metric2.metric("РЇС‡РµРµРє", len(cells))
+        metric3.metric("РџСЂРѕРµР·РґРѕРІ", len(passages))
         metric4.metric(
-            "Маршрут, м",
+            "РњР°СЂС€СЂСѓС‚, Рј",
             round(float(zone_summary["total_route_m"].sum()), 1) if not zone_summary.empty else 0,
         )
 
         map_scale = st.slider(
-            "Масштаб отрисовки",
+            "РњР°СЃС€С‚Р°Р± РѕС‚СЂРёСЃРѕРІРєРё",
             min_value=0.02,
             max_value=0.20,
             value=0.08,
@@ -681,16 +681,16 @@ elif page == "Карта склада":
             scrolling=True,
         )
 
-        with st.expander("Сводка по складу"):
+        with st.expander("РЎРІРѕРґРєР° РїРѕ СЃРєР»Р°РґСѓ"):
             st.dataframe(zone_summary, use_container_width=True)
 
-        with st.expander("Сводка по рядам"):
+        with st.expander("РЎРІРѕРґРєР° РїРѕ СЂСЏРґР°Рј"):
             st.dataframe(row_summary, use_container_width=True)
 
-        with st.expander("Первые 1000 ячеек"):
+        with st.expander("РџРµСЂРІС‹Рµ 1000 СЏС‡РµРµРє"):
             st.dataframe(cells.head(1000), use_container_width=True)
 
-        if st.button("Очистить загруженную карту склада"):
+        if st.button("РћС‡РёСЃС‚РёС‚СЊ Р·Р°РіСЂСѓР¶РµРЅРЅСѓСЋ РєР°СЂС‚Сѓ СЃРєР»Р°РґР°"):
             for key in [
                 "warehouse_map_segments",
                 "warehouse_map_layout_sheet",
@@ -701,22 +701,22 @@ elif page == "Карта склада":
                     del st.session_state[key]
             st.rerun()
 
-# ---------- виртуальный склад Excel ----------
+# ---------- РІРёСЂС‚СѓР°Р»СЊРЅС‹Р№ СЃРєР»Р°Рґ Excel ----------
 
-elif page == "Виртуальный склад Excel":
+elif page == "Р’РёСЂС‚СѓР°Р»СЊРЅС‹Р№ СЃРєР»Р°Рґ Excel":
 
     render_virtual_warehouse_excel()
 
 
 
-# ---------- расчет маршрутов ----------
+# ---------- СЂР°СЃС‡РµС‚ РјР°СЂС€СЂСѓС‚РѕРІ ----------
 
-elif page == "Расчет маршрутов":
-    st.header("Расчет маршрутов")
+elif page == "Р Р°СЃС‡РµС‚ РјР°СЂС€СЂСѓС‚РѕРІ":
+    st.header("Р Р°СЃС‡РµС‚ РјР°СЂС€СЂСѓС‚РѕРІ")
 
-    st.write("Здесь дальше будет расчет маршрутов по РО.")
+    st.write("Р—РґРµСЃСЊ РґР°Р»СЊС€Рµ Р±СѓРґРµС‚ СЂР°СЃС‡РµС‚ РјР°СЂС€СЂСѓС‚РѕРІ РїРѕ Р Рћ.")
 
     if "orders" in st.session_state:
         st.dataframe(st.session_state["orders"])
     else:
-        st.info("Сначала загрузите файл расходников в разделе 'Загрузка данных'.")
+        st.info("РЎРЅР°С‡Р°Р»Р° Р·Р°РіСЂСѓР·РёС‚Рµ С„Р°Р№Р» СЂР°СЃС…РѕРґРЅРёРєРѕРІ РІ СЂР°Р·РґРµР»Рµ 'Р—Р°РіСЂСѓР·РєР° РґР°РЅРЅС‹С…'.")

@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+﻿from dataclasses import dataclass, field
 from typing import Any
 
 @dataclass
@@ -17,7 +17,6 @@ class WarehouseCell:
 
     fill_color: str = ""
     value: str = ""
-=======
 
     warnings: list[str] = field(default_factory=list)
 
