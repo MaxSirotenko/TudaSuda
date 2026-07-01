@@ -21,11 +21,13 @@ if errorlevel 1 (
     exit /b 1
 )
 
-python -c "import streamlit" >nul 2>nul
-if errorlevel 1 del "venv\.deps_installed" >nul 2>nul
+for /f "usebackq delims=" %%H in (`python -c "from pathlib import Path; import hashlib; p=Path('requirements.txt'); print(hashlib.sha256(p.read_bytes()).hexdigest())"`) do set "REQ_HASH=%%H"
+set "REQ_HASH_FILE=venv\.requirements.sha256"
+set "INSTALLED_REQ_HASH="
+if exist "%REQ_HASH_FILE%" set /p INSTALLED_REQ_HASH=<"%REQ_HASH_FILE%"
 
-if not exist "venv\.deps_installed" (
-    echo Installing Python dependencies. This may take a few minutes on first launch...
+if not "%REQ_HASH%"=="%INSTALLED_REQ_HASH%" (
+    echo Installing Python dependencies. This may take a few minutes...
     python -m pip install --upgrade pip
     if errorlevel 1 (
         echo Failed to upgrade pip.
@@ -40,11 +42,13 @@ if not exist "venv\.deps_installed" (
         exit /b 1
     )
 
+    >"%REQ_HASH_FILE%" echo %REQ_HASH%
+    echo ok>"venv\.deps_installed"
     echo ok>"venv\.deps_installed"
 )
 
 echo Starting row constructor on http://localhost:8502/
-echo If localhost does not open, try http://127.0.0.1:8502/
+echo Starting row constructor on http://localhost:8502/
 python -m streamlit run row_constructor.py --server.port 8502
 if errorlevel 1 (
     echo Streamlit stopped with an error.

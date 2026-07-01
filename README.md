@@ -20,10 +20,10 @@ start.cmd
 Скрипт сам перейдёт в папку проекта, создаст `venv`, установит зависимости из `requirements.txt` и запустит:
 
 ```bat
-streamlit run app.py
+streamlit run app.py --server.address localhost --server.port 8501 --browser.serverAddress localhost
 ```
 
-Обычно приложение открывается по адресу <http://localhost:8501>.
+
 
 Если браузер показывает `ERR_CONNECTION_REFUSED`, значит сервер Streamlit не запустился
 или ещё устанавливает зависимости. Откройте окно `start.cmd` и дождитесь строки
@@ -39,10 +39,11 @@ start_row_constructor.cmd
 Скрипт сам подготовит окружение и запустит:
 
 ```bat
-streamlit run row_constructor.py --server.port 8502
+streamlit run row_constructor.py --server.address localhost --server.port 8502 --browser.serverAddress localhost
 ```
 
-Обычно конструктор открывается по адресу <http://localhost:8502>.
+```bat
+streamlit run app.py
 
 Если `localhost:8502` не открывается, дождитесь запуска в окне
 `start_row_constructor.cmd` или попробуйте <http://127.0.0.1:8502>.
@@ -77,13 +78,13 @@ python -m pip install -r requirements.txt
 Запуск распознавалки:
 
 ```bash
-streamlit run app.py
+streamlit run app.py --server.address localhost --server.port 8501 --browser.serverAddress localhost
 ```
 
 Запуск конструктора рядов:
 
 ```bash
-streamlit run row_constructor.py --server.port 8502
+streamlit run row_constructor.py --server.address localhost --server.port 8502 --browser.serverAddress localhost
 ```
 
 ## Импорт схемы склада из Excel
