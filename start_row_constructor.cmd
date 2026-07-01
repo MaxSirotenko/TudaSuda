@@ -47,7 +47,7 @@ if not "%REQ_HASH%"=="%INSTALLED_REQ_HASH%" (
 )
 
 echo Starting row constructor on http://localhost:8502/
-python -m streamlit run row_constructor.py --server.address 127.0.0.1 --server.port 8502
+python -m streamlit run row_constructor.py --server.address localhost --server.port 8502 --browser.serverAddress localhost
 if errorlevel 1 (
     echo Streamlit stopped with an error.
     pause

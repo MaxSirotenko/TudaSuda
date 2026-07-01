@@ -25,4 +25,4 @@ if [ "$REQ_HASH" != "$INSTALLED_REQ_HASH" ]; then
   printf 'ok\n' > "venv/.deps_installed"
 fi
 
-python -m streamlit run app.py --server.address 127.0.0.1 --server.port 8501
+python -m streamlit run app.py --server.address localhost --server.port 8501 --browser.serverAddress localhost
