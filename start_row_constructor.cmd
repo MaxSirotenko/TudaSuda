@@ -44,8 +44,10 @@ if not "%REQ_HASH%"=="%INSTALLED_REQ_HASH%" (
 
     >"%REQ_HASH_FILE%" echo %REQ_HASH%
     echo ok>"venv\.deps_installed"
+    echo ok>"venv\.deps_installed"
 )
 
+echo Starting row constructor on http://localhost:8502/
 echo Starting row constructor on http://localhost:8502/
 python -m streamlit run row_constructor.py --server.port 8502
 if errorlevel 1 (

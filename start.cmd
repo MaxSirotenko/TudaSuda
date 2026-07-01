@@ -37,59 +37,6 @@ if errorlevel 1 (
 )
 
 if not exist "venv\Scripts\python.exe" (
-    call :log Creating virtual environment...
-    %PYTHON_CMD% -m venv venv >>"%START_LOG%" 2>&1
-    if errorlevel 1 (
-        call :fail Failed to create virtual environment with: %PYTHON_CMD% -m venv venv. Delete the incomplete venv folder, reinstall Python with the venv module, and try again.
-        exit /b 1
-    )
-)
-
-if not exist "venv\Scripts\python.exe" (
-    call :fail Virtual environment is incomplete: venv\Scripts\python.exe is missing. Delete the venv folder and run start.cmd again.
-    exit /b 1
-)
-
-if not exist "venv\Scripts\activate.bat" (
-    call :fail Virtual environment is incomplete: venv\Scripts\activate.bat is missing. Delete the venv folder and run start.cmd again.
-    exit /b 1
-)
-
-call "venv\Scripts\activate.bat" >>"%START_LOG%" 2>&1
-if errorlevel 1 (
-    call :fail Failed to activate virtual environment.
-    exit /b 1
-)
-
-set "REQ_HASH="
-for /f "usebackq delims=" %%H in (`"venv\Scripts\python.exe" -c "from pathlib import Path; import hashlib; p=Path('requirements.txt'); print(hashlib.sha256(p.read_bytes()).hexdigest())"`) do set "REQ_HASH=%%H"
-if not defined REQ_HASH (
-    call :fail Failed to calculate requirements.txt hash.
-    exit /b 1
-)
-
-set "REQ_HASH_FILE=venv\.requirements.sha256"
-set "INSTALLED_REQ_HASH="
-if exist "%REQ_HASH_FILE%" set /p INSTALLED_REQ_HASH=<"%REQ_HASH_FILE%"
-
-if not "%REQ_HASH%"=="%INSTALLED_REQ_HASH%" (
-    call :log Installing Python dependencies. This may take a few minutes...
-    "venv\Scripts\python.exe" -m pip install --upgrade pip >>"%START_LOG%" 2>&1
-    if errorlevel 1 (
-        call :fail Failed to upgrade pip. See %START_LOG% for details.
-        exit /b 1
-    )
-
-    "venv\Scripts\python.exe" -m pip install -r requirements.txt >>"%START_LOG%" 2>&1
-    if errorlevel 1 (
-        call :fail Failed to install requirements. See %START_LOG% for details.
-        exit /b 1
-    )
-
-    >"%REQ_HASH_FILE%" echo %REQ_HASH%
-    echo ok>"venv\.deps_installed"
-)
-
 call :log Starting Streamlit on http://localhost:8501/
 "venv\Scripts\python.exe" -m streamlit run app.py --server.port 8501 2>>"%START_LOG%"
 if errorlevel 1 (

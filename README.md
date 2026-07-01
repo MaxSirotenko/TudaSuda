@@ -25,6 +25,11 @@ streamlit run app.py --server.address localhost --server.port 8501 --browser.ser
 
 
 
+Если браузер показывает `ERR_CONNECTION_REFUSED`, значит сервер Streamlit не запустился
+или ещё устанавливает зависимости. Откройте окно `start.cmd` и дождитесь строки
+`You can now view your Streamlit app in your browser`. Если `localhost` не открывается,
+попробуйте прямой адрес <http://127.0.0.1:8501>.
+
 ### Конструктор рядов
 
 ```bat
@@ -39,6 +44,9 @@ streamlit run row_constructor.py --server.address localhost --server.port 8502 -
 
 ```bat
 streamlit run app.py
+
+Если `localhost:8502` не открывается, дождитесь запуска в окне
+`start_row_constructor.cmd` или попробуйте <http://127.0.0.1:8502>.
 
 ## Быстрый запуск на macOS/Linux
 
