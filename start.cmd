@@ -91,7 +91,7 @@ if not "%REQ_HASH%"=="%INSTALLED_REQ_HASH%" (
 )
 
 call :log Starting Streamlit on http://localhost:8501/
-"venv\Scripts\python.exe" -m streamlit run app.py --server.address localhost --server.port 8501 --browser.serverAddress localhost
+"venv\Scripts\python.exe" -m streamlit run app.py --server.port 8501 2>>"%START_LOG%"
 if errorlevel 1 (
     call :fail Streamlit stopped with an error. See %START_LOG% for setup details.
     exit /b 1
