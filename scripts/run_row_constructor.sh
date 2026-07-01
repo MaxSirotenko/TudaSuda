@@ -10,7 +10,11 @@ fi
 
 # shellcheck source=/dev/null
 source venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+if [ ! -f "venv/.deps_installed" ]; then
+  echo "Installing Python dependencies. This may take a few minutes on first launch..."
+  python -m pip install --upgrade pip
+  python -m pip install -r requirements.txt
+  printf 'ok\n' > "venv/.deps_installed"
+fi
 
-streamlit run row_constructor.py --server.port 8502
+python -m streamlit run row_constructor.py --server.address 127.0.0.1 --server.port 8502
