@@ -37,8 +37,49 @@ if errorlevel 1 (
 )
 
 if not exist "venv\Scripts\python.exe" (
+    call :log Creating virtual environment...
+    %PYTHON_CMD% -m venv venv >>"%START_LOG%" 2>&1
+    if errorlevel 1 (
+        call :fail Failed to create virtual environment. See %START_LOG% for details.
+        exit /b 1
+    )
+)
+
+if not exist "venv\Scripts\python.exe" (
+    call :fail Virtual environment Python was not found after creation: %CD%\venv\Scripts\python.exe
+    exit /b 1
+)
+
+call "venv\Scripts\activate.bat" >>"%START_LOG%" 2>&1
+if errorlevel 1 (
+    call :fail Failed to activate virtual environment. See %START_LOG% for details.
+    exit /b 1
+)
+
+for /f "usebackq delims=" %%H in (`python -c "from pathlib import Path; import hashlib; p=Path('requirements.txt'); print(hashlib.sha256(p.read_bytes()).hexdigest())"`) do set "REQ_HASH=%%H"
+set "REQ_HASH_FILE=venv\.requirements.sha256"
+set "INSTALLED_REQ_HASH="
+if exist "%REQ_HASH_FILE%" set /p INSTALLED_REQ_HASH=<"%REQ_HASH_FILE%"
+
+if not "%REQ_HASH%"=="%INSTALLED_REQ_HASH%" (
+    call :log Installing Python dependencies. This may take a few minutes...
+    python -m pip install --upgrade pip >>"%START_LOG%" 2>&1
+    if errorlevel 1 (
+        call :fail Failed to upgrade pip. See %START_LOG% for details.
+        exit /b 1
+    )
+
+    python -m pip install -r requirements.txt >>"%START_LOG%" 2>&1
+    if errorlevel 1 (
+        call :fail Failed to install requirements. See %START_LOG% for details.
+        exit /b 1
+    )
+
+    >"%REQ_HASH_FILE%" echo %REQ_HASH%
+)
+
 call :log Starting Streamlit on http://localhost:8501/
-"venv\Scripts\python.exe" -m streamlit run app.py --server.port 8501 2>>"%START_LOG%"
+python -m streamlit run app.py --server.address localhost --server.port 8501 --browser.serverAddress localhost
 if errorlevel 1 (
     call :fail Streamlit stopped with an error. See %START_LOG% for setup details.
     exit /b 1
