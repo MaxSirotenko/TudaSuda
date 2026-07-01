@@ -1,0 +1,9 @@
+# Runtime dependencies for the Streamlit applications and helper tools.
+streamlit>=1.36,<2
+streamlit-image-coordinates>=0.1.9,<0.2
+pandas>=2.2,<3
+openpyxl>=3.1,<4
+PyMuPDF>=1.24,<2
+Pillow>=10,<12
+ezdxf>=1.3,<2
+matplotlib>=3.8,<4
