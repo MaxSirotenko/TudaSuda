@@ -13,6 +13,7 @@ def _text(value) -> str:
 
 
 
+
 def _fill_color(cell) -> str:
     fill = cell.fill
     if fill is None or fill.fill_type is None:
@@ -33,6 +34,7 @@ def _fill_color(cell) -> str:
 def _is_painted_cell(cell) -> bool:
     return bool(_fill_color(cell))
 
+=======
 def _row_number(label: str) -> str:
     match = ROW_LABEL_RE.search(label.replace("№", ""))
     return match.group(1) if match else label.strip()
@@ -90,6 +92,7 @@ def parse_warehouse_excel(file_obj) -> WarehouseModel:
             values=values,
             merged_ranges=[str(rng) for rng in ws.merged_cells.ranges],
         )
+
         painted_by_excel_row: dict[int, list] = {}
         for row in ws.iter_rows():
             for cell in row:
@@ -154,5 +157,26 @@ def parse_warehouse_excel(file_obj) -> WarehouseModel:
                 sheet.rows.append(wh_row)
             if not sheet.rows:
                 sheet.warnings.append("На листе не найдены цветные ячейки или уверенные текстовые подписи рядов.")
+=======
+        seen = set()
+        for r, c, label in labels:
+            row_number = _row_number(label)
+            if (row_number, r, c) in seen:
+                continue
+            seen.add((row_number, r, c))
+            min_row, min_col, max_row, max_col, direction, confidence, warnings = _find_extent(ws, r, c)
+            wh_row = WarehouseRow(ws.title, row_number, min_row, min_col, max_row, max_col, direction, confidence, warnings=warnings)
+            if confidence >= 0.6:
+                count = (max_col - min_col + 1) if direction == "left_to_right" else (max_row - min_row + 1)
+                for idx in range(1, count + 1):
+                    x = min_col + idx - 1 if direction == "left_to_right" else min_col
+                    y = min_row if direction == "left_to_right" else min_row + idx - 1
+                    wh_row.potential_cells.append(WarehouseCell(ws.title, row_number, str(idx), FIRST_TIER, f"{idx}-{row_number}-{FIRST_TIER}", x, y))
+            else:
+                sheet.warnings.append(f"Ряд '{label}' на {r}:{c} не получил автоматические ячейки из-за низкой уверенности.")
+            sheet.rows.append(wh_row)
+        if not sheet.rows:
+            sheet.warnings.append("На листе не найдены уверенные текстовые подписи рядов.")
+
         model.sheets.append(sheet)
     return model
