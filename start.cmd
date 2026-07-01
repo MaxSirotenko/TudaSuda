@@ -21,8 +21,13 @@ if errorlevel 1 (
     exit /b 1
 )
 
-if not exist "venv\.deps_installed" (
-    echo Installing Python dependencies. This may take a few minutes on first launch...
+for /f "usebackq delims=" %%H in (`python -c "from pathlib import Path; import hashlib; p=Path('requirements.txt'); print(hashlib.sha256(p.read_bytes()).hexdigest())"`) do set "REQ_HASH=%%H"
+set "REQ_HASH_FILE=venv\.requirements.sha256"
+set "INSTALLED_REQ_HASH="
+if exist "%REQ_HASH_FILE%" set /p INSTALLED_REQ_HASH=<"%REQ_HASH_FILE%"
+
+if not "%REQ_HASH%"=="%INSTALLED_REQ_HASH%" (
+    echo Installing Python dependencies. This may take a few minutes...
     python -m pip install --upgrade pip
     if errorlevel 1 (
         echo Failed to upgrade pip.
@@ -37,6 +42,7 @@ if not exist "venv\.deps_installed" (
         exit /b 1
     )
 
+    >"%REQ_HASH_FILE%" echo %REQ_HASH%
     echo ok>"venv\.deps_installed"
 )
 

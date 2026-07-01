@@ -10,10 +10,18 @@ fi
 
 # shellcheck source=/dev/null
 source venv/bin/activate
-if [ ! -f "venv/.deps_installed" ]; then
-  echo "Installing Python dependencies. This may take a few minutes on first launch..."
+REQ_HASH="$(python -c 'from pathlib import Path; import hashlib; p=Path("requirements.txt"); print(hashlib.sha256(p.read_bytes()).hexdigest())')"
+REQ_HASH_FILE="venv/.requirements.sha256"
+INSTALLED_REQ_HASH=""
+if [ -f "$REQ_HASH_FILE" ]; then
+  INSTALLED_REQ_HASH="$(cat "$REQ_HASH_FILE")"
+fi
+
+if [ "$REQ_HASH" != "$INSTALLED_REQ_HASH" ]; then
+  echo "Installing Python dependencies. This may take a few minutes..."
   python -m pip install --upgrade pip
   python -m pip install -r requirements.txt
+  printf '%s\n' "$REQ_HASH" > "$REQ_HASH_FILE"
   printf 'ok\n' > "venv/.deps_installed"
 fi
 
