@@ -7,6 +7,16 @@ from io import BytesIO
 
 import streamlit.components.v1 as components
 
+from warehouse_diagnostics import build_diagnostics
+from warehouse_excel_parser import parse_warehouse_excel
+from warehouse_placement import (
+    apply_cell_addresses,
+    apply_placements,
+    import_cell_addresses,
+    import_placements,
+)
+from warehouse_visualization import build_virtual_warehouse_html
+
 from row_constructor import (
     DEFAULT_SETTINGS,
     apply_1c_cell_numbers,
@@ -56,6 +66,7 @@ page = st.sidebar.radio(
     "Загрузка данных",
     "Карта РЦ",
     "Карта склада",
+    "Виртуальный склад Excel",
     "Расчет маршрутов"
 ]
 )
@@ -533,6 +544,133 @@ elif page == "Карта склада":
             ]:
                 if key in st.session_state:
                     del st.session_state[key]
+            st.rerun()
+
+# ---------- виртуальный склад Excel ----------
+
+elif page == "Виртуальный склад Excel":
+    st.header("Виртуальный склад по Excel-схеме")
+    st.caption(
+        "Минимальная версия читает все листы .xlsx, ищет подписи рядов на визуальной схеме, "
+        "создаёт ячейки первого яруса, импортирует адреса/размещение и показывает диагностику."
+    )
+
+    with st.expander("Форматы файлов", expanded=True):
+        st.markdown(
+            """
+            **Схема склада:** любой `.xlsx` с визуальной схемой. Обрабатываются все листы.
+
+            **Файл ячеек, опционально:** колонки `cell`/`ячейка`, `row`/`ряд`, `tier`/`ярус`
+            или полная колонка `address`/`адрес` в формате `ячейка-ряд-ярус`.
+
+            **Файл размещения, опционально:** `address`/`адрес` + `item`/`товар`/`номенклатура`
+            или раздельные колонки `cell`, `row`, `tier`, `item`.
+            На этом этапе используются только адреса первого яруса; отсутствие яруса считается первым ярусом и попадает в диагностику.
+            """
+        )
+
+    schema_file = st.file_uploader(
+        "Excel-схема склада",
+        type=["xlsx"],
+        key="virtual_warehouse_schema_upload",
+    )
+    cell_file = st.file_uploader(
+        "Файл номеров ячеек (необязательно)",
+        type=["xlsx", "csv"],
+        key="virtual_warehouse_cells_upload",
+    )
+    placement_file = st.file_uploader(
+        "Файл размещения товаров (необязательно)",
+        type=["xlsx", "csv"],
+        key="virtual_warehouse_placements_upload",
+    )
+
+    if st.button("Построить виртуальный склад", disabled=schema_file is None):
+        diagnostics = []
+        try:
+            model = parse_warehouse_excel(schema_file)
+            if cell_file is not None:
+                addresses_by_row, cell_diagnostics = import_cell_addresses(cell_file)
+                diagnostics.extend(cell_diagnostics)
+                diagnostics.extend(apply_cell_addresses(model, addresses_by_row))
+            if placement_file is not None:
+                placements, placement_diagnostics = import_placements(placement_file)
+                diagnostics.extend(placement_diagnostics)
+                diagnostics.extend(apply_placements(model, placements))
+            st.session_state["virtual_warehouse_model"] = model
+            st.session_state["virtual_warehouse_diagnostics"] = diagnostics
+            st.success(f"Виртуальный склад построен: {len(model.sheets)} листов, {len(model.cells)} ячеек.")
+        except Exception as exc:
+            st.error(f"Не удалось построить виртуальный склад: {exc}")
+
+    model = st.session_state.get("virtual_warehouse_model")
+    if model is None:
+        st.info("Загрузите Excel-схему склада и нажмите кнопку построения.")
+    else:
+        diagnostics = st.session_state.get("virtual_warehouse_diagnostics", [])
+        sheet_names = [sheet.name for sheet in model.sheets]
+        selected_sheet_name = st.selectbox("Лист склада", sheet_names, key="virtual_warehouse_sheet_select")
+        selected_sheet = next(sheet for sheet in model.sheets if sheet.name == selected_sheet_name)
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Листов", len(model.sheets))
+        m2.metric("Рядов на листе", len(selected_sheet.rows))
+        m3.metric("Ячеек всего", len(model.cells))
+        m4.metric("Товаров размещено", sum(1 for cell in model.cells if cell.item))
+
+        tab_map, tab_rows, tab_cells, tab_diag = st.tabs(["Визуализация", "Ряды", "Ячейки", "Диагностика"])
+        with tab_map:
+            scale = st.slider("Масштаб сетки", min_value=18, max_value=60, value=34, step=2)
+            components.html(build_virtual_warehouse_html(selected_sheet, scale), height=760, scrolling=True)
+        with tab_rows:
+            st.dataframe(
+                pd.DataFrame([
+                    {
+                        "sheet": row.sheet_name,
+                        "row_number": row.row_number,
+                        "min_row": row.min_row,
+                        "min_col": row.min_col,
+                        "max_row": row.max_row,
+                        "max_col": row.max_col,
+                        "direction": row.direction,
+                        "confidence": row.confidence,
+                        "cells": len(row.potential_cells),
+                        "warnings": "; ".join(row.warnings),
+                    }
+                    for row in selected_sheet.rows
+                ]),
+                use_container_width=True,
+            )
+        with tab_cells:
+            st.dataframe(
+                pd.DataFrame([
+                    {
+                        "sheet": cell.sheet_name,
+                        "address": cell.address,
+                        "cell_number": cell.cell_number,
+                        "row_number": cell.row_number,
+                        "tier_number": cell.tier_number,
+                        "item": cell.item,
+                        "source": cell.source,
+                        "warnings": "; ".join(cell.warnings),
+                    }
+                    for row in selected_sheet.rows for cell in row.potential_cells
+                ]),
+                use_container_width=True,
+            )
+        with tab_diag:
+            diag_df = pd.DataFrame(build_diagnostics(model, diagnostics))
+            st.dataframe(diag_df, use_container_width=True)
+            st.download_button(
+                "Скачать диагностику CSV",
+                diag_df.to_csv(index=False).encode("utf-8-sig"),
+                file_name="virtual_warehouse_diagnostics.csv",
+                mime="text/csv",
+            )
+
+        if st.button("Очистить виртуальный склад"):
+            for key in ["virtual_warehouse_model", "virtual_warehouse_diagnostics"]:
+                st.session_state.pop(key, None)
             st.rerun()
 
 # ---------- расчет маршрутов ----------
