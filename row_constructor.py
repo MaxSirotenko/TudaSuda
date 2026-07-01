@@ -47,6 +47,186 @@ EDITOR_COLUMNS = [
     "comment",
 ]
 
+
+IMPORT_SEGMENT_ALIASES = {
+    "zone": ["zone", "warehouse", "склад", "зона", "камера"],
+    "row_number": ["row_number", "row", "ряд", "номер ряда", "ряд номер", "№ ряда"],
+    "segment_no": ["segment_no", "segment", "часть ряда", "сегмент", "номер сегмента"],
+    "pallet_count": ["pallet_count", "cells_count", "cell_count", "кол-во ячеек", "количество ячеек", "ячейки", "паллетоместа"],
+    "pallet_length_mm_override": ["pallet_length_mm_override", "длина ячейки мм", "длина паллетоместа", "длина", "length_mm"],
+    "pallet_width_mm_override": ["pallet_width_mm_override", "ширина ячейки мм", "ширина паллетоместа", "ширина", "width_mm"],
+    "gap_between_pallets_mm_override": ["gap_between_pallets_mm_override", "зазор", "зазор мм", "gap_mm"],
+    "passage_after_segment_mm": ["passage_after_segment_mm", "проезд после", "проезд мм", "passage_mm"],
+    "turn_after_row_mm": ["turn_after_row_mm", "поворот после", "поворот мм", "turn_mm"],
+    "next_row_number": ["next_row_number", "следующий ряд", "next_row"],
+    "comment": ["comment", "комментарий", "примечание"],
+}
+
+IMPORT_1C_ALIASES = {
+    "zone": ["zone", "warehouse", "склад", "зона", "камера"],
+    "row_number": ["row_number", "row", "ряд", "номер ряда", "№ ряда"],
+    "cell_no_in_row": ["cell_no_in_row", "cell", "ячейка", "номер ячейки", "№ ячейки", "место"],
+    "cell_key": ["cell_key", "cell_id", "адрес", "адрес ячейки", "ячейка склада", "складская ячейка"],
+}
+
+
+def normalize_column_name(value):
+    value = str(value).strip().lower().replace("ё", "е")
+    value = re.sub(r"\s+", " ", value)
+    return value
+
+
+def find_column(columns, aliases):
+    normalized = {normalize_column_name(col): col for col in columns}
+    for alias in aliases:
+        key = normalize_column_name(alias)
+        if key in normalized:
+            return normalized[key]
+    for col in columns:
+        col_norm = normalize_column_name(col)
+        if any(normalize_column_name(alias) in col_norm for alias in aliases):
+            return col
+    return None
+
+
+def read_first_matching_excel_sheet(uploaded_file, aliases_by_target, required_targets):
+    xls = pd.ExcelFile(uploaded_file)
+    best = None
+
+    for sheet_name in xls.sheet_names:
+        df = pd.read_excel(uploaded_file, sheet_name=sheet_name)
+        df = df.dropna(how="all").copy()
+        mapping = {
+            target: find_column(df.columns, aliases)
+            for target, aliases in aliases_by_target.items()
+        }
+        score = sum(1 for target in required_targets if mapping.get(target) is not None)
+        score += sum(1 for col in mapping.values() if col is not None)
+        if best is None or score > best[0]:
+            best = (score, sheet_name, df, mapping)
+
+    if best is None or any(best[3].get(target) is None for target in required_targets):
+        required = ", ".join(required_targets)
+        raise ValueError(f"Не найден лист с обязательными колонками: {required}")
+
+    return best[1], best[2], best[3]
+
+
+def import_segments_from_excel(uploaded_file, default_zone):
+    sheet_name, source, mapping = read_first_matching_excel_sheet(
+        uploaded_file,
+        IMPORT_SEGMENT_ALIASES,
+        ["row_number", "pallet_count"],
+    )
+
+    rows = []
+    for _, src in source.iterrows():
+        row_number = to_int(src.get(mapping["row_number"]), None)
+        pallet_count = to_int(src.get(mapping["pallet_count"]), 0)
+        if row_number is None or pallet_count <= 0:
+            continue
+
+        item = {}
+        for col in SEGMENT_COLUMNS:
+            mapped_col = mapping.get(col)
+            item[col] = src.get(mapped_col, "") if mapped_col is not None else ""
+
+        item["zone"] = str(item.get("zone") or default_zone).strip() or default_zone
+        item["row_number"] = row_number
+        item["segment_no"] = to_int(item.get("segment_no"), 1) or 1
+        item["pallet_count"] = pallet_count
+        for numeric_col in [
+            "pallet_length_mm_override",
+            "pallet_width_mm_override",
+            "gap_between_pallets_mm_override",
+            "passage_after_segment_mm",
+            "turn_after_row_mm",
+        ]:
+            item[numeric_col] = to_int(item.get(numeric_col), 0)
+        rows.append(item)
+
+    if not rows:
+        raise ValueError("В файле схемы не найдено ни одного ряда с количеством ячеек больше 0.")
+
+    return sheet_name, prepare_segments_for_editor(pd.DataFrame(rows, columns=SEGMENT_COLUMNS))
+
+
+def import_1c_cells_from_excel(uploaded_file):
+    sheet_name, source, mapping = read_first_matching_excel_sheet(
+        uploaded_file,
+        IMPORT_1C_ALIASES,
+        ["row_number", "cell_no_in_row"],
+    )
+
+    rows = []
+    for _, src in source.iterrows():
+        row_number = to_int(src.get(mapping["row_number"]), None)
+        cell_no = to_int(src.get(mapping["cell_no_in_row"]), None)
+        if row_number is None or cell_no is None or cell_no <= 0:
+            continue
+
+        cell_key_col = mapping.get("cell_key")
+        cell_key = str(src.get(cell_key_col, "")).strip() if cell_key_col else ""
+        if cell_key in ["", "nan", "None"]:
+            cell_key = str(cell_no)
+
+        zone_col = mapping.get("zone")
+        zone = str(src.get(zone_col, "")).strip() if zone_col else ""
+
+        rows.append(
+            {
+                "zone": zone,
+                "row_number": row_number,
+                "cell_no_in_row": cell_no,
+                "cell_key_1c": cell_key,
+            }
+        )
+
+    if not rows:
+        raise ValueError("В выгрузке 1С не найдено ячеек с номером ряда и номером ячейки.")
+
+    result = pd.DataFrame(rows).drop_duplicates(
+        subset=["zone", "row_number", "cell_no_in_row"],
+        keep="first",
+    )
+    return sheet_name, result
+
+
+def apply_1c_cell_numbers(cells, one_c_cells):
+    if cells.empty or one_c_cells is None or one_c_cells.empty:
+        return cells
+
+    result = cells.copy()
+    refs = one_c_cells.copy()
+    refs["zone"] = refs["zone"].fillna("").astype(str).str.strip()
+    result["zone_match"] = result["zone"].fillna("").astype(str).str.strip()
+
+    exact_refs = refs[refs["zone"] != ""].copy()
+    if not exact_refs.empty:
+        result = result.merge(
+            exact_refs.rename(columns={"zone": "zone_match"}),
+            on=["zone_match", "row_number", "cell_no_in_row"],
+            how="left",
+        )
+    else:
+        result["cell_key_1c"] = pd.NA
+
+    missing_mask = result["cell_key_1c"].isna()
+    generic_refs = refs[refs["zone"] == ""].drop(columns=["zone"])
+    if missing_mask.any() and not generic_refs.empty:
+        fallback = result.loc[missing_mask, ["row_number", "cell_no_in_row"]].merge(
+            generic_refs,
+            on=["row_number", "cell_no_in_row"],
+            how="left",
+        )
+        result.loc[missing_mask, "cell_key_1c"] = fallback["cell_key_1c"].values
+
+    result["cell_key_auto"] = result["cell_key"]
+    result["cell_key"] = result["cell_key_1c"].fillna(result["cell_key_auto"])
+    result = result.drop(columns=["zone_match"])
+    return result
+
+
 DEFAULT_SEGMENTS = pd.DataFrame(
     [
         {
@@ -1175,6 +1355,73 @@ def main():
 
     st.caption("Override = 0 означает использовать значение из общих настроек.")
 
+    st.subheader("Импорт из Excel")
+    st.write(
+        "Можно загрузить Excel со схемой рядов и отдельную выгрузку 1С с номерами ячеек. "
+        "Импорт ищет колонки по русским и техническим названиям: ряд, количество ячеек, "
+        "длина/ширина, проезд, поворот, а в 1С — ряд, ячейка и адрес ячейки."
+    )
+
+    import_col1, import_col2 = st.columns(2)
+
+    with import_col1:
+        layout_zone_name = st.text_input(
+            "Склад/зона для строк без колонки склада",
+            value="Импорт Excel",
+        )
+        layout_file = st.file_uploader(
+            "Excel схемы рядов",
+            type=["xlsx"],
+            key="layout_excel_upload",
+        )
+        replace_existing = st.checkbox(
+            "Заменить текущие ряды импортом",
+            value=False,
+            help="Если выключено — импортированные ряды добавятся к текущим.",
+        )
+        if st.button("Импортировать схему рядов", disabled=layout_file is None):
+            try:
+                sheet_name, imported_segments = import_segments_from_excel(
+                    layout_file,
+                    layout_zone_name.strip() or "Импорт Excel",
+                )
+                if replace_existing:
+                    segments = imported_segments
+                else:
+                    segments = pd.concat([segments, imported_segments], ignore_index=True)
+                segments = prepare_segments_for_editor(segments)
+                save_config(settings, segments)
+                st.success(
+                    f"Импортировано строк: {len(imported_segments)} из листа «{sheet_name}»."
+                )
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Не удалось импортировать схему рядов: {exc}")
+
+    with import_col2:
+        one_c_file = st.file_uploader(
+            "Excel выгрузки 1С с ячейками",
+            type=["xlsx"],
+            key="one_c_excel_upload",
+        )
+        if st.button("Загрузить номера ячеек из 1С", disabled=one_c_file is None):
+            try:
+                sheet_name, one_c_cells = import_1c_cells_from_excel(one_c_file)
+                st.session_state["one_c_cells"] = one_c_cells
+                st.success(
+                    f"Загружено ячеек из 1С: {len(one_c_cells)} из листа «{sheet_name}»."
+                )
+            except Exception as exc:
+                st.error(f"Не удалось загрузить выгрузку 1С: {exc}")
+
+        if "one_c_cells" in st.session_state:
+            st.caption(f"Активна выгрузка 1С: {len(st.session_state['one_c_cells'])} ячеек.")
+            if st.button("Очистить выгрузку 1С"):
+                del st.session_state["one_c_cells"]
+                st.rerun()
+
+    one_c_cells = st.session_state.get("one_c_cells")
+
     warehouses = get_warehouses(segments)
 
     updated_segments_parts = []
@@ -1252,6 +1499,8 @@ def main():
                     warehouse_row_summary,
                     warehouse_zone_summary,
                 ) = build_model(warehouse_calc_segments, settings)
+
+                warehouse_cells = apply_1c_cell_numbers(warehouse_cells, one_c_cells)
 
                 metric1, metric2, metric3, metric4 = st.columns(4)
 
@@ -1349,6 +1598,7 @@ def main():
         all_row_summary,
         all_zone_summary,
     ) = build_model(all_calc_segments, settings)
+    all_cells = apply_1c_cell_numbers(all_cells, one_c_cells)
 
     st.subheader("Сохранение и общая сводка")
 
