@@ -354,24 +354,27 @@ elif page == "Карта РЦ":
                 dx ** 2 + dy ** 2
             ) ** 0.5
 
-            mm_per_px = (
-                real_length_mm /
-                distance_px
-            )
-
             st.metric(
                 "Расстояние в пикселях",
                 f"{distance_px:.2f}"
             )
 
-            st.metric(
-                "мм на пиксель",
-                f"{mm_per_px:.4f}"
-            )
+            if distance_px == 0:
+                st.warning("Точки A и B совпадают. Выбери две разные точки для расчета масштаба.")
+            else:
+                mm_per_px = (
+                    real_length_mm /
+                    distance_px
+                )
 
-            st.session_state[
-                "mm_per_px"
-            ] = mm_per_px
+                st.metric(
+                    "мм на пиксель",
+                    f"{mm_per_px:.4f}"
+                )
+
+                st.session_state[
+                    "mm_per_px"
+                ] = mm_per_px
 
         if st.button("Очистить PDF"):
 

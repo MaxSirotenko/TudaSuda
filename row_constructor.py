@@ -1,4 +1,5 @@
 from pathlib import Path
+import html
 import re
 
 import pandas as pd
@@ -660,6 +661,7 @@ def build_visual_map_html(cells, passages, row_summary, scale):
 
     for _, row in rows.iterrows():
         zone = str(row["zone"])
+        zone_label = html.escape(zone)
         row_number = int(row["row_number"])
         key = (zone, row_number)
 
@@ -669,7 +671,7 @@ def build_visual_map_html(cells, passages, row_summary, scale):
         elements.append(
             f"""
             <text x="{x + max_visual_row_width_px / 2}" y="28" class="row-label" text-anchor="middle">
-                {zone}
+                {zone_label}
             </text>
             <text x="{x + max_visual_row_width_px / 2}" y="46" class="row-label" text-anchor="middle">
                 ряд {row_number}
@@ -744,6 +746,7 @@ def build_visual_map_html(cells, passages, row_summary, scale):
         cell_id = int(c["global_cell_id"])
         cell_no = int(c["cell_no_in_row"])
         cell_key = str(c.get("cell_key", ""))
+        cell_key_label = html.escape(cell_key)
 
         elements.append(
             f"""
@@ -751,7 +754,7 @@ def build_visual_map_html(cells, passages, row_summary, scale):
                   x="{x:.2f}" y="{y:.2f}"
                   width="{w:.2f}" height="{h:.2f}">
                 <title>
-                    cell_key={cell_key};
+                    cell_key={cell_key_label};
                     global_cell_id={cell_id};
                     ряд={row_number};
                     ячейка в ряду={cell_no};
