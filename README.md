@@ -25,6 +25,8 @@ streamlit run app.py
 
 Обычно приложение открывается по адресу <http://localhost:8501>. Если окно браузера не открылось автоматически, откройте эту ссылку вручную после появления сообщения Streamlit в консоли.
 
+Важно для Windows: не добавляйте к этой команде `--server.address localhost` и `--browser.serverAddress localhost`; `start.cmd` использует простой запуск Streamlit, такой же как при ручном запуске из терминала/VS Code.
+
 ### Конструктор рядов
 
 ```bat
@@ -38,6 +40,8 @@ streamlit run row_constructor.py --server.port 8502
 ```
 
 Обычно конструктор открывается по адресу <http://localhost:8502>. Если окно браузера не открылось автоматически, откройте эту ссылку вручную после появления сообщения Streamlit в консоли.
+
+Важно для Windows: не добавляйте к этой команде `--server.address localhost` и `--browser.serverAddress localhost`; `start_row_constructor.cmd` использует простой запуск Streamlit на порту `8502`.
 
 ## Быстрый запуск на macOS/Linux
 
