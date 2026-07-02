@@ -4,6 +4,7 @@ import pandas as pd
 import fitz
 from PIL import Image
 from io import BytesIO
+from time import perf_counter
 
 import streamlit.components.v1 as components
 
@@ -31,7 +32,7 @@ st.set_page_config(page_title="Симулятор сборки", layout="wide")
 
 st.title("Симулятор скорости сборки")
 
-APP_BUILD_LABEL = "virtual-warehouse-color-2026-07-01"
+APP_BUILD_LABEL = "virtual-warehouse-optimized-2026-07-02"
 
 # ---------- функции ----------
 
@@ -57,6 +58,15 @@ def download_excel_button(label, sheets, file_name):
     )
 
 
+
+@st.cache_data(show_spinner=False)
+def parse_warehouse_excel_cached(file_bytes: bytes):
+    return parse_warehouse_excel(file_bytes)
+
+
+@st.cache_data(show_spinner=False)
+def build_virtual_warehouse_html_cached(sheet, scale: int):
+    return build_virtual_warehouse_html(sheet, scale)
 
 
 def render_virtual_warehouse_excel(show_header=True):
@@ -100,7 +110,10 @@ def render_virtual_warehouse_excel(show_header=True):
     if st.button("Построить склад по цветам Excel", disabled=schema_file is None):
         diagnostics = []
         try:
-            model = parse_warehouse_excel(schema_file)
+            started_at = perf_counter()
+            schema_bytes = schema_file.getvalue()
+            model = parse_warehouse_excel_cached(schema_bytes)
+            parse_seconds = perf_counter() - started_at
             if cell_file is not None:
                 addresses_by_row, cell_diagnostics = import_cell_addresses(cell_file)
                 diagnostics.extend(cell_diagnostics)
@@ -111,7 +124,8 @@ def render_virtual_warehouse_excel(show_header=True):
                 diagnostics.extend(apply_placements(model, placements))
             st.session_state["virtual_warehouse_model"] = model
             st.session_state["virtual_warehouse_diagnostics"] = diagnostics
-            st.success(f"Виртуальный склад построен: {len(model.sheets)} листов, {len(model.cells)} ячеек.")
+            st.session_state["virtual_warehouse_parse_seconds"] = parse_seconds
+            st.success(f"Виртуальный склад построен за {parse_seconds:.2f} сек.: {len(model.sheets)} листов, {len(model.cells)} ячеек.")
         except Exception as exc:
             st.error(f"Не удалось построить виртуальный склад: {exc}")
 
@@ -129,11 +143,14 @@ def render_virtual_warehouse_excel(show_header=True):
         m2.metric("Рядов на листе", len(selected_sheet.rows))
         m3.metric("Ячеек всего", len(model.cells))
         m4.metric("Товаров размещено", sum(1 for cell in model.cells if cell.item))
+        parse_seconds = st.session_state.get("virtual_warehouse_parse_seconds")
+        if parse_seconds is not None:
+            st.caption(f"Последний разбор Excel: {parse_seconds:.2f} сек.; повторные построения того же файла берутся из кэша.")
 
         tab_map, tab_rows, tab_cells, tab_diag = st.tabs(["Визуализация", "Ряды", "Ячейки", "Диагностика"])
         with tab_map:
             scale = st.slider("Масштаб сетки", min_value=18, max_value=60, value=34, step=2)
-            components.html(build_virtual_warehouse_html(selected_sheet, scale), height=760, scrolling=True)
+            components.html(build_virtual_warehouse_html_cached(selected_sheet, scale), height=760, scrolling=True)
         with tab_rows:
             st.dataframe(
                 pd.DataFrame([
@@ -181,7 +198,7 @@ def render_virtual_warehouse_excel(show_header=True):
             )
 
         if st.button("Очистить виртуальный склад"):
-            for key in ["virtual_warehouse_model", "virtual_warehouse_diagnostics"]:
+            for key in ["virtual_warehouse_model", "virtual_warehouse_diagnostics", "virtual_warehouse_parse_seconds"]:
                 st.session_state.pop(key, None)
             st.rerun()
 

@@ -1,3 +1,4 @@
+from io import BytesIO
 import re
 from openpyxl import load_workbook
 from warehouse_addressing import FIRST_TIER
@@ -44,9 +45,6 @@ def _fill_color(cell) -> str:
     return ""
 
 
-def _is_painted_cell(cell) -> bool:
-    return bool(_fill_color(cell))
-
 def _row_number(label: str) -> str:
     match = ROW_LABEL_RE.search(label.replace("\u2116", ""))
     return match.group(1) if match else label.strip()
@@ -85,18 +83,24 @@ def _find_extent(ws, r: int, c: int) -> tuple[int, int, int, int, str, float, li
 
 
 def parse_warehouse_excel(file_obj) -> WarehouseModel:
+    if isinstance(file_obj, bytes):
+        file_obj = BytesIO(file_obj)
     wb = load_workbook(file_obj, data_only=True)
     model = WarehouseModel(sheets=[])
     for ws in wb.worksheets:
         values = []
         labels = []
+        painted_by_excel_row: dict[int, list[tuple]] = {}
         for row in ws.iter_rows():
             for cell in row:
                 text = _text(cell.value)
+                fill_color = _fill_color(cell)
                 if text:
                     values.append({"row": cell.row, "column": cell.column, "value": text})
                     if _looks_like_row_label(text):
                         labels.append((cell.row, cell.column, text))
+                if fill_color:
+                    painted_by_excel_row.setdefault(cell.row, []).append((cell, text, fill_color))
         sheet = WarehouseSheet(
             name=ws.title,
             max_row=ws.max_row,
@@ -105,17 +109,11 @@ def parse_warehouse_excel(file_obj) -> WarehouseModel:
             merged_ranges=[str(rng) for rng in ws.merged_cells.ranges],
         )
 
-        painted_by_excel_row: dict[int, list] = {}
-        for row in ws.iter_rows():
-            for cell in row:
-                if _is_painted_cell(cell):
-                    painted_by_excel_row.setdefault(cell.row, []).append(cell)
-
         if painted_by_excel_row:
             for excel_row, painted_cells in sorted(painted_by_excel_row.items()):
-                painted_cells = sorted(painted_cells, key=lambda item: item.column)
+                painted_cells = sorted(painted_cells, key=lambda item: item[0].column)
                 row_label = ""
-                for col in range(max(1, painted_cells[0].column - 3), painted_cells[0].column):
+                for col in range(max(1, painted_cells[0][0].column - 3), painted_cells[0][0].column):
                     candidate = _text(ws.cell(excel_row, col).value)
                     if candidate:
                         row_label = _row_number(candidate) if _looks_like_row_label(candidate) else candidate
@@ -124,15 +122,14 @@ def parse_warehouse_excel(file_obj) -> WarehouseModel:
                     ws.title,
                     row_number,
                     excel_row,
-                    painted_cells[0].column,
+                    painted_cells[0][0].column,
                     excel_row,
-                    painted_cells[-1].column,
+                    painted_cells[-1][0].column,
                     "left_to_right",
                     0.9,
                 )
-                for idx, cell in enumerate(painted_cells, start=1):
+                for idx, (cell, text, fill_color) in enumerate(painted_cells, start=1):
                     cell_number = str(idx)
-                    text = _text(cell.value)
                     wh_row.potential_cells.append(
                         WarehouseCell(
                             ws.title,
@@ -142,7 +139,7 @@ def parse_warehouse_excel(file_obj) -> WarehouseModel:
                             f"{cell_number}-{row_number}-{FIRST_TIER}",
                             cell.column,
                             excel_row,
-                            fill_color=_fill_color(cell),
+                            fill_color=fill_color,
                             value=text,
                             source="excel_fill",
                         )
