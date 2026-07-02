@@ -1,4 +1,4 @@
-﻿import re
+import re
 from openpyxl import load_workbook
 from warehouse_addressing import FIRST_TIER
 from warehouse_model import WarehouseCell, WarehouseModel, WarehouseRow, WarehouseSheet
@@ -67,7 +67,7 @@ def _find_extent(ws, r: int, c: int) -> tuple[int, int, int, int, str, float, li
         min_col, max_col = c, c
     confidence = 0.75 if max(horizontal_span, vertical_span) >= 3 else 0.45
     if confidence < 0.6:
-        warnings.append("Р СЏРґ РЅР°Р№РґРµРЅ РїРѕ РїРѕРґРїРёСЃРё, РЅРѕ РѕР±Р»Р°СЃС‚СЊ СЏС‡РµРµРє СЂСЏРґРѕРј СЃ РїРѕРґРїРёСЃСЊСЋ РѕРїСЂРµРґРµР»РµРЅР° СЃРѕРјРЅРёС‚РµР»СЊРЅРѕ.")
+        warnings.append("Ряд найден по подписи, но область ячеек рядом с подписью определена сомнительно.")
     return min_row, min_col, max_row, max_col, direction, confidence, warnings
 
 
@@ -135,7 +135,7 @@ def parse_warehouse_excel(file_obj) -> WarehouseModel:
                         )
                     )
                 sheet.rows.append(wh_row)
-            sheet.warnings.append("РЇС‡РµР№РєРё РїРѕСЃС‚СЂРѕРµРЅС‹ РїРѕ Р·Р°Р»РёРІРєР°Рј Excel; С‚Р°Р±Р»РёС‡РЅС‹Рµ РєРѕР»РѕРЅРєРё row_number/pallet_count РЅРµ С‚СЂРµР±СѓСЋС‚СЃСЏ.")
+            sheet.warnings.append("Ячейки построены по заливкам Excel; табличные колонки row_number/pallet_count не требуются.")
         else:
             seen = set()
             for r, c, label in labels:
@@ -152,29 +152,9 @@ def parse_warehouse_excel(file_obj) -> WarehouseModel:
                         y = min_row if direction == "left_to_right" else min_row + idx - 1
                         wh_row.potential_cells.append(WarehouseCell(ws.title, row_number, str(idx), FIRST_TIER, f"{idx}-{row_number}-{FIRST_TIER}", x, y))
                 else:
-                    sheet.warnings.append(f"Р СЏРґ '{label}' РЅР° {r}:{c} РЅРµ РїРѕР»СѓС‡РёР» Р°РІС‚РѕРјР°С‚РёС‡РµСЃРєРёРµ СЏС‡РµР№РєРё РёР·-Р·Р° РЅРёР·РєРѕР№ СѓРІРµСЂРµРЅРЅРѕСЃС‚Рё.")
+                    sheet.warnings.append(f"Ряд '{label}' на {r}:{c} не получил автоматические ячейки из-за низкой уверенности.")
                 sheet.rows.append(wh_row)
             if not sheet.rows:
-                sheet.warnings.append("РќР° Р»РёСЃС‚Рµ РЅРµ РЅР°Р№РґРµРЅС‹ С†РІРµС‚РЅС‹Рµ СЏС‡РµР№РєРё РёР»Рё СѓРІРµСЂРµРЅРЅС‹Рµ С‚РµРєСЃС‚РѕРІС‹Рµ РїРѕРґРїРёСЃРё СЂСЏРґРѕРІ.")
-        seen = set()
-        for r, c, label in labels:
-            row_number = _row_number(label)
-            if (row_number, r, c) in seen:
-                continue
-            seen.add((row_number, r, c))
-            min_row, min_col, max_row, max_col, direction, confidence, warnings = _find_extent(ws, r, c)
-            wh_row = WarehouseRow(ws.title, row_number, min_row, min_col, max_row, max_col, direction, confidence, warnings=warnings)
-            if confidence >= 0.6:
-                count = (max_col - min_col + 1) if direction == "left_to_right" else (max_row - min_row + 1)
-                for idx in range(1, count + 1):
-                    x = min_col + idx - 1 if direction == "left_to_right" else min_col
-                    y = min_row if direction == "left_to_right" else min_row + idx - 1
-                    wh_row.potential_cells.append(WarehouseCell(ws.title, row_number, str(idx), FIRST_TIER, f"{idx}-{row_number}-{FIRST_TIER}", x, y))
-            else:
-                sheet.warnings.append(f"Р СЏРґ '{label}' РЅР° {r}:{c} РЅРµ РїРѕР»СѓС‡РёР» Р°РІС‚РѕРјР°С‚РёС‡РµСЃРєРёРµ СЏС‡РµР№РєРё РёР·-Р·Р° РЅРёР·РєРѕР№ СѓРІРµСЂРµРЅРЅРѕСЃС‚Рё.")
-            sheet.rows.append(wh_row)
-        if not sheet.rows:
-            sheet.warnings.append("РќР° Р»РёСЃС‚Рµ РЅРµ РЅР°Р№РґРµРЅС‹ СѓРІРµСЂРµРЅРЅС‹Рµ С‚РµРєСЃС‚РѕРІС‹Рµ РїРѕРґРїРёСЃРё СЂСЏРґРѕРІ.")
-
+                sheet.warnings.append("На листе не найдены цветные ячейки или уверенные текстовые подписи рядов.")
         model.sheets.append(sheet)
     return model
