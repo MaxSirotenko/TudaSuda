@@ -3,7 +3,7 @@ from openpyxl import load_workbook
 from warehouse_addressing import FIRST_TIER
 from warehouse_model import WarehouseCell, WarehouseModel, WarehouseRow, WarehouseSheet
 
-ROW_LABEL_RE = re.compile(r"(?:^|\b)(?:СЂСЏРґ\s*)?(\d{1,4}|[A-Za-zРђ-РЇР°-СЏРЃС‘]{1,3}\d{0,3})(?:\b|$)", re.IGNORECASE)
+ROW_LABEL_RE = re.compile(r"(?:^|\b)(?:\u0440\u044f\u0434\s*)?(\d{1,4}|[A-Za-z\u0410-\u042f\u0430-\u044f\u0401\u0451]{1,3}\d{0,3})(?:\b|$)", re.IGNORECASE)
 
 
 def _text(value) -> str:
@@ -35,7 +35,7 @@ def _is_painted_cell(cell) -> bool:
     return bool(_fill_color(cell))
 
 def _row_number(label: str) -> str:
-    match = ROW_LABEL_RE.search(label.replace("в„–", ""))
+    match = ROW_LABEL_RE.search(label.replace("\u2116", ""))
     return match.group(1) if match else label.strip()
 
 
@@ -44,7 +44,7 @@ def _looks_like_row_label(text: str) -> bool:
     if not clean or len(clean) > 30:
         return False
     low = clean.lower()
-    return "СЂСЏРґ" in low or bool(re.fullmatch(r"\d{1,4}|[A-Za-zРђ-РЇР°-СЏРЃС‘]{1,3}\d{0,3}", clean))
+    return "\u0440\u044f\u0434" in low or bool(re.fullmatch(r"\d{1,4}|[A-Za-z\u0410-\u042f\u0430-\u044f\u0401\u0451]{1,3}\d{0,3}", clean))
 
 
 def _find_extent(ws, r: int, c: int) -> tuple[int, int, int, int, str, float, list[str]]:
