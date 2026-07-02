@@ -1,4 +1,4 @@
-﻿from streamlit_image_coordinates import streamlit_image_coordinates
+from streamlit_image_coordinates import streamlit_image_coordinates
 import streamlit as st
 import pandas as pd
 import fitz
@@ -27,11 +27,13 @@ from row_constructor import (
     normalize_segments,
 )
 
-st.set_page_config(page_title="РЎРёРјСѓР»СЏС‚РѕСЂ СЃР±РѕСЂРєРё", layout="wide")
+st.set_page_config(page_title="Симулятор сборки", layout="wide")
 
-st.title("РЎРёРјСѓР»СЏС‚РѕСЂ СЃРєРѕСЂРѕСЃС‚Рё СЃР±РѕСЂРєРё")
+st.title("Симулятор скорости сборки")
 
-# ---------- С„СѓРЅРєС†РёРё ----------
+APP_BUILD_LABEL = "virtual-warehouse-color-2026-07-01"
+
+# ---------- функции ----------
 
 def make_excel_file(sheets: dict):
     output = BytesIO()
