@@ -41,7 +41,7 @@ st.set_page_config(page_title="Симулятор сборки", layout="wide")
 
 st.title("Симулятор скорости сборки")
 
-APP_BUILD_LABEL = "virtual-warehouse-optimized-2026-07-02"
+APP_BUILD_LABEL = "excel-import-visible-2026-07-03"
 
 # ---------- функции ----------
 
@@ -372,6 +372,8 @@ def render_imported_warehouse_excel():
 # ---------- меню ----------
 
 st.sidebar.header("Разделы")
+st.sidebar.caption(f"Сборка приложения: {APP_BUILD_LABEL}")
+st.sidebar.success("Если нужна новая функция — откройте пункт или вкладку «Импорт склада из Excel».")
 
 page = st.sidebar.radio(
     "Выберите раздел",
@@ -731,162 +733,168 @@ elif page == "Карта РЦ":
 # ---------- карта склада ----------
 
 elif page == "Карта склада":
-    st.header("Карта склада")
+    map_tab, import_tab = st.tabs(["Текущая карта склада", "Импорт склада из Excel"])
 
-    st.warning(
-        "Новый модуль Excel-схемы склада доступен прямо здесь ниже и отдельным пунктом меню "
-        "«Виртуальный склад Excel». Если пункт меню не появился, перезапустите Streamlit/start.cmd."
-    )
+    with import_tab:
+        render_imported_warehouse_excel()
 
-    st.subheader("Виртуальный склад Excel — построить по визуальной Excel-схеме")
-    render_virtual_warehouse_excel(show_header=False)
-    st.divider()
+    with map_tab:
+        st.header("Карта склада")
 
-    st.info(
-        "Карту склада теперь можно загрузить прямо здесь: сначала Excel со схемой рядов, "
-        "затем при необходимости Excel-выгрузку 1С с фактическими адресами ячеек."
-    )
-
-    with st.expander("Какие колонки нужны в Excel", expanded=True):
-        st.markdown(
-            """
-            **Схема рядов:** обязательны `Ряд` и `Кол-во ячеек` / `Количество ячеек`.
-            Дополнительно: `Склад`, `Часть ряда`, `Длина ячейки мм`, `Ширина ячейки мм`,
-            `Зазор мм`, `Проезд мм`, `Поворот мм`, `Следующий ряд`, `Комментарий`.
-
-            **Выгрузка 1С:** обязательны `Ряд` и `Ячейка`.
-            Дополнительно: `Склад`, `Адрес ячейки` / `Складская ячейка`.
-            """
+        st.warning(
+            "Новая функция доступна во второй вкладке этого раздела — «Импорт склада из Excel», "
+            "а также отдельным пунктом бокового меню. Если вы не видите пункт меню, обновите страницу браузера после start.cmd."
         )
 
-    upload_col, one_c_col = st.columns(2)
+        st.subheader("Виртуальный склад Excel — построить по визуальной Excel-схеме")
+        render_virtual_warehouse_excel(show_header=False)
+        st.divider()
 
-    with upload_col:
-        default_zone = st.text_input(
-            "Склад/зона для строк без колонки склада",
-            value="Карта склада",
-            key="warehouse_map_default_zone",
+        st.info(
+            "Карту склада теперь можно загрузить прямо здесь: сначала Excel со схемой рядов, "
+            "затем при необходимости Excel-выгрузку 1С с фактическими адресами ячеек."
         )
-        layout_file = st.file_uploader(
-            "Загрузить Excel схемы склада",
-            type=["xlsx"],
-            key="warehouse_map_layout_upload",
-        )
-        if st.button("Построить карту склада", disabled=layout_file is None):
-            try:
-                sheet_name, segments = import_segments_from_excel(
-                    layout_file,
-                    default_zone.strip() or "Карта склада",
-                )
-                st.session_state["warehouse_map_segments"] = segments
-                st.session_state["warehouse_map_layout_sheet"] = sheet_name
-                st.success(
-                    f"Схема загружена: {len(segments)} строк из листа «{sheet_name}»."
-                )
-            except Exception as exc:
+
+        with st.expander("Какие колонки нужны в Excel", expanded=True):
+            st.markdown(
+                """
+                **Схема рядов:** обязательны `Ряд` и `Кол-во ячеек` / `Количество ячеек`.
+                Дополнительно: `Склад`, `Часть ряда`, `Длина ячейки мм`, `Ширина ячейки мм`,
+                `Зазор мм`, `Проезд мм`, `Поворот мм`, `Следующий ряд`, `Комментарий`.
+
+                **Выгрузка 1С:** обязательны `Ряд` и `Ячейка`.
+                Дополнительно: `Склад`, `Адрес ячейки` / `Складская ячейка`.
+                """
+            )
+
+        upload_col, one_c_col = st.columns(2)
+
+        with upload_col:
+            default_zone = st.text_input(
+                "Склад/зона для строк без колонки склада",
+                value="Карта склада",
+                key="warehouse_map_default_zone",
+            )
+            layout_file = st.file_uploader(
+                "Загрузить Excel схемы склада",
+                type=["xlsx"],
+                key="warehouse_map_layout_upload",
+            )
+            if st.button("Построить карту склада", disabled=layout_file is None):
                 try:
-                    layout_file.seek(0)
-                    model = parse_warehouse_excel(layout_file)
-                    st.session_state["virtual_warehouse_model"] = model
-                    st.session_state["virtual_warehouse_diagnostics"] = [
-                        {
-                            "level": "warning",
-                            "message": (
-                                "Файл не похож на табличную схему рядов, поэтому он открыт "
-                                "в упрощённом режиме по цветной Excel-разметке."
-                            ),
-                        }
-                    ]
-                    st.warning(
-                        "Табличные колонки `Ряд` и `Кол-во ячеек` не найдены. "
-                        "Я построил склад по цветным ячейкам Excel в блоке выше."
+                    sheet_name, segments = import_segments_from_excel(
+                        layout_file,
+                        default_zone.strip() or "Карта склада",
                     )
-                except Exception as fallback_exc:
-                    st.error(f"Не удалось загрузить схему склада: {exc}. Упрощённый режим тоже не сработал: {fallback_exc}")
+                    st.session_state["warehouse_map_segments"] = segments
+                    st.session_state["warehouse_map_layout_sheet"] = sheet_name
+                    st.success(
+                        f"Схема загружена: {len(segments)} строк из листа «{sheet_name}»."
+                    )
+                except Exception as exc:
+                    try:
+                        layout_file.seek(0)
+                        model = parse_warehouse_excel(layout_file)
+                        st.session_state["virtual_warehouse_model"] = model
+                        st.session_state["virtual_warehouse_diagnostics"] = [
+                            {
+                                "level": "warning",
+                                "message": (
+                                    "Файл не похож на табличную схему рядов, поэтому он открыт "
+                                    "в упрощённом режиме по цветной Excel-разметке."
+                                ),
+                            }
+                        ]
+                        st.warning(
+                            "Табличные колонки `Ряд` и `Кол-во ячеек` не найдены. "
+                            "Я построил склад по цветным ячейкам Excel в блоке выше."
+                        )
+                    except Exception as fallback_exc:
+                        st.error(f"Не удалось загрузить схему склада: {exc}. Упрощённый режим тоже не сработал: {fallback_exc}")
 
-    with one_c_col:
-        one_c_file = st.file_uploader(
-            "Загрузить Excel выгрузки 1С",
-            type=["xlsx"],
-            key="warehouse_map_1c_upload",
-        )
-        if st.button("Применить номера из 1С", disabled=one_c_file is None):
-            try:
-                sheet_name, one_c_cells = import_1c_cells_from_excel(one_c_file)
-                st.session_state["warehouse_map_1c_cells"] = one_c_cells
-                st.session_state["warehouse_map_1c_sheet"] = sheet_name
-                st.success(
-                    f"Выгрузка 1С загружена: {len(one_c_cells)} ячеек из листа «{sheet_name}»."
-                )
-            except Exception as exc:
-                st.error(f"Не удалось загрузить выгрузку 1С: {exc}")
+        with one_c_col:
+            one_c_file = st.file_uploader(
+                "Загрузить Excel выгрузки 1С",
+                type=["xlsx"],
+                key="warehouse_map_1c_upload",
+            )
+            if st.button("Применить номера из 1С", disabled=one_c_file is None):
+                try:
+                    sheet_name, one_c_cells = import_1c_cells_from_excel(one_c_file)
+                    st.session_state["warehouse_map_1c_cells"] = one_c_cells
+                    st.session_state["warehouse_map_1c_sheet"] = sheet_name
+                    st.success(
+                        f"Выгрузка 1С загружена: {len(one_c_cells)} ячеек из листа «{sheet_name}»."
+                    )
+                except Exception as exc:
+                    st.error(f"Не удалось загрузить выгрузку 1С: {exc}")
 
-    if "warehouse_map_segments" not in st.session_state:
-        st.warning("Загрузите Excel схемы склада в блоке выше, чтобы построить карту.")
-    else:
-        segments = st.session_state["warehouse_map_segments"]
-        one_c_cells = st.session_state.get("warehouse_map_1c_cells")
+        if "warehouse_map_segments" not in st.session_state:
+            st.warning("Загрузите Excel схемы склада в блоке выше, чтобы построить карту.")
+        else:
+            segments = st.session_state["warehouse_map_segments"]
+            one_c_cells = st.session_state.get("warehouse_map_1c_cells")
 
-        st.subheader("Загруженная схема рядов")
-        st.caption(
-            f"Лист схемы: {st.session_state.get('warehouse_map_layout_sheet', 'не указан')}"
-        )
-        st.dataframe(segments, use_container_width=True)
+            st.subheader("Загруженная схема рядов")
+            st.caption(
+                f"Лист схемы: {st.session_state.get('warehouse_map_layout_sheet', 'не указан')}"
+            )
+            st.dataframe(segments, use_container_width=True)
 
-        settings = DEFAULT_SETTINGS.copy()
-        calc_segments = normalize_segments(segments)
-        (
-            cells,
-            gaps,
-            passages,
-            transitions,
-            row_summary,
-            zone_summary,
-        ) = build_model(calc_segments, settings)
-        cells = apply_1c_cell_numbers(cells, one_c_cells)
+            settings = DEFAULT_SETTINGS.copy()
+            calc_segments = normalize_segments(segments)
+            (
+                cells,
+                gaps,
+                passages,
+                transitions,
+                row_summary,
+                zone_summary,
+            ) = build_model(calc_segments, settings)
+            cells = apply_1c_cell_numbers(cells, one_c_cells)
 
-        metric1, metric2, metric3, metric4 = st.columns(4)
-        metric1.metric("Рядов", len(row_summary))
-        metric2.metric("Ячеек", len(cells))
-        metric3.metric("Проездов", len(passages))
-        metric4.metric(
-            "Маршрут, м",
-            round(float(zone_summary["total_route_m"].sum()), 1) if not zone_summary.empty else 0,
-        )
+            metric1, metric2, metric3, metric4 = st.columns(4)
+            metric1.metric("Рядов", len(row_summary))
+            metric2.metric("Ячеек", len(cells))
+            metric3.metric("Проездов", len(passages))
+            metric4.metric(
+                "Маршрут, м",
+                round(float(zone_summary["total_route_m"].sum()), 1) if not zone_summary.empty else 0,
+            )
 
-        map_scale = st.slider(
-            "Масштаб отрисовки",
-            min_value=0.02,
-            max_value=0.20,
-            value=0.08,
-            step=0.01,
-            key="warehouse_map_scale",
-        )
-        components.html(
-            build_visual_map_html(cells, passages, row_summary, map_scale),
-            height=760,
-            scrolling=True,
-        )
+            map_scale = st.slider(
+                "Масштаб отрисовки",
+                min_value=0.02,
+                max_value=0.20,
+                value=0.08,
+                step=0.01,
+                key="warehouse_map_scale",
+            )
+            components.html(
+                build_visual_map_html(cells, passages, row_summary, map_scale),
+                height=760,
+                scrolling=True,
+            )
 
-        with st.expander("Сводка по складу"):
-            st.dataframe(zone_summary, use_container_width=True)
+            with st.expander("Сводка по складу"):
+                st.dataframe(zone_summary, use_container_width=True)
 
-        with st.expander("Сводка по рядам"):
-            st.dataframe(row_summary, use_container_width=True)
+            with st.expander("Сводка по рядам"):
+                st.dataframe(row_summary, use_container_width=True)
 
-        with st.expander("Первые 1000 ячеек"):
-            st.dataframe(cells.head(1000), use_container_width=True)
+            with st.expander("Первые 1000 ячеек"):
+                st.dataframe(cells.head(1000), use_container_width=True)
 
-        if st.button("Очистить загруженную карту склада"):
-            for key in [
-                "warehouse_map_segments",
-                "warehouse_map_layout_sheet",
-                "warehouse_map_1c_cells",
-                "warehouse_map_1c_sheet",
-            ]:
-                if key in st.session_state:
-                    del st.session_state[key]
-            st.rerun()
+            if st.button("Очистить загруженную карту склада"):
+                for key in [
+                    "warehouse_map_segments",
+                    "warehouse_map_layout_sheet",
+                    "warehouse_map_1c_cells",
+                    "warehouse_map_1c_sheet",
+                ]:
+                    if key in st.session_state:
+                        del st.session_state[key]
+                st.rerun()
 
 # ---------- виртуальный склад Excel ----------
 
