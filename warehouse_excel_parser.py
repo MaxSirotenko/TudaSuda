@@ -26,8 +26,6 @@ def _text(value) -> str:
     return _repair_mojibake(str(value)).strip()
 
 
-
-
 def _fill_color(cell) -> str:
     fill = cell.fill
     if fill is None or fill.fill_type is None:
