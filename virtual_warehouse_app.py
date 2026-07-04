@@ -12,6 +12,7 @@ from time import perf_counter
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
+from streamlit.runtime.scriptrunner import get_script_run_ctx
 from openpyxl import load_workbook
 
 from warehouse_diagnostics import build_diagnostics
@@ -19,6 +20,19 @@ from warehouse_excel_parser import parse_warehouse_excel
 from warehouse_model import WarehouseCell, WarehouseModel, WarehouseRow, WarehouseSheet
 from warehouse_placement import apply_cell_addresses, apply_placements, import_cell_addresses, import_placements
 from warehouse_visualization import build_virtual_warehouse_html, prepare_render_cache
+from warehouse_geometry_model import (
+    GeometrySettings,
+    build_geometry_html,
+    build_geometry_model,
+    default_row_config,
+    detect_column_mapping,
+    empty_aisle_config,
+    get_excel_sheet_names as get_geometry_sheet_names,
+    load_geometry_model,
+    normalize_cell_table,
+    read_cell_table,
+    save_geometry_model,
+)
 
 st.set_page_config(page_title="Симулятор сборки", layout="wide")
 
@@ -56,6 +70,23 @@ def prepare_render_cache_cached(model_payload: dict) -> dict:
 @st.cache_data(show_spinner=False)
 def build_virtual_warehouse_html_cached(sheet_payload: dict, scale: int, summary_mode: bool):
     return build_virtual_warehouse_html(sheet_from_dict(sheet_payload), scale=scale, summary_mode=summary_mode)
+
+
+@st.cache_data(show_spinner=False)
+def read_cell_table_cached(file_bytes: bytes, content_hash: str, sheet_name: str, header_rows: int) -> pd.DataFrame:
+    return read_cell_table(file_bytes, sheet_name, header_rows=header_rows)
+
+
+@st.cache_data(show_spinner=False)
+def normalize_cell_table_cached(table_payload: str, mapping_payload: str) -> tuple[pd.DataFrame, list[dict]]:
+    df = pd.read_json(table_payload, orient="split")
+    mapping = json.loads(mapping_payload)
+    return normalize_cell_table(df, mapping)
+
+
+@st.cache_data(show_spinner=False)
+def build_geometry_html_cached(model_payload: str, scale: float, detailed: bool) -> str:
+    return build_geometry_html(json.loads(model_payload), scale=scale, detailed=detailed)
 
 
 def model_to_dict(model: WarehouseModel) -> dict:
@@ -218,10 +249,170 @@ def render_performance(meta: dict) -> None:
     st.caption(f"Модель загружена из кэша: {'да' if meta.get('loaded_from_cache') else 'нет'}")
 
 
+def render_excel_geometry_warehouse() -> None:
+    st.title("Симулятор скорости сборки")
+    st.header("Склад из Excel: ряды + ячейки + проезды")
+    st.caption("Строим не копию Excel-картинки, а рабочую геометрическую модель склада в метрах: вертикальные ряды, фактические ячейки, верхний/нижний проезд и заданные межрядные проезды.")
+
+    saved_model = load_geometry_model()
+    with st.sidebar:
+        st.subheader("Сохранённая геометрия")
+        if saved_model:
+            st.success(f"Есть сохранённая модель: {saved_model.get('source_file_name', '—')}")
+            if st.button("Использовать сохранённую геометрию", key="geometry_use_saved"):
+                st.session_state["geometry_model"] = saved_model
+                st.rerun()
+            if st.button("Очистить сохранённую геометрию", key="geometry_clear_saved"):
+                for path in [MODEL_PATH, META_PATH]:
+                    if path.exists():
+                        path.unlink()
+                st.session_state.pop("geometry_model", None)
+                st.rerun()
+        else:
+            st.caption("Сохранённой геометрии пока нет.")
+
+    uploaded = st.file_uploader("Excel со списком фактических ячеек", type=["xlsx"], key="geometry_cells_file")
+    if uploaded is None:
+        if saved_model:
+            st.info("Загрузите новый Excel или используйте сохранённую модель из боковой панели.")
+        else:
+            st.info("Загрузите Excel со списком ячеек в формате: Код | Ряд | Ячейка | Ярус.")
+        model = st.session_state.get("geometry_model")
+        if model:
+            render_geometry_model_view(model)
+        return
+
+    file_bytes = uploaded.getvalue()
+    content_hash = file_hash(file_bytes)
+    sheet_names = get_geometry_sheet_names(file_bytes)
+    sheet_name = st.selectbox("Лист со списком ячеек", sheet_names, key="geometry_sheet")
+    header_rows = st.radio("Строк заголовка", [1, 2], index=1, horizontal=True, help="Если в Excel сверху 'Ряд', а ниже 'Ссылка', выберите 2 строки заголовка.")
+
+    timings: dict[str, float] = {}
+    started = perf_counter()
+    df = read_cell_table_cached(file_bytes, content_hash, sheet_name, header_rows)
+    timings["read_excel_seconds"] = perf_counter() - started
+    st.caption(f"Прочитано строк: {len(df)}; колонок: {len(df.columns)}")
+    with st.expander("Предпросмотр первых строк", expanded=False):
+        st.dataframe(df.head(30), use_container_width=True)
+
+    detected = detect_column_mapping(df)
+    st.subheader("Колонки")
+    columns = [None] + list(df.columns)
+    c1, c2, c3, c4 = st.columns(4)
+    mapping = {
+        "code": c1.selectbox("Код", columns, index=columns.index(detected["code"]) if detected["code"] in columns else 0),
+        "row_number": c2.selectbox("Ряд", columns, index=columns.index(detected["row_number"]) if detected["row_number"] in columns else 0),
+        "cell_number": c3.selectbox("Ячейка", columns, index=columns.index(detected["cell_number"]) if detected["cell_number"] in columns else 0),
+        "tier": c4.selectbox("Ярус", columns, index=columns.index(detected["tier"]) if detected["tier"] in columns else 0),
+    }
+
+    norm_started = perf_counter()
+    normalized_df, column_diagnostics = normalize_cell_table_cached(df.to_json(orient="split", force_ascii=False), json.dumps(mapping, ensure_ascii=False))
+    timings["normalize_columns_seconds"] = perf_counter() - norm_started
+    if any(item.get("level") == "error" for item in column_diagnostics):
+        st.error("Не удалось определить обязательные колонки. Выберите 'Ряд' и 'Ячейка' вручную.")
+        st.dataframe(pd.DataFrame(column_diagnostics), use_container_width=True)
+        return
+
+    st.subheader("Размеры и ярусы")
+    s1, s2, s3, s4, s5 = st.columns(5)
+    cell_length_m = s1.number_input("Длина ячейки вдоль ряда, м", min_value=0.1, value=1.2, step=0.1)
+    cell_width_m = s2.number_input("Ширина ряда, м", min_value=0.1, value=0.8, step=0.1)
+    aisle_width_m = s3.number_input("Межрядный проезд, м", min_value=0.1, value=3.4, step=0.1)
+    top_road_width_m = s4.number_input("Верхний проезд, м", min_value=0.1, value=3.4, step=0.1)
+    bottom_road_width_m = s5.number_input("Нижний проезд, м", min_value=0.1, value=3.4, step=0.1)
+    tier_values = sorted(normalized_df["tier"].dropna().astype(str).unique().tolist(), key=lambda value: (not value.isdigit(), value)) or ["1"]
+    tier_mode = st.radio("Ярусы", ["selected", "all", "min_per_cell"], format_func={"selected": "только выбранный", "all": "все", "min_per_cell": "минимальный для ряд+ячейка"}.get, horizontal=True)
+    selected_tier = st.selectbox("Выбранный ярус", tier_values, disabled=tier_mode != "selected")
+
+    row_config_default = default_row_config(normalized_df)
+    st.subheader("Порядок рядов")
+    row_config = st.data_editor(row_config_default, num_rows="dynamic", use_container_width=True, key="geometry_row_config")
+
+    st.subheader("Проезды между рядами")
+    st.caption("Если пары row_from → row_to нет в таблице, ряды стоят плотно. Если есть — между ними добавляется проезд.")
+    aisle_config = st.data_editor(empty_aisle_config(), num_rows="dynamic", use_container_width=True, key="geometry_aisle_config")
+
+    build_clicked = st.button("Построить склад", type="primary", key="geometry_build")
+    if build_clicked:
+        settings = GeometrySettings(
+            cell_length_m=cell_length_m,
+            cell_width_m=cell_width_m,
+            aisle_width_m=aisle_width_m,
+            top_road_width_m=top_road_width_m,
+            bottom_road_width_m=bottom_road_width_m,
+            selected_tier=str(selected_tier),
+            tier_mode=tier_mode,
+        )
+        build_started = perf_counter()
+        model, diagnostics = build_geometry_model(normalized_df, settings, row_config, aisle_config, uploaded.name, sheet_name)
+        timings["build_geometry_seconds"] = perf_counter() - build_started
+        model["performance"] = timings | model.get("performance", {})
+        save_started = perf_counter()
+        save_geometry_model(model)
+        timings["save_model_seconds"] = perf_counter() - save_started
+        model["performance"] = timings | model.get("performance", {})
+        save_geometry_model(model)
+        st.session_state["geometry_model"] = model
+        st.success(f"Геометрическая модель построена и сохранена: {len(model['rows'])} рядов, {len(model['cells'])} ячеек, {len(model['aisles'])} проездов.")
+
+    model = st.session_state.get("geometry_model")
+    if model:
+        render_geometry_model_view(model)
+
+
+def render_geometry_model_view(model: dict) -> None:
+    st.subheader("Диагностика импорта")
+    settings = model.get("settings", {})
+    stats = [
+        ("Рядов", len(model.get("rows", []))),
+        ("Ячеек", len(model.get("cells", []))),
+        ("Проездов между рядами", len(model.get("aisles", []))),
+        ("Верхний проезд", f"{settings.get('top_road_width_m', 0)} м"),
+        ("Нижний проезд", f"{settings.get('bottom_road_width_m', 0)} м"),
+    ]
+    cols = st.columns(len(stats))
+    for col, (label, value) in zip(cols, stats):
+        col.metric(label, value)
+    diagnostics = model.get("diagnostics", [])
+    if diagnostics:
+        st.dataframe(pd.DataFrame(diagnostics), use_container_width=True)
+    st.subheader("Карта")
+    detailed = st.toggle("Детальный режим", value=len(model.get("cells", [])) <= 1500)
+    scale = st.slider("Масштаб, px/м", min_value=4.0, max_value=40.0, value=18.0, step=1.0)
+    render_started = perf_counter()
+    html = build_geometry_html_cached(json.dumps(model, ensure_ascii=False), scale, detailed)
+    components.html(html, height=760, scrolling=True)
+    st.caption(f"Рендер карты: {perf_counter() - render_started:.2f} сек. Модель: data/last_import/warehouse_model.json")
+    tabs = st.tabs(["Ряды", "Ячейки", "Проезды", "Навигация", "JSON"])
+    with tabs[0]:
+        st.dataframe(pd.DataFrame(model.get("rows", [])), use_container_width=True)
+    with tabs[1]:
+        st.dataframe(pd.DataFrame(model.get("cells", [])).head(10000), use_container_width=True)
+    with tabs[2]:
+        st.dataframe(pd.DataFrame(model.get("aisles", [])), use_container_width=True)
+        st.dataframe(pd.DataFrame(model.get("roads", [])), use_container_width=True)
+    with tabs[3]:
+        st.dataframe(pd.DataFrame(model.get("navigation_nodes", [])), use_container_width=True)
+        st.dataframe(pd.DataFrame(model.get("navigation_edges", [])), use_container_width=True)
+    with tabs[4]:
+        st.download_button("Скачать модель JSON", json.dumps(model, ensure_ascii=False, indent=2).encode("utf-8"), file_name="warehouse_model.json", mime="application/json")
+
+
 def render_virtual_warehouse_excel() -> None:
+    st.sidebar.caption(f"Сборка приложения: {APP_BUILD_LABEL}")
+    mode = st.sidebar.radio(
+        "Режим",
+        ["Склад из Excel: ряды + ячейки + проезды", "Виртуальный склад по Excel-схеме"],
+        index=0,
+    )
+    if mode == "Склад из Excel: ряды + ячейки + проезды":
+        render_excel_geometry_warehouse()
+        return
+
     st.title("Симулятор скорости сборки")
     st.header("Виртуальный склад по Excel-схеме")
-    st.sidebar.caption(f"Сборка приложения: {APP_BUILD_LABEL}")
     st.sidebar.info("Оставлен только режим виртуального склада Excel. Старые разделы скрыты из интерфейса.")
 
     ensure_loaded_model()
@@ -355,4 +546,21 @@ def render_virtual_warehouse_excel() -> None:
         st.dataframe(diag_df, use_container_width=True)
         st.download_button("Скачать диагностику CSV", diag_df.to_csv(index=False).encode("utf-8-sig"), file_name="virtual_warehouse_diagnostics.csv", mime="text/csv")
         st.download_button("Скачать модель JSON", json.dumps(model_to_dict(model), ensure_ascii=False, indent=2).encode("utf-8"), file_name="warehouse_model.json", mime="application/json")
+
+
+_VIRTUAL_WAREHOUSE_APP_RENDERED = False
+
+
+def main() -> None:
+    global _VIRTUAL_WAREHOUSE_APP_RENDERED
+    if get_script_run_ctx(suppress_warning=True) is None and __name__ != "__main__":
+        return
+    if _VIRTUAL_WAREHOUSE_APP_RENDERED:
+        return
+    _VIRTUAL_WAREHOUSE_APP_RENDERED = True
+    render_virtual_warehouse_excel()
+
+
+if __name__ == "__main__" or get_script_run_ctx(suppress_warning=True) is not None:
+    main()
 
