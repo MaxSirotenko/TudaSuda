@@ -12,6 +12,7 @@ from time import perf_counter
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
+from streamlit.runtime.scriptrunner import get_script_run_ctx
 from openpyxl import load_workbook
 
 from warehouse_diagnostics import build_diagnostics
@@ -356,3 +357,19 @@ def render_virtual_warehouse_excel() -> None:
         st.download_button("Скачать диагностику CSV", diag_df.to_csv(index=False).encode("utf-8-sig"), file_name="virtual_warehouse_diagnostics.csv", mime="text/csv")
         st.download_button("Скачать модель JSON", json.dumps(model_to_dict(model), ensure_ascii=False, indent=2).encode("utf-8"), file_name="warehouse_model.json", mime="application/json")
 
+
+_VIRTUAL_WAREHOUSE_APP_RENDERED = False
+
+
+def main() -> None:
+    global _VIRTUAL_WAREHOUSE_APP_RENDERED
+    if get_script_run_ctx(suppress_warning=True) is None and __name__ != "__main__":
+        return
+    if _VIRTUAL_WAREHOUSE_APP_RENDERED:
+        return
+    _VIRTUAL_WAREHOUSE_APP_RENDERED = True
+    render_virtual_warehouse_excel()
+
+
+if __name__ == "__main__" or get_script_run_ctx(suppress_warning=True) is not None:
+    main()
