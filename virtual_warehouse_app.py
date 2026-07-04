@@ -356,3 +356,5 @@ def render_virtual_warehouse_excel() -> None:
         st.download_button("Скачать диагностику CSV", diag_df.to_csv(index=False).encode("utf-8-sig"), file_name="virtual_warehouse_diagnostics.csv", mime="text/csv")
         st.download_button("Скачать модель JSON", json.dumps(model_to_dict(model), ensure_ascii=False, indent=2).encode("utf-8"), file_name="warehouse_model.json", mime="application/json")
 
+if __name__ == "__main__":
+    render_virtual_warehouse_excel()
