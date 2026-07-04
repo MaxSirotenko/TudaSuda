@@ -47,11 +47,29 @@ render_virtual_warehouse_excel()
 start.cmd
 ```
 
-Скрипт сам перейдёт в папку проекта, создаст `venv`, установит зависимости из `requirements.txt` и запустит:
+Скрипт сам перейдёт в папку проекта, безопасно попробует подтянуть свежий код из GitHub через `git fetch --prune` и `git pull --ff-only`, создаст `venv`, установит зависимости из `requirements.txt` только при изменении hash файла и запустит основной entrypoint `virtual_warehouse_app.py`:
 
 ```bat
 streamlit run virtual_warehouse_app.py --server.address localhost --server.port 8501 --browser.serverAddress localhost
 ```
+
+`app.py` оставлен только как compatibility wrapper для старых команд запуска. Полная Excel-only логика виртуального склада живёт в `virtual_warehouse_app.py`. После merge PR локально достаточно выполнить:
+
+```bat
+start.cmd
+```
+
+Подробности запуска, текущий commit, hash entrypoint и ошибки обновления пишутся в `start.log`. Если в рабочей папке есть локальные изменения, `start.cmd` не делает `pull`, чтобы ничего не затереть.
+
+Если локальная папка уже конфликтная и вы точно готовы удалить локальные изменения, можно вручную синхронизироваться с GitHub:
+
+```bash
+git status
+git fetch origin
+git reset --hard origin/main
+```
+
+Внимание: `git reset --hard` безвозвратно удаляет локальные изменения в отслеживаемых файлах. Не запускайте его, если нужно сохранить свои правки.
 
 
 
