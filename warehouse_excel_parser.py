@@ -82,16 +82,27 @@ def _find_extent(ws, r: int, c: int) -> tuple[int, int, int, int, str, float, li
     return min_row, min_col, max_row, max_col, direction, confidence, warnings
 
 
-def parse_warehouse_excel(file_obj) -> WarehouseModel:
+def parse_warehouse_excel(file_obj, sheet_names: list[str] | None = None) -> WarehouseModel:
     if isinstance(file_obj, bytes):
         file_obj = BytesIO(file_obj)
     wb = load_workbook(file_obj, data_only=True)
     model = WarehouseModel(sheets=[])
+    selected_names = set(sheet_names or wb.sheetnames)
     for ws in wb.worksheets:
+        if ws.title not in selected_names:
+            continue
         values = []
         labels = []
         painted_by_excel_row: dict[int, list[tuple]] = {}
-        for row in ws.iter_rows():
+        min_row, min_col, max_row, max_col = 1, 1, ws.max_row, ws.max_column
+        if ws.max_row == 1 and ws.max_column == 1 and ws.cell(1, 1).value is None and not _fill_color(ws.cell(1, 1)):
+            sheet = WarehouseSheet(name=ws.title, max_row=1, max_column=1, values=[], merged_ranges=[])
+            sheet.warnings.append("Лист пустой и пропущен без детальной обработки.")
+            model.sheets.append(sheet)
+            continue
+        for row in ws.iter_rows(min_row=min_row, max_row=max_row, min_col=min_col, max_col=max_col):
+            if not any(cell.value is not None or cell.fill.fill_type is not None for cell in row):
+                continue
             for cell in row:
                 text = _text(cell.value)
                 fill_color = _fill_color(cell)
@@ -167,4 +178,5 @@ def parse_warehouse_excel(file_obj) -> WarehouseModel:
             if not sheet.rows:
                 sheet.warnings.append("На листе не найдены цветные ячейки или уверенные текстовые подписи рядов.")
         model.sheets.append(sheet)
+    wb.close()
     return model
