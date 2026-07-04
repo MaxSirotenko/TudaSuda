@@ -63,6 +63,7 @@ streamlit run virtual_warehouse_app.py --server.address localhost --server.port 
 Если после обновления проекта в браузере всё ещё виден старый интерфейс с разделами
 `Шаблоны файлов`, `Загрузка данных`, `Карта РЦ`, `Карта склада`, `Расчет маршрутов`,
 значит открыт старый Streamlit-процесс. Запускайте приложение через `start.cmd`: он
+
 освобождает порт `8501`, пишет в `start.log` текущий git commit, entrypoint и hash `virtual_warehouse_app.py`, а затем
 стартует актуальный `virtual_warehouse_app.py`. После запуска обновите страницу браузера.
 
