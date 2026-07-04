@@ -27,6 +27,18 @@ render_virtual_warehouse_excel()
 После сохранения проверьте, что в файлах не осталось строк `<<<<<<<`, `=======`, `>>>>>>>`,
 и запустите `python -m compileall .`.
 
+
+## Резолюция merge conflict в `start.cmd`
+
+Если Git показывает конфликт между запуском через `%STREAMLIT_ENTRYPOINT%` и запуском
+через `app.py`, выбирайте вариант с `%STREAMLIT_ENTRYPOINT%`. Основной Streamlit-файл
+теперь `virtual_warehouse_app.py`, а `app.py` — только wrapper для обратной совместимости.
+В конфликте нужно оставить строки, которые:
+
+- считают hash от `Path('%STREAMLIT_ENTRYPOINT%')`;
+- пишут в лог `Streamlit entrypoint` и `Entrypoint file hash`;
+- запускают `python -m streamlit run "%STREAMLIT_ENTRYPOINT%" ...`.
+
 ## Быстрый запуск на Windows
 
 ### Распознавалка
