@@ -373,12 +373,4 @@ def main() -> None:
 
 if __name__ == "__main__" or get_script_run_ctx(suppress_warning=True) is not None:
     main()
-    if _VIRTUAL_WAREHOUSE_APP_RENDERED:
-        return
-    _VIRTUAL_WAREHOUSE_APP_RENDERED = True
-    render_virtual_warehouse_excel()
-
-
-if __name__ == "__main__" or get_script_run_ctx(suppress_warning=True) is not None:
-    main()
 
