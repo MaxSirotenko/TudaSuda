@@ -5,7 +5,17 @@ def _coord_key(x, y):
     return (int(x), int(y))
 
 
-def build_virtual_warehouse_html(sheet, scale=34):
+def prepare_render_cache(model):
+    cells = model.cells
+    return {
+        "sheet_count": len(model.sheets),
+        "cell_count": len(cells),
+        "row_count": len({row.row_number for sheet in model.sheets for row in sheet.rows}),
+        "zone_count": len({cell.fill_color or "без зоны" for cell in cells}),
+    }
+
+
+def build_virtual_warehouse_html(sheet, scale=34, summary_mode=False):
     width = max(900, sheet.max_column * scale + 80)
     height = max(500, sheet.max_row * scale + 80)
     parts = [f"<div style='position:relative;width:{width}px;height:{height}px;background:#fafafa;border:1px solid #ddd;overflow:auto'>"]
@@ -18,6 +28,9 @@ def build_virtual_warehouse_html(sheet, scale=34):
         color = "#2563eb" if row.confidence >= 0.6 else "#f59e0b"
         row_number = html.escape(row.row_number)
         parts.append(f"<div title='Ряд {row_number} confidence={row.confidence:.2f}' style='position:absolute;left:{left}px;top:{top}px;width:{w}px;height:{h}px;border:2px dashed {color};box-sizing:border-box;color:{color};font:12px Arial'>Ряд {row_number}</div>")
+        if summary_mode:
+            parts.append(f"<div title='Ряд {row_number}: {len(row.potential_cells)} ячеек' style='position:absolute;left:{left}px;top:{top}px;width:{w}px;height:{max(h, scale)}px;background:rgba(37,99,235,0.12);border:1px solid {color};box-sizing:border-box;color:{color};font:12px Arial;text-align:center;line-height:{max(h, scale)}px'>{row_number}: {len(row.potential_cells)}</div>")
+            continue
         for cell in row.potential_cells:
             modeled_coords.add(_coord_key(cell.x, cell.y))
             cleft = cell.x * scale
