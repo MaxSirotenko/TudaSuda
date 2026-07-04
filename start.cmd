@@ -14,8 +14,10 @@ if not exist "requirements.txt" (
     exit /b 1
 )
 
-if not exist "app.py" (
-    call :fail app.py was not found in %CD%.
+set "STREAMLIT_ENTRYPOINT=virtual_warehouse_app.py"
+
+if not exist "%STREAMLIT_ENTRYPOINT%" (
+    call :fail %STREAMLIT_ENTRYPOINT% was not found in %CD%.
     exit /b 1
 )
 
@@ -78,16 +80,20 @@ if not "%REQ_HASH%"=="%INSTALLED_REQ_HASH%" (
     >"%REQ_HASH_FILE%" echo %REQ_HASH%
 )
 
-for /f "usebackq delims=" %%H in (`python -c "from pathlib import Path; import hashlib; p=Path('app.py'); print(hashlib.sha256(p.read_bytes()).hexdigest()[:12])"`) do set "APP_HASH=%%H"
+rem Merge conflict note: keep hashing %STREAMLIT_ENTRYPOINT%, not app.py.
+rem app.py is only a compatibility wrapper; virtual_warehouse_app.py is the real Streamlit entrypoint.
+for /f "usebackq delims=" %%H in (`python -c "from pathlib import Path; import hashlib; p=Path('%STREAMLIT_ENTRYPOINT%'); print(hashlib.sha256(p.read_bytes()).hexdigest()[:12])"`) do set "APP_HASH=%%H"
 set "GIT_COMMIT=unknown"
 for /f "usebackq delims=" %%H in (`git rev-parse --short HEAD 2^>nul`) do set "GIT_COMMIT=%%H"
-call :log App file hash: %APP_HASH%
+call :log Streamlit entrypoint: %STREAMLIT_ENTRYPOINT%
+call :log Entrypoint file hash: %APP_HASH%
 call :log Git commit: %GIT_COMMIT%
 
 call :free_port 8501
 
 call :log Starting Streamlit on http://localhost:8501/
-python -m streamlit run app.py --server.address localhost --server.port 8501 --browser.serverAddress localhost --server.fileWatcherType poll
+rem Merge conflict note: keep running %STREAMLIT_ENTRYPOINT%, not app.py.
+python -m streamlit run "%STREAMLIT_ENTRYPOINT%" --server.address localhost --server.port 8501 --browser.serverAddress localhost --server.fileWatcherType poll
 if errorlevel 1 (
     call :fail Streamlit stopped with an error. See %START_LOG% for setup details.
     exit /b 1
