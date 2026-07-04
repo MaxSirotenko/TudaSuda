@@ -358,7 +358,6 @@ def render_virtual_warehouse_excel() -> None:
         st.download_button("Скачать модель JSON", json.dumps(model_to_dict(model), ensure_ascii=False, indent=2).encode("utf-8"), file_name="warehouse_model.json", mime="application/json")
 
 
-
 _VIRTUAL_WAREHOUSE_APP_RENDERED = False
 
 
@@ -374,3 +373,12 @@ def main() -> None:
 
 if __name__ == "__main__" or get_script_run_ctx(suppress_warning=True) is not None:
     main()
+    if _VIRTUAL_WAREHOUSE_APP_RENDERED:
+        return
+    _VIRTUAL_WAREHOUSE_APP_RENDERED = True
+    render_virtual_warehouse_excel()
+
+
+if __name__ == "__main__" or get_script_run_ctx(suppress_warning=True) is not None:
+    main()
+
