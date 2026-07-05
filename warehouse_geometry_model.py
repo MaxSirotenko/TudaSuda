@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import json
 import re
+import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from io import BytesIO
@@ -15,6 +16,7 @@ import pandas as pd
 GEOMETRY_MODEL_VERSION = 1
 GEOMETRY_MODEL_PATH = Path("data/last_import/warehouse_model.json")
 GEOMETRY_META_PATH = Path("data/last_import/import_meta.json")
+MANUAL_OVERRIDES_PATH = Path("data/last_import/manual_overrides.json")
 
 CODE_ALIASES = ["code", "код"]
 ROW_ALIASES = ["row_number", "row", "ряд", "ряд ссылка", "ряд/ссылка", "ряд / ссылка"]
@@ -212,6 +214,8 @@ def build_geometry_model(
     aisle_config: pd.DataFrame | None = None,
     source_file_name: str = "",
     source_sheet_name: str = "",
+    source_file_hash: str = "",
+    existing_model_id: str | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     started = perf_counter()
     diagnostics: list[dict[str, Any]] = []
@@ -277,6 +281,7 @@ def build_geometry_model(
                 "width_m": settings.cell_width_m,
                 "length_m": settings.cell_length_m,
                 "source_line": int(cell_row.get("source_line", 0)),
+                "source": _display_value(cell_row.get("source")) or "excel",
             }
             cells.append(cell)
             row_cells.append(cell)
@@ -333,12 +338,15 @@ def build_geometry_model(
     model = {
         "model_type": "excel_rows_cells_aisles_geometry",
         "model_version": GEOMETRY_MODEL_VERSION,
+        "model_id": existing_model_id or str(uuid.uuid4()),
         "created_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
         "source_file_name": source_file_name,
         "source_sheet_name": source_sheet_name,
+        "source_file_hash": source_file_hash,
         "settings": asdict(settings),
         "rows": rows,
         "cells": cells,
+        "base_cells": [dict(cell) for cell in cells],
         "aisles": aisles,
         "roads": roads,
         "navigation_nodes": navigation_nodes,
@@ -352,7 +360,7 @@ def build_geometry_model(
 def save_geometry_model(model: dict[str, Any]) -> None:
     GEOMETRY_MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
     GEOMETRY_MODEL_PATH.write_text(json.dumps(model, ensure_ascii=False, indent=2), encoding="utf-8")
-    GEOMETRY_META_PATH.write_text(json.dumps({"model_type": model.get("model_type"), "created_at": model.get("created_at"), "source_file_name": model.get("source_file_name"), "source_sheet_name": model.get("source_sheet_name")}, ensure_ascii=False, indent=2), encoding="utf-8")
+    GEOMETRY_META_PATH.write_text(json.dumps({"model_type": model.get("model_type"), "model_id": model.get("model_id"), "created_at": model.get("created_at"), "source_file_name": model.get("source_file_name"), "source_sheet_name": model.get("source_sheet_name"), "source_file_hash": model.get("source_file_hash")}, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def load_geometry_model() -> dict[str, Any] | None:
@@ -361,7 +369,182 @@ def load_geometry_model() -> dict[str, Any] | None:
     data = json.loads(GEOMETRY_MODEL_PATH.read_text(encoding="utf-8-sig"))
     if data.get("model_type") != "excel_rows_cells_aisles_geometry":
         return None
+    if "base_cells" not in data:
+        data["base_cells"] = [dict(cell) for cell in data.get("cells", [])]
+    overrides = load_manual_overrides()
+    if overrides and overrides.get("source_model_id") == data.get("model_id"):
+        data = apply_manual_overrides(data, overrides)
     return data
+
+
+def cell_key(cell: dict[str, Any]) -> str:
+    return f"{_display_value(cell.get('row_number'))}|{_display_value(cell.get('cell_number'))}|{_display_value(cell.get('tier'))}"
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def load_manual_overrides() -> dict[str, Any] | None:
+    if not MANUAL_OVERRIDES_PATH.exists():
+        return None
+    try:
+        return json.loads(MANUAL_OVERRIDES_PATH.read_text(encoding="utf-8-sig"))
+    except json.JSONDecodeError:
+        return None
+
+
+def save_manual_overrides(payload: dict[str, Any]) -> None:
+    MANUAL_OVERRIDES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    MANUAL_OVERRIDES_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def empty_manual_overrides(model: dict[str, Any]) -> dict[str, Any]:
+    now = _now_iso()
+    return {
+        "source_model_id": model.get("model_id"),
+        "source_file_hash": model.get("source_file_hash", ""),
+        "source_file_name": model.get("source_file_name", ""),
+        "created_at": now,
+        "updated_at": now,
+        "changes": [],
+    }
+
+
+def clear_manual_overrides() -> None:
+    if MANUAL_OVERRIDES_PATH.exists():
+        MANUAL_OVERRIDES_PATH.unlink()
+
+
+def append_manual_change(model: dict[str, Any], change_type: str, old_value: dict[str, Any] | None, new_value: dict[str, Any] | None, comment: str = "") -> dict[str, Any]:
+    overrides = load_manual_overrides()
+    if not overrides or overrides.get("source_model_id") != model.get("model_id"):
+        overrides = empty_manual_overrides(model)
+    key_source = new_value or old_value or {}
+    change = {
+        "change_id": str(uuid.uuid4()),
+        "change_type": change_type,
+        "created_at": _now_iso(),
+        "cell_key": cell_key(key_source),
+        "old_value": old_value,
+        "new_value": new_value,
+        "comment": comment,
+    }
+    overrides.setdefault("changes", []).append(change)
+    overrides["updated_at"] = change["created_at"]
+    save_manual_overrides(overrides)
+    return overrides
+
+
+def manual_change_counts(overrides: dict[str, Any] | None) -> dict[str, int]:
+    changes = (overrides or {}).get("changes", [])
+    return {
+        "total": len(changes),
+        "add": sum(1 for item in changes if item.get("change_type") == "add"),
+        "update": sum(1 for item in changes if item.get("change_type") == "update"),
+        "delete": sum(1 for item in changes if item.get("change_type") == "delete"),
+    }
+
+
+def _cells_to_df(cells: list[dict[str, Any]]) -> pd.DataFrame:
+    rows = []
+    for idx, cell in enumerate(cells):
+        rows.append({
+            "code": _display_value(cell.get("code")),
+            "row_number": _display_value(cell.get("row_number")),
+            "cell_number": _display_value(cell.get("cell_number")),
+            "tier": _display_value(cell.get("tier")),
+            "source": _display_value(cell.get("source")) or "excel",
+            "source_line": int(cell.get("source_line", idx + 2) or idx + 2),
+        })
+    return pd.DataFrame(rows, columns=["code", "row_number", "cell_number", "tier", "source", "source_line"])
+
+
+def _row_config_from_model(model: dict[str, Any]) -> pd.DataFrame:
+    return pd.DataFrame([
+        {
+            "row_number": row.get("row_number"),
+            "row_order": row.get("row_order"),
+            "row_group": row.get("row_group", ""),
+            "side": row.get("side", ""),
+            "comment": row.get("comment", ""),
+        }
+        for row in model.get("rows", [])
+    ])
+
+
+def _aisle_config_from_model(model: dict[str, Any]) -> pd.DataFrame:
+    return pd.DataFrame([
+        {
+            "row_from": aisle.get("row_from"),
+            "row_to": aisle.get("row_to"),
+            "aisle_width_m": aisle.get("aisle_width_m"),
+            "aisle_type": aisle.get("aisle_type", "межрядный проезд"),
+            "comment": aisle.get("comment", ""),
+        }
+        for aisle in model.get("aisles", [])
+    ])
+
+
+def settings_from_model(model: dict[str, Any]) -> GeometrySettings:
+    raw = model.get("settings", {})
+    return GeometrySettings(
+        cell_length_m=_safe_float(raw.get("cell_length_m"), 1.2),
+        cell_width_m=_safe_float(raw.get("cell_width_m"), 0.8),
+        aisle_width_m=_safe_float(raw.get("aisle_width_m"), 3.4),
+        top_road_width_m=_safe_float(raw.get("top_road_width_m"), 3.4),
+        bottom_road_width_m=_safe_float(raw.get("bottom_road_width_m"), 3.4),
+        selected_tier=_display_value(raw.get("selected_tier")) or "1",
+        tier_mode=_display_value(raw.get("tier_mode")) or "selected",
+        row_order_mode=_display_value(raw.get("row_order_mode")) or "row_order_or_number",
+    )
+
+
+def rebuild_geometry_from_cells(model: dict[str, Any], cells: list[dict[str, Any]], keep_base_cells: bool = True) -> dict[str, Any]:
+    rebuilt, _ = build_geometry_model(
+        _cells_to_df(cells),
+        settings_from_model(model),
+        _row_config_from_model(model),
+        _aisle_config_from_model(model),
+        source_file_name=model.get("source_file_name", ""),
+        source_sheet_name=model.get("source_sheet_name", ""),
+        source_file_hash=model.get("source_file_hash", ""),
+        existing_model_id=model.get("model_id"),
+    )
+    rebuilt["created_at"] = model.get("created_at", rebuilt.get("created_at"))
+    rebuilt["manual_updated_at"] = _now_iso()
+    rebuilt["base_cells"] = [dict(cell) for cell in model.get("base_cells", model.get("cells", []))] if keep_base_cells else [dict(cell) for cell in rebuilt.get("cells", [])]
+    return rebuilt
+
+
+def apply_manual_overrides(model: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
+    cells_by_key = {cell_key(cell): dict(cell) for cell in model.get("base_cells", model.get("cells", []))}
+    for change in overrides.get("changes", []):
+        change_type = change.get("change_type")
+        old_value = change.get("old_value")
+        new_value = change.get("new_value")
+        if change_type == "add" and new_value:
+            updated = dict(new_value)
+            updated["source"] = "manual_add"
+            cells_by_key[cell_key(updated)] = updated
+        elif change_type == "update" and old_value and new_value:
+            cells_by_key.pop(cell_key(old_value), None)
+            updated = dict(new_value)
+            updated["source"] = "manual_update"
+            cells_by_key[cell_key(updated)] = updated
+        elif change_type == "delete" and old_value:
+            cells_by_key.pop(cell_key(old_value), None)
+    rebuilt = rebuild_geometry_from_cells(model, list(cells_by_key.values()), keep_base_cells=True)
+    rebuilt["manual_overrides_applied"] = True
+    rebuilt["manual_change_counts"] = manual_change_counts(overrides)
+    return rebuilt
+
+
+def export_current_model_excel_bytes(model: dict[str, Any]) -> bytes:
+    buffer = BytesIO()
+    columns = ["code", "row_number", "cell_number", "tier", "source", "x_min", "x_max", "y_min", "y_max", "x_center", "y_center"]
+    pd.DataFrame(model.get("cells", [])).reindex(columns=columns).to_excel(buffer, index=False)
+    return buffer.getvalue()
 
 
 def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bool = True) -> str:
@@ -392,7 +575,8 @@ def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bo
         rect(aisle["x_min"], 0, aisle["x_max"], y_max, "#fef3c7", "1px solid #f59e0b", "проезд", f"{aisle['row_from']} → {aisle['row_to']}: {aisle['aisle_width_m']} м")
     if detailed:
         for cell in cells:
-            title = f"code: {cell['code']}\nrow: {cell['row_number']}\ncell: {cell['cell_number']}\ntier: {cell['tier']}\nx: {cell['x_center']:.2f}\ny: {cell['y_center']:.2f}"
+            source_label = {"excel": "Excel", "manual_add": "добавлена вручную", "manual_update": "изменена вручную"}.get(str(cell.get("source", "excel")), str(cell.get("source", "excel")))
+            title = f"Код: {cell['code']}\nРяд: {cell['row_number']}\nЯчейка: {cell['cell_number']}\nЯрус: {cell['tier']}\nX: {cell['x_center']:.2f}\nY: {cell['y_center']:.2f}\nИсточник: {source_label}"
             rect(cell["x_min"], cell["y_min"], cell["x_max"], cell["y_max"], "#e2e8f0", "1px solid #64748b", str(cell["cell_number"]), title)
     else:
         for row in rows:
