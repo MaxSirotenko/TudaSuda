@@ -9,6 +9,10 @@ call :log Starting TudaSuda recognizer from %CD%
 call :log Log file: %START_LOG%
 call :log ============================================================
 
+
+call :safe_git_update
+if errorlevel 1 exit /b 1
+
 if not exist "requirements.txt" (
     call :fail requirements.txt was not found in %CD%.
     exit /b 1
@@ -101,6 +105,38 @@ if errorlevel 1 (
 
 exit /b 0
 
+
+:safe_git_update
+set "GIT_DIRTY="
+if not exist ".git" (
+    call :log Git repository was not found. Skipping auto-update.
+    exit /b 0
+)
+where git >nul 2>&1
+if errorlevel 1 (
+    call :log Git was not found in PATH. Skipping auto-update.
+    exit /b 0
+)
+for /f "usebackq delims=" %%S in (`git status --porcelain 2^>^>"%START_LOG%"`) do set "GIT_DIRTY=1"
+if defined GIT_DIRTY (
+    call :log Local changes detected. Skipping git pull to avoid overwriting your work.
+    git status --short >>"%START_LOG%" 2>&1
+    exit /b 0
+)
+call :log Fetching latest Git metadata...
+git fetch --prune >>"%START_LOG%" 2>&1
+if errorlevel 1 (
+    call :log git fetch failed. Continuing with local checkout; see %START_LOG% for details.
+    exit /b 0
+)
+call :log Pulling latest code with fast-forward only...
+git pull --ff-only >>"%START_LOG%" 2>&1
+if errorlevel 1 (
+    call :fail git pull --ff-only failed. Resolve divergent history or conflicts manually, then run start.cmd again. See %START_LOG%.
+    exit /b 1
+)
+call :log Git auto-update completed.
+exit /b 0
 :free_port
 set "PORT=%~1"
 set "FOUND_PID="
