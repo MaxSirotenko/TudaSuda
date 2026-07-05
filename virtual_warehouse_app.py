@@ -125,6 +125,48 @@ def render_git_release_badge() -> None:
     st.sidebar.caption(f"Git commit: {info['commit_hash']} · {info['commit_date']}")
 
 
+@st.cache_data(show_spinner=False)
+def get_git_release_info() -> dict[str, str]:
+    repo_dir = Path(__file__).resolve().parent
+
+    def git_text(*args: str) -> str:
+        try:
+            result = subprocess.run(
+                ["git", *args],
+                cwd=repo_dir,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=2,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        if result.returncode != 0:
+            return ""
+        return result.stdout.strip()
+
+    merge_title = git_text("log", "--merges", "-1", "--pretty=%s")
+    commit_title = git_text("log", "-1", "--pretty=%s")
+    commit_hash = git_text("rev-parse", "--short", "HEAD")
+    commit_date = git_text("log", "-1", "--date=short", "--pretty=%cd")
+    return {
+        "merge_title": merge_title,
+        "commit_title": commit_title,
+        "display_label": "Последний merge" if merge_title else "Последний commit",
+        "display_title": merge_title or commit_title or "нет данных Git",
+        "commit_hash": commit_hash or "—",
+        "commit_date": commit_date or "—",
+    }
+
+
+def render_git_release_badge() -> None:
+    info = get_git_release_info()
+    st.sidebar.caption(f"{info['display_label']}: {info['display_title']}")
+    st.sidebar.caption(f"Git commit: {info['commit_hash']} · {info['commit_date']}")
+
+
 def file_hash(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
