@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+import subprocess
 from dataclasses import asdict
 from datetime import datetime, timezone
 from io import BytesIO
@@ -51,6 +52,48 @@ LAST_IMPORT_DIR = Path("data/last_import")
 MODEL_PATH = LAST_IMPORT_DIR / "warehouse_model.json"
 RENDER_CACHE_PATH = LAST_IMPORT_DIR / "render_cache.json"
 META_PATH = LAST_IMPORT_DIR / "import_meta.json"
+
+
+@st.cache_data(show_spinner=False)
+def get_git_release_info() -> dict[str, str]:
+    repo_dir = Path(__file__).resolve().parent
+
+    def git_text(*args: str) -> str:
+        try:
+            result = subprocess.run(
+                ["git", *args],
+                cwd=repo_dir,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=2,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        if result.returncode != 0:
+            return ""
+        return result.stdout.strip()
+
+    merge_title = git_text("log", "--merges", "-1", "--pretty=%s")
+    commit_title = git_text("log", "-1", "--pretty=%s")
+    commit_hash = git_text("rev-parse", "--short", "HEAD")
+    commit_date = git_text("log", "-1", "--date=short", "--pretty=%cd")
+    return {
+        "merge_title": merge_title,
+        "commit_title": commit_title,
+        "display_label": "Последний merge" if merge_title else "Последний commit",
+        "display_title": merge_title or commit_title or "нет данных Git",
+        "commit_hash": commit_hash or "—",
+        "commit_date": commit_date or "—",
+    }
+
+
+def render_git_release_badge() -> None:
+    info = get_git_release_info()
+    st.sidebar.caption(f"{info['display_label']}: {info['display_title']}")
+    st.sidebar.caption(f"Git commit: {info['commit_hash']} · {info['commit_date']}")
 
 
 def file_hash(data: bytes) -> str:
@@ -773,6 +816,7 @@ def render_geometry_model_view(model: dict) -> None:
 
 def render_virtual_warehouse_excel() -> None:
     st.sidebar.caption(f"Сборка приложения: {APP_BUILD_LABEL}")
+    render_git_release_badge()
     mode = st.sidebar.radio(
         "Режим",
         ["Склад из Excel: ряды + ячейки + проезды", "Виртуальный склад по Excel-схеме"],
