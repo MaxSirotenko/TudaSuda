@@ -325,6 +325,7 @@ def build_geometry_model(
         deep_lane_width = int(meta.get("deep_lane_width", 1))
         cell_direction = meta.get("cell_direction", "bottom_to_top")
         row_width_m = settings.cell_width_m * deep_lane_width
+        row_order_value = meta.get("row_order") or len(rows) + 1
         row_x_min = x_cursor
         row_x_max = row_x_min + row_width_m
         row_x_center = (row_x_min + row_x_max) / 2
@@ -368,6 +369,7 @@ def build_geometry_model(
                 "capacity_pallets": capacity_pallets,
                 "volume_m3": round(volume_m3, 4),
                 "cell_direction": cell_direction,
+                "row_order": row_order_value,
                 "physical_slots": physical_slots,
             }
             cells.append(cell)
@@ -381,7 +383,7 @@ def build_geometry_model(
         max_row_y = max(max_row_y, row_y_max)
         rows.append({
             "row_number": row_number,
-            "row_order": meta.get("row_order") or len(rows) + 1,
+            "row_order": row_order_value,
             "row_storage_type": storage_type,
             "deep_lane_width": deep_lane_width,
             "cell_direction": cell_direction,
@@ -703,12 +705,34 @@ def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bo
         for cell in cells:
             source_label = {"excel": "Excel", "manual_add": "добавлена вручную", "manual_update": "изменена вручную"}.get(str(cell.get("source", "excel")), str(cell.get("source", "excel")))
             storage_label = "набивная" if cell.get("storage_type") == "deep_lane" else "обычная"
-            title = f"Код: {cell['code']}\nРяд: {cell['row_number']}\nЯчейка: {cell['cell_number']}\nЯрус: {cell['tier']}\nТип: {storage_label}\nВместимость: {cell.get('capacity_pallets', 1)} паллет\nФизических мест: {cell.get('deep_lane_width', 1)}\nОбъём: {cell.get('volume_m3', 0)} м³\nНаправление: {_direction_label(cell.get('cell_direction', 'bottom_to_top'))}\nX: {cell['x_center']:.2f}\nY: {cell['y_center']:.2f}\nИсточник: {source_label}"
-            color = "#fde68a" if cell.get("storage_type") == "deep_lane" else "#e2e8f0"
-            border = "2px solid #d97706" if cell.get("storage_type") == "deep_lane" else "1px solid #64748b"
-            rect(cell["x_min"], cell["y_min"], cell["x_max"], cell["y_max"], color, border, str(cell["cell_number"]), title)
+            capacity = float(cell.get("capacity_pallets", 1) or 1)
+            occupied = float(cell.get("occupied_capacity_pallets", 0) or 0)
+            free = max(capacity - occupied, 0.0)
+            occupancy_label = cell.get("occupancy_label") or (f"{occupied:g}/{capacity:g}" if occupied else "")
+            placements = cell.get("placements", [])
+            sku_text = ", ".join(sorted({str(item.get("sku_code", "")) for item in placements if item.get("sku_code")})) or "—"
+            item_text = ", ".join(sorted({str(item.get("sku_name") or item.get("item_name") or "") for item in placements if item.get("sku_name") or item.get("item_name")})) or "—"
+            placement_source = ", ".join(sorted({str(item.get("source", "")) for item in placements if item.get("source")})) or "—"
+            confidence = ", ".join(sorted({str(item.get("confidence", "")) for item in placements if item.get("confidence")})) or "—"
+            title = f"Код: {cell['code']}\nРяд: {cell['row_number']}\nЯчейка: {cell['cell_number']}\nЯрус: {cell['tier']}\nТип: {storage_label}\nВместимость: {capacity:g} паллет\nЗанято: {occupied:g}\nСвободно: {free:g}\nSKU: {sku_text}\nНаименование: {item_text}\nИсточник размещения: {placement_source}\nТочность: {confidence}\nФизических мест: {cell.get('deep_lane_width', 1)}\nОбъём: {cell.get('volume_m3', 0)} м³\nНаправление: {_direction_label(cell.get('cell_direction', 'bottom_to_top'))}\nX: {cell['x_center']:.2f}\nY: {cell['y_center']:.2f}\nИсточник ячейки: {source_label}"
+            if occupied > capacity:
+                color = "#fecaca"
+                border = "2px solid #dc2626"
+            elif occupied >= capacity:
+                color = "#bbf7d0"
+                border = "2px solid #16a34a"
+            elif occupied > 0:
+                color = "#fde68a"
+                border = "2px solid #d97706"
+            else:
+                color = "#fef3c7" if cell.get("storage_type") == "deep_lane" else "#e2e8f0"
+                border = "2px solid #d97706" if cell.get("storage_type") == "deep_lane" else "1px solid #64748b"
+            label = f"{cell['cell_number']} {occupancy_label}" if occupancy_label else str(cell["cell_number"])
+            rect(cell["x_min"], cell["y_min"], cell["x_max"], cell["y_max"], color, border, label, title)
+            occupied_slots = int(min(round(occupied), len(cell.get("physical_slots", []))))
             for slot in cell.get("physical_slots", []):
-                rect(slot["x_min"], slot["y_min"], slot["x_max"], slot["y_max"], "rgba(255,255,255,0.18)", "1px dashed #92400e", "", f"Физическое место {slot['slot_index']} из {cell.get('deep_lane_width', 1)}")
+                slot_color = "rgba(34,197,94,0.45)" if slot.get("slot_index", 0) <= occupied_slots else "rgba(255,255,255,0.18)"
+                rect(slot["x_min"], slot["y_min"], slot["x_max"], slot["y_max"], slot_color, "1px dashed #92400e", "", f"Физическое место {slot['slot_index']} из {cell.get('deep_lane_width', 1)}")
     else:
         for row in rows:
             rect(row["x_min"], row["y_min"], row["x_max"], row["y_max"], "#e2e8f0", "1px solid #64748b", f"ряд {row['row_number']} ({row['cells_count']})")

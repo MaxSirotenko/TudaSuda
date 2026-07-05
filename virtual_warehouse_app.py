@@ -44,6 +44,26 @@ from warehouse_geometry_model import (
     save_geometry_model,
 )
 
+from warehouse_inventory_placement import (
+    PLACEMENTS_PATH,
+    attach_placements_to_model,
+    auto_place_unplaced,
+    clear_placement_state,
+    delete_placement,
+    detect_inventory_columns,
+    export_placements_excel_bytes,
+    get_inventory_sheet_names,
+    import_inventory,
+    load_placement_state,
+    manual_place,
+    normalize_inventory_table,
+    placement_diagnostics,
+    read_inventory_table,
+    save_placement_state,
+    update_placement_qty,
+    move_placement,
+)
+
 st.set_page_config(page_title="Симулятор сборки", layout="wide")
 
 APP_BUILD_LABEL = "virtual-excel-only-2026-07-04"
@@ -139,6 +159,18 @@ def normalize_cell_table_cached(table_payload: str, mapping_payload: str) -> tup
 @st.cache_data(show_spinner=False)
 def build_geometry_html_cached(model_payload: str, scale: float, detailed: bool) -> str:
     return build_geometry_html(json.loads(model_payload), scale=scale, detailed=detailed)
+
+
+@st.cache_data(show_spinner=False)
+def read_inventory_table_cached(file_bytes: bytes, content_hash: str, sheet_name: str, header_rows: int) -> pd.DataFrame:
+    return read_inventory_table(file_bytes, sheet_name, header_rows=header_rows)
+
+
+@st.cache_data(show_spinner=False)
+def normalize_inventory_table_cached(table_payload: str, mapping_payload: str) -> tuple[pd.DataFrame, list[dict]]:
+    df = pd.read_json(table_payload, orient="split")
+    mapping = json.loads(mapping_payload)
+    return normalize_inventory_table(df, mapping)
 
 
 def model_to_dict(model: WarehouseModel) -> dict:
@@ -517,6 +549,181 @@ def render_manual_cell_editor(model: dict) -> None:
                 st.success("Ручные изменения очищены. Модель восстановлена к состоянию после последней загрузки Excel.")
                 st.rerun()
 
+
+def render_inventory_placement(model: dict) -> dict:
+    st.subheader("Размещение товара")
+    state, state_warning = load_placement_state(model)
+    if state_warning:
+        st.warning(state_warning)
+    settings = state.setdefault("settings", {"allow_mixed_sku_in_deep_lane": False})
+    allow_mixed = st.checkbox(
+        "Разрешить несколько SKU в одной набивной ячейке",
+        value=bool(settings.get("allow_mixed_sku_in_deep_lane", False)),
+        key="placement_allow_mixed",
+    )
+    settings["allow_mixed_sku_in_deep_lane"] = allow_mixed
+
+    upload_tab, unplaced_tab, manual_tab, edit_tab, diag_tab = st.tabs([
+        "Загрузка инвента / остатков",
+        "Товар без привязки к ячейкам",
+        "Разместить вручную",
+        "Редактировать размещение",
+        "Диагностика размещения",
+    ])
+
+    with upload_tab:
+        inventory_file = st.file_uploader("Загрузить Excel с остатками", type=["xlsx"], key="inventory_upload")
+        replace_current = st.checkbox("Заменить текущее размещение", value=True, key="inventory_replace_current")
+        if inventory_file is not None:
+            inventory_bytes = inventory_file.getvalue()
+            inventory_hash = file_hash(inventory_bytes)
+            sheet_names = get_inventory_sheet_names(inventory_bytes)
+            sheet_name = st.selectbox("Лист инвента", sheet_names, key="inventory_sheet")
+            header_rows = st.radio("Строк заголовка инвента", [1, 2], index=0, horizontal=True, key="inventory_header_rows")
+            inv_df = read_inventory_table_cached(inventory_bytes, inventory_hash, sheet_name, header_rows)
+            st.caption(f"Прочитано строк инвента: {len(inv_df)}; колонок: {len(inv_df.columns)}")
+            with st.expander("Предпросмотр инвента", expanded=False):
+                st.dataframe(inv_df.head(30), use_container_width=True)
+            detected = detect_inventory_columns(inv_df)
+            columns = [None] + list(inv_df.columns)
+            st.caption("Проверьте автоопределение колонок или выберите вручную.")
+            c1, c2, c3, c4 = st.columns(4)
+            c5, c6, c7, c8 = st.columns(4)
+            mapping = {
+                "sku_code": c1.selectbox("Код товара / SKU", columns, index=columns.index(detected["sku_code"]) if detected["sku_code"] in columns else 0, key="inv_map_sku"),
+                "sku_name": c2.selectbox("Наименование товара", columns, index=columns.index(detected["sku_name"]) if detected["sku_name"] in columns else 0, key="inv_map_name"),
+                "qty_pallets": c3.selectbox("Количество паллет", columns, index=columns.index(detected["qty_pallets"]) if detected["qty_pallets"] in columns else 0, key="inv_map_pallets"),
+                "qty_boxes": c4.selectbox("Количество коробов", columns, index=columns.index(detected["qty_boxes"]) if detected["qty_boxes"] in columns else 0, key="inv_map_boxes"),
+                "cell_address": c5.selectbox("Адрес ячейки", columns, index=columns.index(detected["cell_address"]) if detected["cell_address"] in columns else 0, key="inv_map_address"),
+                "row_number": c6.selectbox("Ряд", columns, index=columns.index(detected["row_number"]) if detected["row_number"] in columns else 0, key="inv_map_row"),
+                "cell_number": c7.selectbox("Ячейка", columns, index=columns.index(detected["cell_number"]) if detected["cell_number"] in columns else 0, key="inv_map_cell"),
+                "tier": c8.selectbox("Ярус", columns, index=columns.index(detected["tier"]) if detected["tier"] in columns else 0, key="inv_map_tier"),
+            }
+            for key in ["expiry_date", "batch", "characteristic", "weight", "volume"]:
+                mapping[key] = detected.get(key)
+            normalized_inventory, inv_diagnostics = normalize_inventory_table_cached(inv_df.to_json(orient="split", force_ascii=False), json.dumps(mapping, ensure_ascii=False))
+            if inv_diagnostics:
+                st.dataframe(pd.DataFrame(inv_diagnostics), use_container_width=True)
+            has_cell_columns = bool(mapping.get("cell_address") or (mapping.get("row_number") and mapping.get("cell_number")))
+            if not has_cell_columns:
+                st.warning("В инвенте нет адресов ячеек. Система не может восстановить фактическое расположение товара. Автоматическое размещение будет модельным и используется только для расчётов.")
+            if st.button("Импортировать инвент", type="primary", key="inventory_import_button"):
+                if any(item.get("level") == "error" for item in inv_diagnostics):
+                    st.error("Исправьте обязательные колонки перед импортом.")
+                elif not replace_current and (state.get("placements") or state.get("unplaced_inventory")):
+                    st.error("Подтвердите замену текущего размещения или очистите его вручную.")
+                else:
+                    state, placement_import_diag = import_inventory(model, normalized_inventory, allow_replace=True)
+                    st.session_state["placement_state"] = state
+                    st.success("Инвент импортирован. Размещение сохранено в data/last_import/placements.json.")
+                    st.dataframe(pd.DataFrame(placement_import_diag), use_container_width=True)
+                    st.rerun()
+
+    with unplaced_tab:
+        unplaced = state.get("unplaced_inventory", [])
+        total_unplaced_pallets = sum(float(item.get("qty_pallets", 0) or 0) for item in unplaced)
+        total_unplaced_boxes = sum(float(item.get("qty_boxes", 0) or 0) for item in unplaced)
+        u1, u2, u3 = st.columns(3)
+        u1.metric("SKU без ячейки", len(unplaced))
+        u2.metric("Паллет без ячейки", f"{total_unplaced_pallets:g}")
+        u3.metric("Коробов без ячейки", f"{total_unplaced_boxes:g}")
+        if unplaced:
+            st.warning("Это модельное размещение, а не фактическое, потому что в инвенте нет адресов ячеек.")
+            st.dataframe(pd.DataFrame(unplaced), use_container_width=True)
+        else:
+            st.info("Товаров без привязки к ячейкам сейчас нет.")
+        if st.button("Разложить автоматически по складу", disabled=not unplaced, key="auto_place_inventory"):
+            state, auto_diag = auto_place_unplaced(model, state, allow_mixed_sku_in_deep_lane=allow_mixed)
+            st.session_state["placement_state"] = state
+            st.success("Автоматическое модельное размещение выполнено.")
+            st.dataframe(pd.DataFrame(auto_diag), use_container_width=True)
+            st.rerun()
+
+    with manual_tab:
+        unplaced = state.get("unplaced_inventory", [])
+        if not unplaced:
+            st.info("Нет товара без ячейки для ручного размещения.")
+        else:
+            options = {f"{idx}: {item.get('sku_code')} · {item.get('sku_name')} · {item.get('qty_pallets')} паллет": idx for idx, item in enumerate(unplaced)}
+            selected_label = st.selectbox("Товар из списка Без ячейки", list(options), key="manual_place_item")
+            m1, m2, m3, m4 = st.columns(4)
+            target_row = m1.text_input("Ряд", key="manual_place_row")
+            target_cell = m2.text_input("Ячейка", key="manual_place_cell")
+            target_tier = m3.text_input("Ярус", value="1", key="manual_place_tier")
+            qty = m4.number_input("Паллет к размещению", min_value=0.0, value=1.0, step=1.0, key="manual_place_qty")
+            if st.button("Разместить", key="manual_place_button", type="primary"):
+                state, error = manual_place(model, state, options[selected_label], target_row, target_cell, target_tier, qty, allow_mixed_sku_in_deep_lane=allow_mixed)
+                if error:
+                    st.error(error)
+                else:
+                    st.session_state["placement_state"] = state
+                    st.success("Товар размещён вручную, placements.json обновлён.")
+                    st.rerun()
+
+    with edit_tab:
+        placements = state.get("placements", [])
+        if not placements:
+            st.info("Размещений пока нет.")
+        else:
+            placement_options = {f"{p.get('sku_code')} · {p.get('cell_key')} · {p.get('qty_pallets')} паллет · {p.get('source')}": p for p in placements}
+            selected = st.selectbox("Выберите размещение", list(placement_options), key="placement_edit_selected")
+            selected_placement = placement_options[selected]
+            e1, e2, e3, e4 = st.columns(4)
+            new_qty = e1.number_input("Новое количество паллет", min_value=0.0, value=float(selected_placement.get("qty_pallets", 0) or 0), step=1.0, key="placement_edit_qty")
+            move_row = e2.text_input("Новый ряд", value=str(selected_placement.get("row_number", "")), key="placement_move_row")
+            move_cell = e3.text_input("Новая ячейка", value=str(selected_placement.get("cell_number", "")), key="placement_move_cell")
+            move_tier = e4.text_input("Новый ярус", value=str(selected_placement.get("tier", "1")), key="placement_move_tier")
+            a1, a2, a3 = st.columns(3)
+            if a1.button("Изменить количество", key="placement_update_qty_button"):
+                state, error = update_placement_qty(model, state, selected_placement["placement_id"], new_qty)
+                if error:
+                    st.error(error)
+                else:
+                    st.session_state["placement_state"] = state
+                    st.success("Количество размещения изменено.")
+                    st.rerun()
+            if a2.button("Перенести в другую ячейку", key="placement_move_button"):
+                state, error = move_placement(model, state, selected_placement["placement_id"], move_row, move_cell, move_tier, allow_mixed_sku_in_deep_lane=allow_mixed)
+                if error:
+                    st.error(error)
+                else:
+                    st.session_state["placement_state"] = state
+                    st.success("Размещение перенесено.")
+                    st.rerun()
+            if a3.button("Удалить размещение", key="placement_delete_button"):
+                state, error = delete_placement(state, selected_placement["placement_id"])
+                if error:
+                    st.error(error)
+                else:
+                    st.session_state["placement_state"] = state
+                    st.success("Размещение удалено, товар возвращён в Без ячейки.")
+                    st.rerun()
+
+    with diag_tab:
+        diag = placement_diagnostics(model, state)
+        st.subheader("Диагностика размещения")
+        st.dataframe(pd.DataFrame([{"Показатель": key, "Значение": value} for key, value in diag.items()]), use_container_width=True)
+        st.download_button("Скачать размещение в Excel", export_placements_excel_bytes(model, state), file_name="placements.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        log_df = pd.DataFrame(state.get("journal", []))
+        st.subheader("Журнал размещения")
+        if log_df.empty:
+            st.info("Журнал размещения пока пуст.")
+        else:
+            st.dataframe(log_df, use_container_width=True)
+            st.download_button("Скачать журнал размещения", log_df.to_csv(index=False).encode("utf-8-sig"), file_name="placement_journal.csv", mime="text/csv")
+        if st.button("Очистить журнал", key="placement_clear_journal"):
+            state["journal"] = []
+            save_placement_state(state)
+            st.rerun()
+        if st.button("Очистить размещение", key="placement_clear_all"):
+            clear_placement_state()
+            st.session_state.pop("placement_state", None)
+            st.success("Размещение очищено.")
+            st.rerun()
+
+    return attach_placements_to_model(model, state)
+
+
 def render_excel_geometry_warehouse() -> None:
     st.title("Симулятор скорости сборки")
     st.header("Склад из Excel: ряды + ячейки + проезды")
@@ -538,7 +745,9 @@ def render_excel_geometry_warehouse() -> None:
                         path.unlink()
                 clear_manual_overrides()
                 clear_row_settings()
+                clear_placement_state()
                 st.session_state.pop("geometry_model", None)
+                st.session_state.pop("placement_state", None)
                 st.rerun()
         else:
             st.caption("Сохранённой геометрии пока нет.")
@@ -704,7 +913,9 @@ def render_excel_geometry_warehouse() -> None:
         model["performance"] = timings | model.get("performance", {})
         clear_manual_overrides()
         clear_row_settings()
-        st.warning("Загружен новый Excel. Старые ручные изменения и настройки набивных рядов сброшены для новой модели.")
+        clear_placement_state()
+        st.session_state.pop("placement_state", None)
+        st.warning("Загружен новый Excel. Старые ручные изменения, настройки набивных рядов и размещение товара сброшены для новой модели.")
         save_started = perf_counter()
         save_geometry_model(model)
         timings["save_model_seconds"] = perf_counter() - save_started
@@ -792,6 +1003,7 @@ def render_geometry_model_view(model: dict) -> None:
     if diagnostics:
         st.dataframe(pd.DataFrame(diagnostics), use_container_width=True)
     render_manual_cell_editor(model)
+    model = render_inventory_placement(model)
     st.subheader("Карта склада")
     detailed = st.toggle("Детальный режим", value=len(model.get("cells", [])) <= 1500)
     scale = st.slider("Масштаб, px/м", min_value=4.0, max_value=40.0, value=18.0, step=1.0)
