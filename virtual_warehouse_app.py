@@ -45,7 +45,6 @@ from warehouse_geometry_model import (
 )
 
 from warehouse_inventory_placement import (
-    PLACEMENTS_PATH,
     attach_placements_to_model,
     auto_place_unplaced,
     clear_placement_state,
