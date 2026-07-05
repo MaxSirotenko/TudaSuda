@@ -71,6 +71,58 @@ LAST_IMPORT_DIR = Path("data/last_import")
 MODEL_PATH = LAST_IMPORT_DIR / "warehouse_model.json"
 RENDER_CACHE_PATH = LAST_IMPORT_DIR / "render_cache.json"
 META_PATH = LAST_IMPORT_DIR / "import_meta.json"
+RENDER_SETTINGS_PATH = LAST_IMPORT_DIR / "render_settings.json"
+
+DEFAULT_RENDER_LABEL_SETTINGS = {
+    "show_row_labels": True,
+    "show_cell_labels": True,
+    "show_occupancy_labels": True,
+    "show_aisle_labels": True,
+    "label_mode": "Авто",
+    "row_label_position": "авто",
+}
+
+
+@st.cache_data(show_spinner=False)
+def get_git_release_info() -> dict[str, str]:
+    repo_dir = Path(__file__).resolve().parent
+
+    def git_text(*args: str) -> str:
+        try:
+            result = subprocess.run(
+                ["git", *args],
+                cwd=repo_dir,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=2,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        if result.returncode != 0:
+            return ""
+        return result.stdout.strip()
+
+    merge_title = git_text("log", "--merges", "-1", "--pretty=%s")
+    commit_title = git_text("log", "-1", "--pretty=%s")
+    commit_hash = git_text("rev-parse", "--short", "HEAD")
+    commit_date = git_text("log", "-1", "--date=short", "--pretty=%cd")
+    return {
+        "merge_title": merge_title,
+        "commit_title": commit_title,
+        "display_label": "Последний merge" if merge_title else "Последний commit",
+        "display_title": merge_title or commit_title or "нет данных Git",
+        "commit_hash": commit_hash or "—",
+        "commit_date": commit_date or "—",
+    }
+
+
+def render_git_release_badge() -> None:
+    info = get_git_release_info()
+    st.sidebar.caption(f"{info['display_label']}: {info['display_title']}")
+    st.sidebar.caption(f"Git commit: {info['commit_hash']} · {info['commit_date']}")
 
 
 @st.cache_data(show_spinner=False)
@@ -156,8 +208,8 @@ def normalize_cell_table_cached(table_payload: str, mapping_payload: str) -> tup
 
 
 @st.cache_data(show_spinner=False)
-def build_geometry_html_cached(model_payload: str, scale: float, detailed: bool) -> str:
-    return build_geometry_html(json.loads(model_payload), scale=scale, detailed=detailed)
+def build_geometry_html_cached(model_payload: str, scale: float, detailed: bool, label_settings_payload: str) -> str:
+    return build_geometry_html(json.loads(model_payload), scale=scale, detailed=detailed, label_settings=json.loads(label_settings_payload))
 
 
 @st.cache_data(show_spinner=False)
@@ -210,6 +262,40 @@ def write_json_atomic(path: Path, payload: dict) -> None:
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp_path.replace(path)
+
+
+def load_render_label_settings() -> dict:
+    settings = dict(DEFAULT_RENDER_LABEL_SETTINGS)
+    if RENDER_SETTINGS_PATH.exists():
+        try:
+            payload = json.loads(RENDER_SETTINGS_PATH.read_text(encoding="utf-8-sig"))
+            settings.update({key: payload.get(key, value) for key, value in DEFAULT_RENDER_LABEL_SETTINGS.items()})
+        except json.JSONDecodeError:
+            pass
+    return settings
+
+
+def save_render_label_settings(settings: dict) -> None:
+    payload = {key: settings.get(key, value) for key, value in DEFAULT_RENDER_LABEL_SETTINGS.items()}
+    write_json_atomic(RENDER_SETTINGS_PATH, payload)
+
+
+def render_label_settings_editor() -> dict:
+    settings = load_render_label_settings()
+    with st.expander("Настройки подписей", expanded=False):
+        c1, c2, c3, c4 = st.columns(4)
+        settings["show_row_labels"] = c1.checkbox("Показывать номера рядов", value=bool(settings.get("show_row_labels", True)), key="show_row_labels")
+        settings["show_cell_labels"] = c2.checkbox("Показывать номера ячеек", value=bool(settings.get("show_cell_labels", True)), key="show_cell_labels")
+        settings["show_occupancy_labels"] = c3.checkbox("Показывать занятость ячеек", value=bool(settings.get("show_occupancy_labels", True)), key="show_occupancy_labels")
+        settings["show_aisle_labels"] = c4.checkbox("Показывать подписи проездов", value=bool(settings.get("show_aisle_labels", True)), key="show_aisle_labels")
+        c5, c6 = st.columns(2)
+        label_modes = ["Авто", "Полные", "Короткие", "Только при наведении"]
+        row_positions = ["авто", "сверху", "снизу", "сверху и снизу"]
+        settings["label_mode"] = c5.selectbox("Режим подписей", label_modes, index=label_modes.index(settings.get("label_mode", "Авто")) if settings.get("label_mode") in label_modes else 0, key="label_mode")
+        settings["row_label_position"] = c6.selectbox("Положение номера ряда", row_positions, index=row_positions.index(settings.get("row_label_position", "авто")) if settings.get("row_label_position") in row_positions else 0, key="row_label_position")
+        st.caption("Если подпись не помещается, карта уменьшает шрифт до 4 px, затем скрывает текст на карте, но оставляет полную информацию в tooltip.")
+    save_render_label_settings(settings)
+    return settings
 
 
 def save_uploaded_copy(uploaded_file, target_name: str) -> str:
@@ -1006,8 +1092,9 @@ def render_geometry_model_view(model: dict) -> None:
     st.subheader("Карта склада")
     detailed = st.toggle("Детальный режим", value=len(model.get("cells", [])) <= 1500)
     scale = st.slider("Масштаб, px/м", min_value=4.0, max_value=40.0, value=18.0, step=1.0)
+    label_settings = render_label_settings_editor()
     render_started = perf_counter()
-    html = build_geometry_html_cached(json.dumps(model, ensure_ascii=False), scale, detailed)
+    html = build_geometry_html_cached(json.dumps(model, ensure_ascii=False), scale, detailed, json.dumps(label_settings, ensure_ascii=False, sort_keys=True))
     components.html(html, height=760, scrolling=True)
     st.caption(f"Рендер карты: {perf_counter() - render_started:.2f} сек. Модель: data/last_import/warehouse_model.json")
     tabs = st.tabs(["Ряды", "Ячейки", "Проезды", "Навигация", "JSON"])

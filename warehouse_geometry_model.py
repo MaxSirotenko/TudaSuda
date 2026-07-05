@@ -675,7 +675,7 @@ def export_current_model_excel_bytes(model: dict[str, Any]) -> bytes:
     return buffer.getvalue()
 
 
-def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bool = True) -> str:
+def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bool = True, label_settings: dict[str, Any] | None = None) -> str:
     rows = model.get("rows", [])
     cells = model.get("cells", [])
     aisles = model.get("aisles", [])
@@ -686,21 +686,74 @@ def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bo
     width = max(900, int(max_x * scale + 160))
     height = max(600, int((max_y - min_y) * scale + 160))
     y_offset = -min_y * scale + 40
+    settings = {
+        "show_row_labels": True,
+        "show_cell_labels": True,
+        "show_occupancy_labels": True,
+        "show_aisle_labels": True,
+        "label_mode": "Авто",
+        "row_label_position": "авто",
+    }
+    settings.update(label_settings or {})
+    label_mode = str(settings.get("label_mode", "Авто"))
     parts = [f"<div style='position:relative;width:{width}px;height:{height}px;background:#f8fafc;border:1px solid #cbd5e1;overflow:auto'>"]
 
-    def rect(x_min, y_min, x_max, y_max, color, border, label, title=""):
+    def label_font_size(label_lines, w, h) -> int:
+        lines = [str(line) for line in label_lines if str(line)]
+        if not lines:
+            return 0
+        max_len = max(len(line) for line in lines)
+        width_size = int((w - 4) / max(max_len * 0.58, 1))
+        height_size = int((h - 4) / max(len(lines) * 1.15, 1))
+        size = min(12, width_size, height_size)
+        return size if size >= 4 else 0
+
+    def fit_label(full_lines, short_lines, w, h, mode: str | None = None):
+        mode = mode or label_mode
+        if mode == "Только при наведении":
+            return [], 0
+        candidates = []
+        if mode == "Короткие":
+            candidates = [short_lines]
+        elif mode == "Полные":
+            candidates = [full_lines, short_lines]
+        else:
+            candidates = [full_lines, short_lines]
+        for candidate in candidates:
+            lines = [str(line) for line in candidate if str(line)]
+            size = label_font_size(lines, w, h)
+            if size:
+                return lines, size
+        return [], 0
+
+    def rect(x_min, y_min, x_max, y_max, color, border, label="", title="", short_label="", label_lines=None, short_lines=None, force_label=False, vertical=False):
         left = x_min * scale + 60
         top = height - (y_max * scale + y_offset)
         w = max(2, (x_max - x_min) * scale)
         h = max(2, (y_max - y_min) * scale)
-        parts.append(f"<div title='{html.escape(title or label)}' style='position:absolute;left:{left:.1f}px;top:{top:.1f}px;width:{w:.1f}px;height:{h:.1f}px;background:{color};border:{border};box-sizing:border-box;font:10px Arial;text-align:center;overflow:hidden;color:#0f172a'>{html.escape(label)}</div>")
+        full = label_lines if label_lines is not None else ([label] if label else [])
+        short = short_lines if short_lines is not None else ([short_label or label] if (short_label or label) else [])
+        lines, font_size = fit_label(full, short, w, h, "Полные" if force_label else None)
+        content = ""
+        if lines:
+            line_height = max(font_size + 1, int(font_size * 1.15))
+            if vertical and h > w and len(lines) == 1:
+                content = f"<span style='display:inline-block;transform:rotate(-90deg);white-space:nowrap'>{html.escape(lines[0])}</span>"
+            else:
+                content = "<br>".join(html.escape(line) for line in lines)
+            content_style = f"display:flex;align-items:center;justify-content:center;width:100%;height:100%;padding:1px;box-sizing:border-box;font:{font_size}px/{line_height}px Arial;text-align:center;overflow:hidden;color:#0f172a;"
+        else:
+            content_style = "display:block;width:100%;height:100%;overflow:hidden;"
+        parts.append(f"<div title='{html.escape(title or label)}' style='position:absolute;left:{left:.1f}px;top:{top:.1f}px;width:{w:.1f}px;height:{h:.1f}px;background:{color};border:{border};box-sizing:border-box;overflow:hidden;clip-path:inset(0);'><div style='{content_style}'>{content}</div></div>")
 
     for road in roads:
         label = "верхний проезд" if road["road_type"] == "top" else "нижний проезд"
-        rect(road["x_min"], road["y_min"], road["x_max"], road["y_max"], "#dbeafe", "1px solid #60a5fa", label, f"{label}: {road['width_m']} м")
+        road_label = label if settings.get("show_aisle_labels", True) else ""
+        rect(road["x_min"], road["y_min"], road["x_max"], road["y_max"], "#dbeafe", "1px solid #60a5fa", road_label, f"{label}: {road['width_m']} м", short_label="проезд")
     for aisle in aisles:
         y_max = max_y - model["settings"].get("top_road_width_m", 3.4)
-        rect(aisle["x_min"], 0, aisle["x_max"], y_max, "#fef3c7", "1px solid #f59e0b", "проезд", f"{aisle['row_from']} → {aisle['row_to']}: {aisle['aisle_width_m']} м")
+        aisle_label = "проезд" if settings.get("show_aisle_labels", True) else ""
+        rect(aisle["x_min"], 0, aisle["x_max"], y_max, "#fef3c7", "1px solid #f59e0b", aisle_label, f"{aisle['row_from']} → {aisle['row_to']}: {aisle['aisle_width_m']} м", short_label="↕")
     if detailed:
         for cell in cells:
             source_label = {"excel": "Excel", "manual_add": "добавлена вручную", "manual_update": "изменена вручную"}.get(str(cell.get("source", "excel")), str(cell.get("source", "excel")))
@@ -727,16 +780,39 @@ def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bo
             else:
                 color = "#fef3c7" if cell.get("storage_type") == "deep_lane" else "#e2e8f0"
                 border = "2px solid #d97706" if cell.get("storage_type") == "deep_lane" else "1px solid #64748b"
-            label = f"{cell['cell_number']} {occupancy_label}" if occupancy_label else str(cell["cell_number"])
-            rect(cell["x_min"], cell["y_min"], cell["x_max"], cell["y_max"], color, border, label, title)
+            cell_number_label = str(cell["cell_number"]) if settings.get("show_cell_labels", True) else ""
+            occupancy_text = occupancy_label if settings.get("show_occupancy_labels", True) and occupied > 0 else ""
+            if label_mode == "Короткие":
+                full_lines = [occupancy_text or cell_number_label]
+                short_lines = [occupancy_text or cell_number_label]
+            elif label_mode == "Только при наведении":
+                full_lines = []
+                short_lines = []
+            else:
+                full_lines = [cell_number_label, occupancy_text] if occupancy_text else [cell_number_label]
+                short_lines = [occupancy_text] if occupancy_text else [cell_number_label]
+            rect(cell["x_min"], cell["y_min"], cell["x_max"], cell["y_max"], color, border, cell_number_label, title, short_label=occupancy_text or cell_number_label, label_lines=full_lines, short_lines=short_lines)
             occupied_slots = int(min(round(occupied), len(cell.get("physical_slots", []))))
             for slot in cell.get("physical_slots", []):
                 slot_color = "rgba(34,197,94,0.45)" if slot.get("slot_index", 0) <= occupied_slots else "rgba(255,255,255,0.18)"
                 rect(slot["x_min"], slot["y_min"], slot["x_max"], slot["y_max"], slot_color, "1px dashed #92400e", "", f"Физическое место {slot['slot_index']} из {cell.get('deep_lane_width', 1)}")
     else:
         for row in rows:
-            rect(row["x_min"], row["y_min"], row["x_max"], row["y_max"], "#e2e8f0", "1px solid #64748b", f"ряд {row['row_number']} ({row['cells_count']})")
-    for row in rows:
-        rect(row["x_min"], row["y_max"], row["x_max"], row["y_max"] + 0.4, "#bfdbfe", "1px solid #2563eb", f"{row['row_number']}")
+            row_label = f"ряд {row['row_number']} ({row['cells_count']})" if settings.get("show_row_labels", True) else ""
+            rect(row["x_min"], row["y_min"], row["x_max"], row["y_max"], "#e2e8f0", "1px solid #64748b", row_label, short_label=str(row.get("row_number", "")), vertical=True)
+    if settings.get("show_row_labels", True):
+        row_position = str(settings.get("row_label_position", "авто"))
+        for idx, row in enumerate(rows):
+            if label_mode == "Авто" and len(rows) > 60 and idx % 2:
+                continue
+            row_label = str(row["row_number"])
+            positions = ["top", "bottom"] if row_position == "сверху и снизу" else (["bottom"] if row_position == "снизу" else ["top"])
+            if row_position == "авто" and row.get("width_m", 1) * scale < 12:
+                positions = ["bottom"]
+            for position in positions:
+                if position == "bottom":
+                    rect(row["x_min"], row["y_min"] - 0.4, row["x_max"], row["y_min"], "#bfdbfe", "1px solid #2563eb", row_label, f"Ряд {row_label}", short_label=row_label, vertical=True)
+                else:
+                    rect(row["x_min"], row["y_max"], row["x_max"], row["y_max"] + 0.4, "#bfdbfe", "1px solid #2563eb", row_label, f"Ряд {row_label}", short_label=row_label, vertical=True)
     parts.append("</div>")
     return "".join(parts)
