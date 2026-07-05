@@ -17,6 +17,7 @@ GEOMETRY_MODEL_VERSION = 1
 GEOMETRY_MODEL_PATH = Path("data/last_import/warehouse_model.json")
 GEOMETRY_META_PATH = Path("data/last_import/import_meta.json")
 MANUAL_OVERRIDES_PATH = Path("data/last_import/manual_overrides.json")
+ROW_SETTINGS_PATH = Path("data/last_import/row_settings.json")
 
 CODE_ALIASES = ["code", "код"]
 ROW_ALIASES = ["row_number", "row", "ряд", "ряд ссылка", "ряд/ссылка", "ряд / ссылка"]
@@ -31,6 +32,7 @@ class GeometrySettings:
     aisle_width_m: float = 3.4
     top_road_width_m: float = 3.4
     bottom_road_width_m: float = 3.4
+    pallet_height_m: float = 2.2
     selected_tier: str = "1"
     tier_mode: str = "selected"
     row_order_mode: str = "row_order_or_number"
@@ -83,8 +85,8 @@ def _find_column(columns: list[str], aliases: list[str]) -> str | None:
 
 
 def get_excel_sheet_names(file_bytes: bytes) -> list[str]:
-    xls = pd.ExcelFile(BytesIO(file_bytes))
-    return list(xls.sheet_names)
+    with pd.ExcelFile(BytesIO(file_bytes)) as xls:
+        return list(xls.sheet_names)
 
 
 def read_cell_table(file_bytes: bytes, sheet_name: str, header_rows: int = 2) -> pd.DataFrame:
@@ -162,6 +164,9 @@ def default_row_config(df: pd.DataFrame) -> pd.DataFrame:
         {
             "row_number": rows,
             "row_order": list(range(1, len(rows) + 1)),
+            "row_storage_type": ["normal"] * len(rows),
+            "deep_lane_width": [1] * len(rows),
+            "cell_direction": ["bottom_to_top"] * len(rows),
             "row_group": [""] * len(rows),
             "side": [""] * len(rows),
             "comment": [""] * len(rows),
@@ -173,6 +178,41 @@ def empty_aisle_config() -> pd.DataFrame:
     return pd.DataFrame(columns=["row_from", "row_to", "aisle_width_m", "aisle_type", "comment"])
 
 
+def _normalize_storage_type(value: Any) -> str:
+    text = _clean_label(value)
+    if text in {"deep_lane", "набивной ряд", "набивной", "deep lane"}:
+        return "deep_lane"
+    return "normal"
+
+
+def _normalize_cell_direction(value: Any, storage_type: str = "normal") -> str:
+    text = _clean_label(value)
+    if text in {"top_to_bottom", "сверху вниз", "верх вниз", "top to bottom"}:
+        return "top_to_bottom"
+    if text in {"bottom_to_top", "снизу вверх", "низ вверх", "bottom to top"}:
+        return "bottom_to_top"
+    return "top_to_bottom" if storage_type == "deep_lane" else "bottom_to_top"
+
+
+def _normalize_deep_lane_width(value: Any, storage_type: str = "normal") -> int:
+    default = 5 if storage_type == "deep_lane" else 1
+    try:
+        width = int(float(_display_value(value)))
+    except ValueError:
+        return default
+    if storage_type != "deep_lane":
+        return 1
+    return width if 2 <= width <= 7 else default
+
+
+def _row_storage_label(storage_type: str) -> str:
+    return "Набивной ряд" if storage_type == "deep_lane" else "Обычный ряд"
+
+
+def _direction_label(direction: str) -> str:
+    return "Сверху вниз" if direction == "top_to_bottom" else "Снизу вверх"
+
+
 def _row_order_map(row_config: pd.DataFrame | None) -> dict[str, dict[str, Any]]:
     if row_config is None or row_config.empty:
         return {}
@@ -181,8 +221,23 @@ def _row_order_map(row_config: pd.DataFrame | None) -> dict[str, dict[str, Any]]
         row_number = _display_value(row.get("row_number"))
         if not row_number:
             continue
+        storage_type = _normalize_storage_type(row.get("row_storage_type", "normal"))
+        raw_deep_lane_width = row.get("deep_lane_width", "")
+        deep_lane_width = _normalize_deep_lane_width(raw_deep_lane_width, storage_type)
+        cell_direction = _normalize_cell_direction(row.get("cell_direction", ""), storage_type)
+        deep_lane_width_invalid = False
+        if storage_type == "deep_lane":
+            try:
+                raw_width_int = int(float(_display_value(raw_deep_lane_width)))
+                deep_lane_width_invalid = raw_width_int not in range(2, 8)
+            except ValueError:
+                deep_lane_width_invalid = True
         result[row_number] = {
             "row_order": row.get("row_order"),
+            "row_storage_type": storage_type,
+            "deep_lane_width": deep_lane_width,
+            "cell_direction": cell_direction,
+            "deep_lane_width_invalid": deep_lane_width_invalid,
             "row_group": _display_value(row.get("row_group")),
             "side": _display_value(row.get("side")),
             "comment": _display_value(row.get("comment")),
@@ -228,6 +283,11 @@ def build_geometry_model(
     work_df = work_df.drop_duplicates(["row_number", "cell_number", "tier"], keep="first")
 
     row_meta = _row_order_map(row_config)
+    for row_number, meta in row_meta.items():
+        if meta.get("deep_lane_width_invalid"):
+            diagnostics.append({"level": "warning", "message": f"Ряд {row_number}: некорректная ширина набивного ряда; применено значение {meta.get('deep_lane_width', 5)}."})
+        if meta.get("row_storage_type") == "deep_lane" and not meta.get("cell_direction"):
+            diagnostics.append({"level": "warning", "message": f"Ряд {row_number}: набивной ряд без направления; применено направление сверху вниз."})
     aisle_by_pair = _aisle_map(aisle_config, settings.aisle_width_m)
     row_numbers = sorted(set(work_df["row_number"]), key=lambda row: (_safe_float(row_meta.get(row, {}).get("row_order"), 10**9), _number_key(row)))
 
@@ -260,13 +320,34 @@ def build_geometry_model(
                 x_cursor = x_max
         row_df = work_df[work_df["row_number"] == row_number].copy()
         row_df = row_df.sort_values("cell_number", key=lambda series: series.map(_number_key))
+        meta = row_meta.get(row_number, {})
+        storage_type = meta.get("row_storage_type", "normal")
+        deep_lane_width = int(meta.get("deep_lane_width", 1))
+        cell_direction = meta.get("cell_direction", "bottom_to_top")
+        row_width_m = settings.cell_width_m * deep_lane_width
         row_x_min = x_cursor
-        row_x_max = row_x_min + settings.cell_width_m
+        row_x_max = row_x_min + row_width_m
         row_x_center = (row_x_min + row_x_max) / 2
         row_cells = []
+        row_count = len(row_df)
         for idx, (_, cell_row) in enumerate(row_df.iterrows()):
-            y_min = idx * settings.cell_length_m
+            position_from_bottom = row_count - 1 - idx if cell_direction == "top_to_bottom" else idx
+            y_min = position_from_bottom * settings.cell_length_m
             y_max = y_min + settings.cell_length_m
+            capacity_pallets = deep_lane_width if storage_type == "deep_lane" else 1
+            volume_m3 = settings.cell_length_m * settings.cell_width_m * settings.pallet_height_m * capacity_pallets
+            physical_slots = []
+            if storage_type == "deep_lane":
+                for slot_index in range(1, deep_lane_width + 1):
+                    slot_x_min = row_x_min + (slot_index - 1) * settings.cell_width_m
+                    physical_slots.append({
+                        "slot_index": slot_index,
+                        "x_min": slot_x_min,
+                        "x_max": slot_x_min + settings.cell_width_m,
+                        "y_min": y_min,
+                        "y_max": y_max,
+                        "capacity_pallets": 1,
+                    })
             cell = {
                 "code": _display_value(cell_row.get("code")),
                 "row_number": row_number,
@@ -278,10 +359,16 @@ def build_geometry_model(
                 "y_max": y_max,
                 "x_center": row_x_center,
                 "y_center": (y_min + y_max) / 2,
-                "width_m": settings.cell_width_m,
+                "width_m": row_width_m,
                 "length_m": settings.cell_length_m,
                 "source_line": int(cell_row.get("source_line", 0)),
                 "source": _display_value(cell_row.get("source")) or "excel",
+                "storage_type": storage_type,
+                "deep_lane_width": deep_lane_width,
+                "capacity_pallets": capacity_pallets,
+                "volume_m3": round(volume_m3, 4),
+                "cell_direction": cell_direction,
+                "physical_slots": physical_slots,
             }
             cells.append(cell)
             row_cells.append(cell)
@@ -292,10 +379,12 @@ def build_geometry_model(
                 diagnostics.append({"level": "warning", "message": f"В ряду {row_number} есть пропуск номеров: {', '.join(map(str, missing))}."})
         row_y_max = len(row_cells) * settings.cell_length_m
         max_row_y = max(max_row_y, row_y_max)
-        meta = row_meta.get(row_number, {})
         rows.append({
             "row_number": row_number,
             "row_order": meta.get("row_order") or len(rows) + 1,
+            "row_storage_type": storage_type,
+            "deep_lane_width": deep_lane_width,
+            "cell_direction": cell_direction,
             "row_group": meta.get("row_group", ""),
             "side": meta.get("side", ""),
             "comment": meta.get("comment", ""),
@@ -304,7 +393,9 @@ def build_geometry_model(
             "y_min": 0.0,
             "y_max": row_y_max,
             "x_center": row_x_center,
+            "width_m": row_width_m,
             "cells_count": len(row_cells),
+            "capacity_pallets": sum(cell["capacity_pallets"] for cell in row_cells),
         })
         bottom_node = {"node_id": f"row:{row_number}:bottom", "node_type": "row_bottom_entry", "x": row_x_center, "y": 0.0, "row_number": row_number}
         top_node = {"node_id": f"row:{row_number}:top", "node_type": "row_top_entry", "x": row_x_center, "y": row_y_max, "row_number": row_number}
@@ -326,9 +417,23 @@ def build_geometry_model(
         navigation_edges.append({"from_node": "road:bottom", "to_node": f"row:{row['row_number']}:bottom", "distance_m": settings.bottom_road_width_m / 2, "edge_type": "road_to_row"})
         navigation_edges.append({"from_node": f"row:{row['row_number']}:top", "to_node": "road:top", "distance_m": settings.top_road_width_m / 2, "edge_type": "row_to_road"})
 
+    normal_rows = [row for row in rows if row.get("row_storage_type") != "deep_lane"]
+    deep_rows = [row for row in rows if row.get("row_storage_type") == "deep_lane"]
+    normal_cells = [cell for cell in cells if cell.get("storage_type") != "deep_lane"]
+    deep_cells = [cell for cell in cells if cell.get("storage_type") == "deep_lane"]
+    deep_slots = sum(int(cell.get("capacity_pallets", 1)) for cell in deep_cells)
+    total_capacity = sum(int(cell.get("capacity_pallets", 1)) for cell in cells)
+    for row in deep_rows:
+        diagnostics.append({"level": "info", "message": f"Ряд {row['row_number']}: логических ячеек {row['cells_count']}; набивных мест в каждой ячейке {row['deep_lane_width']}; физических паллетомест {row['capacity_pallets']}; направление {_direction_label(row['cell_direction'])}."})
     diagnostics.extend([
         {"level": "info", "message": f"Всего уникальных рядов: {len(rows)}."},
+        {"level": "info", "message": f"Обычных рядов: {len(normal_rows)}."},
+        {"level": "info", "message": f"Набивных рядов: {len(deep_rows)}."},
         {"level": "info", "message": f"Всего уникальных ячеек: {len(cells)}."},
+        {"level": "info", "message": f"Обычных ячеек: {len(normal_cells)}."},
+        {"level": "info", "message": f"Набивных логических ячеек: {len(deep_cells)}."},
+        {"level": "info", "message": f"Физических паллетомест в набивных ячейках: {deep_slots}."},
+        {"level": "info", "message": f"Общая вместимость в паллетах: {total_capacity}."},
         {"level": "info", "message": f"Всего ярусов в исходных данных: {normalized_df['tier'].nunique() if not normalized_df.empty else 0}."},
         {"level": "info", "message": f"Количество заданных межрядных проездов: {len(aisles)}."},
         {"level": "info", "message": f"Максимальная длина ряда: {max_row_y:.2f} м."},
@@ -345,6 +450,17 @@ def build_geometry_model(
         "source_file_hash": source_file_hash,
         "settings": asdict(settings),
         "rows": rows,
+        "row_settings": [
+            {
+                "row_number": row["row_number"],
+                "row_storage_type": row.get("row_storage_type", "normal"),
+                "deep_lane_width": row.get("deep_lane_width", 1),
+                "cell_direction": row.get("cell_direction", "bottom_to_top"),
+                "updated_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+                "comment": row.get("comment", ""),
+            }
+            for row in rows
+        ],
         "cells": cells,
         "base_cells": [dict(cell) for cell in cells],
         "aisles": aisles,
@@ -361,6 +477,7 @@ def save_geometry_model(model: dict[str, Any]) -> None:
     GEOMETRY_MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
     GEOMETRY_MODEL_PATH.write_text(json.dumps(model, ensure_ascii=False, indent=2), encoding="utf-8")
     GEOMETRY_META_PATH.write_text(json.dumps({"model_type": model.get("model_type"), "model_id": model.get("model_id"), "created_at": model.get("created_at"), "source_file_name": model.get("source_file_name"), "source_sheet_name": model.get("source_sheet_name"), "source_file_hash": model.get("source_file_hash")}, ensure_ascii=False, indent=2), encoding="utf-8")
+    ROW_SETTINGS_PATH.write_text(json.dumps({"model_id": model.get("model_id"), "source_file_hash": model.get("source_file_hash"), "rows": model.get("row_settings", [])}, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def load_geometry_model() -> dict[str, Any] | None:
@@ -416,6 +533,11 @@ def clear_manual_overrides() -> None:
         MANUAL_OVERRIDES_PATH.unlink()
 
 
+def clear_row_settings() -> None:
+    if ROW_SETTINGS_PATH.exists():
+        ROW_SETTINGS_PATH.unlink()
+
+
 def append_manual_change(model: dict[str, Any], change_type: str, old_value: dict[str, Any] | None, new_value: dict[str, Any] | None, comment: str = "") -> dict[str, Any]:
     overrides = load_manual_overrides()
     if not overrides or overrides.get("source_model_id") != model.get("model_id"):
@@ -465,6 +587,9 @@ def _row_config_from_model(model: dict[str, Any]) -> pd.DataFrame:
         {
             "row_number": row.get("row_number"),
             "row_order": row.get("row_order"),
+            "row_storage_type": row.get("row_storage_type", "normal"),
+            "deep_lane_width": row.get("deep_lane_width", 1),
+            "cell_direction": row.get("cell_direction", "bottom_to_top"),
             "row_group": row.get("row_group", ""),
             "side": row.get("side", ""),
             "comment": row.get("comment", ""),
@@ -494,6 +619,7 @@ def settings_from_model(model: dict[str, Any]) -> GeometrySettings:
         aisle_width_m=_safe_float(raw.get("aisle_width_m"), 3.4),
         top_road_width_m=_safe_float(raw.get("top_road_width_m"), 3.4),
         bottom_road_width_m=_safe_float(raw.get("bottom_road_width_m"), 3.4),
+        pallet_height_m=_safe_float(raw.get("pallet_height_m"), 2.2),
         selected_tier=_display_value(raw.get("selected_tier")) or "1",
         tier_mode=_display_value(raw.get("tier_mode")) or "selected",
         row_order_mode=_display_value(raw.get("row_order_mode")) or "row_order_or_number",
@@ -542,7 +668,7 @@ def apply_manual_overrides(model: dict[str, Any], overrides: dict[str, Any]) -> 
 
 def export_current_model_excel_bytes(model: dict[str, Any]) -> bytes:
     buffer = BytesIO()
-    columns = ["code", "row_number", "cell_number", "tier", "source", "x_min", "x_max", "y_min", "y_max", "x_center", "y_center"]
+    columns = ["code", "row_number", "cell_number", "tier", "source", "storage_type", "deep_lane_width", "capacity_pallets", "volume_m3", "cell_direction", "x_min", "x_max", "y_min", "y_max", "x_center", "y_center"]
     pd.DataFrame(model.get("cells", [])).reindex(columns=columns).to_excel(buffer, index=False)
     return buffer.getvalue()
 
@@ -576,8 +702,13 @@ def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bo
     if detailed:
         for cell in cells:
             source_label = {"excel": "Excel", "manual_add": "добавлена вручную", "manual_update": "изменена вручную"}.get(str(cell.get("source", "excel")), str(cell.get("source", "excel")))
-            title = f"Код: {cell['code']}\nРяд: {cell['row_number']}\nЯчейка: {cell['cell_number']}\nЯрус: {cell['tier']}\nX: {cell['x_center']:.2f}\nY: {cell['y_center']:.2f}\nИсточник: {source_label}"
-            rect(cell["x_min"], cell["y_min"], cell["x_max"], cell["y_max"], "#e2e8f0", "1px solid #64748b", str(cell["cell_number"]), title)
+            storage_label = "набивная" if cell.get("storage_type") == "deep_lane" else "обычная"
+            title = f"Код: {cell['code']}\nРяд: {cell['row_number']}\nЯчейка: {cell['cell_number']}\nЯрус: {cell['tier']}\nТип: {storage_label}\nВместимость: {cell.get('capacity_pallets', 1)} паллет\nФизических мест: {cell.get('deep_lane_width', 1)}\nОбъём: {cell.get('volume_m3', 0)} м³\nНаправление: {_direction_label(cell.get('cell_direction', 'bottom_to_top'))}\nX: {cell['x_center']:.2f}\nY: {cell['y_center']:.2f}\nИсточник: {source_label}"
+            color = "#fde68a" if cell.get("storage_type") == "deep_lane" else "#e2e8f0"
+            border = "2px solid #d97706" if cell.get("storage_type") == "deep_lane" else "1px solid #64748b"
+            rect(cell["x_min"], cell["y_min"], cell["x_max"], cell["y_max"], color, border, str(cell["cell_number"]), title)
+            for slot in cell.get("physical_slots", []):
+                rect(slot["x_min"], slot["y_min"], slot["x_max"], slot["y_max"], "rgba(255,255,255,0.18)", "1px dashed #92400e", "", f"Физическое место {slot['slot_index']} из {cell.get('deep_lane_width', 1)}")
     else:
         for row in rows:
             rect(row["x_min"], row["y_min"], row["x_max"], row["y_max"], "#e2e8f0", "1px solid #64748b", f"ряд {row['row_number']} ({row['cells_count']})")

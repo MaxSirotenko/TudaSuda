@@ -28,6 +28,7 @@ from warehouse_geometry_model import (
     build_geometry_model,
     cell_key,
     clear_manual_overrides,
+    clear_row_settings,
     default_row_config,
     detect_column_mapping,
     empty_aisle_config,
@@ -479,6 +480,8 @@ def render_excel_geometry_warehouse() -> None:
     st.caption("Строим не копию Excel-картинки, а рабочую геометрическую модель склада в метрах: вертикальные ряды, фактические ячейки, верхний/нижний проезд и заданные межрядные проезды.")
 
     saved_model = load_geometry_model()
+    if saved_model and "geometry_model" not in st.session_state:
+        st.session_state["geometry_model"] = saved_model
     with st.sidebar:
         st.subheader("Сохранённая геометрия")
         if saved_model:
@@ -491,6 +494,7 @@ def render_excel_geometry_warehouse() -> None:
                     if path.exists():
                         path.unlink()
                 clear_manual_overrides()
+                clear_row_settings()
                 st.session_state.pop("geometry_model", None)
                 st.rerun()
         else:
@@ -552,20 +556,77 @@ def render_excel_geometry_warehouse() -> None:
     selected_tier = st.selectbox("Выбранный ярус", tier_values, disabled=tier_mode != "selected")
 
     row_config_default = default_row_config(normalized_df)
-    st.subheader("Порядок рядов")
+    if st.session_state.get("geometry_row_config_hash") != content_hash:
+        st.session_state["geometry_row_config_data"] = row_config_default
+        st.session_state["geometry_row_config_hash"] = content_hash
+
+    st.subheader("Настройки рядов")
+    st.caption("Обычный ряд хранит одну паллету на системную ячейку. Набивной ряд хранит несколько физических паллетомест внутри одной системной ячейки.")
+    row_config_source = st.session_state.get("geometry_row_config_data", row_config_default)
+    row_config_display = row_config_source.copy()
+    row_config_display["row_storage_type"] = row_config_display["row_storage_type"].map({"normal": "Обычный ряд", "deep_lane": "Набивной ряд"}).fillna(row_config_display["row_storage_type"])
+    row_config_display["cell_direction"] = row_config_display["cell_direction"].map({"bottom_to_top": "Снизу вверх", "top_to_bottom": "Сверху вниз"}).fillna(row_config_display["cell_direction"])
     row_config = st.data_editor(
-        row_config_default,
+        row_config_display,
         num_rows="dynamic",
         use_container_width=True,
         key="geometry_row_config",
         column_config={
             "row_number": "Ряд",
-            "row_order": "Порядок слева направо",
+            "row_order": "Порядок ряда",
+            "row_storage_type": st.column_config.SelectboxColumn("Тип ряда", options=["Обычный ряд", "Набивной ряд"]),
+            "deep_lane_width": st.column_config.NumberColumn("Набивных паллетомест", min_value=1, max_value=7, step=1),
+            "cell_direction": st.column_config.SelectboxColumn("Направление ячеек", options=["Снизу вверх", "Сверху вниз"]),
             "row_group": "Группа рядов",
             "side": "Сторона/зона",
             "comment": "Комментарий",
         },
     )
+    row_config["row_storage_type"] = row_config["row_storage_type"].map({"Обычный ряд": "normal", "Набивной ряд": "deep_lane"}).fillna(row_config["row_storage_type"])
+    row_config["cell_direction"] = row_config["cell_direction"].map({"Снизу вверх": "bottom_to_top", "Сверху вниз": "top_to_bottom"}).fillna(row_config["cell_direction"])
+    st.session_state["geometry_row_config_data"] = row_config
+
+    st.subheader("Набивные ряды")
+    available_rows = sorted(row_config["row_number"].dropna().astype(str).tolist(), key=lambda value: (not value.isdigit(), value))
+    selected_deep_rows = st.multiselect("Выберите ряды", available_rows, key="deep_lane_selected_rows")
+    d1, d2, d3 = st.columns(3)
+    bulk_storage_type = d1.selectbox("Тип ряда", ["Набивной ряд", "Обычный ряд"], key="deep_lane_bulk_type")
+    bulk_width = d2.selectbox("Набивных паллетомест", [2, 3, 4, 5, 6, 7], index=3, key="deep_lane_bulk_width")
+    bulk_direction = d3.selectbox("Направление ячеек", ["Сверху вниз", "Снизу вверх"], key="deep_lane_bulk_direction")
+    deep_comment = st.text_input("Комментарий для выбранных рядов", value="", key="deep_lane_bulk_comment")
+    b1, b2, b3 = st.columns(3)
+    if b1.button("Применить к выбранным рядам", disabled=not selected_deep_rows, key="deep_lane_apply"):
+        updated = row_config.copy()
+        mask = updated["row_number"].astype(str).isin(selected_deep_rows)
+        is_deep = bulk_storage_type == "Набивной ряд"
+        updated.loc[mask, "row_storage_type"] = "deep_lane" if is_deep else "normal"
+        updated.loc[mask, "deep_lane_width"] = bulk_width if is_deep else 1
+        updated.loc[mask, "cell_direction"] = "top_to_bottom" if bulk_direction == "Сверху вниз" else "bottom_to_top"
+        if deep_comment:
+            updated.loc[mask, "comment"] = deep_comment
+        st.session_state["geometry_row_config_data"] = updated
+        st.success("Настройки выбранных рядов обновлены. Нажмите «Построить склад», чтобы пересчитать геометрию.")
+        st.rerun()
+    if b2.button("Добавить набивной ряд", key="deep_lane_add"):
+        new_row = pd.DataFrame([{
+            "row_number": "154",
+            "row_order": len(row_config) + 1,
+            "row_storage_type": "deep_lane",
+            "deep_lane_width": 5,
+            "cell_direction": "top_to_bottom",
+            "row_group": "",
+            "side": "",
+            "comment": "ФРОВ, набивные ячейки",
+        }])
+        st.session_state["geometry_row_config_data"] = pd.concat([row_config, new_row], ignore_index=True).drop_duplicates("row_number", keep="last")
+        st.success("Добавлена строка настройки набивного ряда. Проверьте номер ряда и нажмите «Построить склад».")
+        st.rerun()
+    if b3.button("Сбросить настройки набивных рядов", key="deep_lane_reset"):
+        st.session_state["geometry_row_config_data"] = row_config_default
+        st.success("Настройки набивных рядов сброшены для текущей выгрузки.")
+        st.rerun()
+    if st.button("Сохранить настройки рядов", key="deep_lane_save_hint"):
+        st.info("Настройки рядов сохранятся вместе с моделью после нажатия «Построить склад».")
 
     st.subheader("Проезды между рядами")
     st.caption("Если пары «ряд от → ряд до» нет в таблице, ряды стоят плотно. Если есть — между ними добавляется проезд.")
@@ -599,7 +660,8 @@ def render_excel_geometry_warehouse() -> None:
         timings["build_geometry_seconds"] = perf_counter() - build_started
         model["performance"] = timings | model.get("performance", {})
         clear_manual_overrides()
-        st.warning("Загружен новый Excel. Старые ручные изменения сброшены.")
+        clear_row_settings()
+        st.warning("Загружен новый Excel. Старые ручные изменения и настройки набивных рядов сброшены для новой модели.")
         save_started = perf_counter()
         save_geometry_model(model)
         timings["save_model_seconds"] = perf_counter() - save_started
@@ -621,6 +683,13 @@ RUSSIAN_COLUMN_LABELS = {
     "tier": "Ярус",
     "source": "Источник",
     "source_line": "Строка источника",
+    "storage_type": "Тип хранения",
+    "row_storage_type": "Тип ряда",
+    "deep_lane_width": "Набивных паллетомест",
+    "capacity_pallets": "Вместимость, паллет",
+    "volume_m3": "Объём, м³",
+    "cell_direction": "Направление ячеек",
+    "physical_slots": "Физические места",
     "row_order": "Порядок",
     "row_group": "Группа",
     "side": "Сторона/зона",
