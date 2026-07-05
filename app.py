@@ -4,7 +4,7 @@
 # keep this file small and do not paste the full Streamlit implementation here.
 # The Excel-only virtual warehouse UI lives in virtual_warehouse_app.py.
 
-from virtual_warehouse_app import render_virtual_warehouse_excel
+from virtual_warehouse_app import main
 
 
-render_virtual_warehouse_excel()
+main()
