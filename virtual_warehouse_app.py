@@ -63,6 +63,17 @@ from warehouse_inventory_placement import (
     move_placement,
 )
 
+from warehouse_receipts import (
+    clear_receipts_state,
+    detect_receipt_columns,
+    export_receipts_excel_bytes,
+    get_receipt_sheet_names,
+    load_receipts_state,
+    make_receipts_state,
+    normalize_receipt_table,
+    read_receipt_table,
+    save_receipts_state,
+)
 st.set_page_config(page_title="Симулятор сборки", layout="wide")
 
 APP_BUILD_LABEL = "virtual-excel-only-2026-07-04"
@@ -82,47 +93,19 @@ DEFAULT_RENDER_LABEL_SETTINGS = {
     "row_label_position": "авто",
 }
 
-
-@st.cache_data(show_spinner=False)
-def get_git_release_info() -> dict[str, str]:
-    repo_dir = Path(__file__).resolve().parent
-
-    def git_text(*args: str) -> str:
-        try:
-            result = subprocess.run(
-                ["git", *args],
-                cwd=repo_dir,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=2,
-                check=False,
-            )
-        except (OSError, subprocess.SubprocessError):
-            return ""
-        if result.returncode != 0:
-            return ""
-        return result.stdout.strip()
-
-    merge_title = git_text("log", "--merges", "-1", "--pretty=%s")
-    commit_title = git_text("log", "-1", "--pretty=%s")
-    commit_hash = git_text("rev-parse", "--short", "HEAD")
-    commit_date = git_text("log", "-1", "--date=short", "--pretty=%cd")
-    return {
-        "merge_title": merge_title,
-        "commit_title": commit_title,
-        "display_label": "Последний merge" if merge_title else "Последний commit",
-        "display_title": merge_title or commit_title or "нет данных Git",
-        "commit_hash": commit_hash or "—",
-        "commit_date": commit_date or "—",
-    }
-
-
-def render_git_release_badge() -> None:
-    info = get_git_release_info()
-    st.sidebar.caption(f"{info['display_label']}: {info['display_title']}")
-    st.sidebar.caption(f"Git commit: {info['commit_hash']} · {info['commit_date']}")
+DEFAULT_RENDER_COLOR_SETTINGS = {
+    "cell_color": "#DCEBFF",
+    "deep_lane_cell_color": "#CFE8D5",
+    "aisle_color": "#F2F2F2",
+    "top_road_color": "#FFE8A3",
+    "bottom_road_color": "#FFE8A3",
+    "exit_color": "#FFCC80",
+    "selected_cell_color": "#FF7043",
+    "hover_cell_color": "#FFF59D",
+    "occupied_cell_color": "#90CAF9",
+    "deep_lane_partial_color": "#A5D6A7",
+    "deep_lane_full_color": "#66BB6A",
+}
 
 
 @st.cache_data(show_spinner=False)
@@ -224,6 +207,18 @@ def normalize_inventory_table_cached(table_payload: str, mapping_payload: str) -
     return normalize_inventory_table(df, mapping)
 
 
+@st.cache_data(show_spinner=False)
+def read_receipt_table_cached(file_bytes: bytes, content_hash: str, sheet_name: str, header_rows: int) -> pd.DataFrame:
+    return read_receipt_table(file_bytes, sheet_name, header_rows=header_rows)
+
+
+@st.cache_data(show_spinner=False)
+def normalize_receipt_table_cached(table_payload: str, mapping_payload: str) -> tuple[pd.DataFrame, dict, list[dict]]:
+    df = pd.read_json(table_payload, orient="split")
+    mapping = json.loads(mapping_payload)
+    return normalize_receipt_table(df, mapping)
+
+
 def model_to_dict(model: WarehouseModel) -> dict:
     payload = asdict(model)
     payload["model_version"] = MODEL_VERSION
@@ -264,24 +259,28 @@ def write_json_atomic(path: Path, payload: dict) -> None:
     tmp_path.replace(path)
 
 
-def load_render_label_settings() -> dict:
+def load_render_settings() -> dict:
     settings = dict(DEFAULT_RENDER_LABEL_SETTINGS)
+    settings["colors"] = dict(DEFAULT_RENDER_COLOR_SETTINGS)
     if RENDER_SETTINGS_PATH.exists():
         try:
             payload = json.loads(RENDER_SETTINGS_PATH.read_text(encoding="utf-8-sig"))
             settings.update({key: payload.get(key, value) for key, value in DEFAULT_RENDER_LABEL_SETTINGS.items()})
+            colors = dict(DEFAULT_RENDER_COLOR_SETTINGS)
+            colors.update(payload.get("colors", {}))
+            settings["colors"] = colors
         except json.JSONDecodeError:
             pass
     return settings
 
 
-def save_render_label_settings(settings: dict) -> None:
+def save_render_settings(settings: dict) -> None:
     payload = {key: settings.get(key, value) for key, value in DEFAULT_RENDER_LABEL_SETTINGS.items()}
+    payload["colors"] = {key: settings.get("colors", {}).get(key, value) for key, value in DEFAULT_RENDER_COLOR_SETTINGS.items()}
     write_json_atomic(RENDER_SETTINGS_PATH, payload)
 
 
-def render_label_settings_editor() -> dict:
-    settings = load_render_label_settings()
+def render_label_settings_editor(settings: dict) -> dict:
     with st.expander("Настройки подписей", expanded=False):
         c1, c2, c3, c4 = st.columns(4)
         settings["show_row_labels"] = c1.checkbox("Показывать номера рядов", value=bool(settings.get("show_row_labels", True)), key="show_row_labels")
@@ -294,7 +293,63 @@ def render_label_settings_editor() -> dict:
         settings["label_mode"] = c5.selectbox("Режим подписей", label_modes, index=label_modes.index(settings.get("label_mode", "Авто")) if settings.get("label_mode") in label_modes else 0, key="label_mode")
         settings["row_label_position"] = c6.selectbox("Положение номера ряда", row_positions, index=row_positions.index(settings.get("row_label_position", "авто")) if settings.get("row_label_position") in row_positions else 0, key="row_label_position")
         st.caption("Если подпись не помещается, карта уменьшает шрифт до 4 px, затем скрывает текст на карте, но оставляет полную информацию в tooltip.")
-    save_render_label_settings(settings)
+    return settings
+
+
+def render_color_settings_editor(settings: dict) -> dict:
+    colors = dict(DEFAULT_RENDER_COLOR_SETTINGS)
+    colors.update(settings.get("colors", {}))
+    with st.expander("Настройки цветов карты", expanded=False):
+        c1, c2, c3 = st.columns(3)
+        colors["cell_color"] = c1.color_picker("Цвет обычных ячеек", colors["cell_color"], key="color_cell")
+        colors["deep_lane_cell_color"] = c2.color_picker("Цвет набивных ячеек", colors["deep_lane_cell_color"], key="color_deep_lane")
+        colors["aisle_color"] = c3.color_picker("Цвет проездов между рядами", colors["aisle_color"], key="color_aisle")
+        c4, c5, c6 = st.columns(3)
+        colors["top_road_color"] = c4.color_picker("Цвет верхнего проезда", colors["top_road_color"], key="color_top_road")
+        colors["bottom_road_color"] = c5.color_picker("Цвет нижнего проезда", colors["bottom_road_color"], key="color_bottom_road")
+        colors["exit_color"] = c6.color_picker("Цвет выходов", colors["exit_color"], key="color_exit")
+        c7, c8, c9 = st.columns(3)
+        colors["selected_cell_color"] = c7.color_picker("Цвет выбранной ячейки", colors["selected_cell_color"], key="color_selected")
+        colors["hover_cell_color"] = c8.color_picker("Цвет ячейки при наведении", colors["hover_cell_color"], key="color_hover")
+        colors["occupied_cell_color"] = c9.color_picker("Цвет занятой ячейки", colors["occupied_cell_color"], key="color_occupied")
+        c10, c11 = st.columns(2)
+        colors["deep_lane_partial_color"] = c10.color_picker("Цвет частично занятой набивной", colors["deep_lane_partial_color"], key="color_deep_partial")
+        colors["deep_lane_full_color"] = c11.color_picker("Цвет полностью занятой набивной", colors["deep_lane_full_color"], key="color_deep_full")
+        b1, b2 = st.columns(2)
+        if b1.button("Сохранить цвета", key="save_render_colors"):
+            settings["colors"] = colors
+            save_render_settings(settings)
+            st.success("Цвета карты сохранены.")
+        if b2.button("Сбросить цвета по умолчанию", key="reset_render_colors"):
+            reset_widget_keys = {
+                "color_cell": "cell_color",
+                "color_deep_lane": "deep_lane_cell_color",
+                "color_aisle": "aisle_color",
+                "color_top_road": "top_road_color",
+                "color_bottom_road": "bottom_road_color",
+                "color_exit": "exit_color",
+                "color_selected": "selected_cell_color",
+                "color_hover": "hover_cell_color",
+                "color_occupied": "occupied_cell_color",
+                "color_deep_partial": "deep_lane_partial_color",
+                "color_deep_full": "deep_lane_full_color",
+            }
+            colors = dict(DEFAULT_RENDER_COLOR_SETTINGS)
+            for widget_key, color_key in reset_widget_keys.items():
+                st.session_state[widget_key] = colors[color_key]
+            settings["colors"] = colors
+            save_render_settings(settings)
+            st.success("Цвета сброшены по умолчанию.")
+            st.rerun()
+    settings["colors"] = colors
+    return settings
+
+
+def render_map_settings_editor() -> dict:
+    settings = load_render_settings()
+    settings = render_label_settings_editor(settings)
+    settings = render_color_settings_editor(settings)
+    save_render_settings(settings)
     return settings
 
 
@@ -809,6 +864,127 @@ def render_inventory_placement(model: dict) -> dict:
     return attach_placements_to_model(model, state)
 
 
+RECEIPT_STATUS_LABELS = {
+    "not_placed": "Не размещено",
+    "partially_placed": "Частично размещено",
+    "placed": "Размещено",
+    "error": "Ошибка",
+}
+
+RECEIPT_TABLE_COLUMNS = {
+    "receipt_date": "Дата прихода",
+    "receipt_document": "Документ прихода",
+    "sku_code": "Код товара",
+    "sku_name": "Наименование",
+    "characteristic_name": "Характеристика",
+    "qty_pallets": "Количество паллет",
+    "qty_boxes": "Количество коробов",
+    "expiry_date": "Срок годности",
+    "placement_status": "Статус размещения",
+}
+
+
+def _receipt_dataframe(receipts: list[dict]) -> pd.DataFrame:
+    df = pd.DataFrame(receipts)
+    if df.empty:
+        return df
+    columns = [column for column in RECEIPT_TABLE_COLUMNS if column in df.columns]
+    result = df[columns].copy()
+    if "placement_status" in result.columns:
+        result["placement_status"] = result["placement_status"].map(RECEIPT_STATUS_LABELS).fillna(result["placement_status"])
+    return result.rename(columns=RECEIPT_TABLE_COLUMNS)
+
+
+def render_receipts_section(model: dict) -> None:
+    st.subheader("Приходы")
+    state, state_warning = load_receipts_state(model)
+    if state_warning:
+        st.warning(state_warning)
+    receipts = state.get("receipts", [])
+    diagnostics = state.get("diagnostics", {})
+    if receipts:
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Файл", state.get("source_file_name", "—"))
+        c2.metric("Дата загрузки", state.get("created_at", "—"))
+        c3.metric("Строк", len(receipts))
+        c4.metric("SKU", diagnostics.get("Всего SKU", 0))
+        c5.metric("Паллет", f"{diagnostics.get('Всего паллет', 0):g}" if isinstance(diagnostics.get("Всего паллет", 0), (int, float)) else diagnostics.get("Всего паллет", 0))
+        st.info("Приходы загружены. Алгоритм размещения по ячейкам пока не запущен. Все строки имеют статус ‘Не размещено’.")
+    upload_tab, data_tab, diag_tab = st.tabs(["Загрузка приходов", "Приходы к размещению", "Диагностика приходов"])
+
+    with upload_tab:
+        receipt_file = st.file_uploader("Загрузить Excel с приходами", type=["xlsx"], key="receipt_upload")
+        replace_current = st.checkbox("Заменить текущие загруженные приходы", value=True, key="receipt_replace_current")
+        if receipt_file is not None:
+            receipt_bytes = receipt_file.getvalue()
+            receipt_hash = file_hash(receipt_bytes)
+            sheet_names = get_receipt_sheet_names(receipt_bytes)
+            sheet_name = st.selectbox("Выбрать лист", sheet_names, key="receipt_sheet")
+            header_rows = st.radio("Строк заголовка приходов", [1, 2], index=0, horizontal=True, key="receipt_header_rows")
+            receipt_df = read_receipt_table_cached(receipt_bytes, receipt_hash, sheet_name, header_rows)
+            with st.expander("Предпросмотр", expanded=False):
+                st.dataframe(receipt_df.head(30), use_container_width=True)
+            detected = detect_receipt_columns(receipt_df)
+            columns = [None] + list(receipt_df.columns)
+            st.caption("Ручной выбор колонок: проверьте автоопределение или выберите колонки вручную.")
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c6, c7, c8, c9, c10 = st.columns(5)
+            c11, c12, c13, c14, c15 = st.columns(5)
+            mapping = {
+                "sku_code": c1.selectbox("Код товара", columns, index=columns.index(detected["sku_code"]) if detected["sku_code"] in columns else 0, key="receipt_map_sku"),
+                "sku_name": c2.selectbox("Наименование", columns, index=columns.index(detected["sku_name"]) if detected["sku_name"] in columns else 0, key="receipt_map_name"),
+                "qty_pallets": c3.selectbox("Количество паллет", columns, index=columns.index(detected["qty_pallets"]) if detected["qty_pallets"] in columns else 0, key="receipt_map_pallets"),
+                "qty_boxes": c4.selectbox("Количество коробов", columns, index=columns.index(detected["qty_boxes"]) if detected["qty_boxes"] in columns else 0, key="receipt_map_boxes"),
+                "qty_units": c5.selectbox("Базовое количество", columns, index=columns.index(detected["qty_units"]) if detected["qty_units"] in columns else 0, key="receipt_map_units"),
+                "receipt_date": c6.selectbox("Дата прихода", columns, index=columns.index(detected["receipt_date"]) if detected["receipt_date"] in columns else 0, key="receipt_map_date"),
+                "receipt_number": c7.selectbox("Номер документа", columns, index=columns.index(detected["receipt_number"]) if detected["receipt_number"] in columns else 0, key="receipt_map_number"),
+                "receipt_document": c8.selectbox("Документ прихода", columns, index=columns.index(detected["receipt_document"]) if detected["receipt_document"] in columns else 0, key="receipt_map_document"),
+                "warehouse": c9.selectbox("Склад", columns, index=columns.index(detected["warehouse"]) if detected["warehouse"] in columns else 0, key="receipt_map_warehouse"),
+                "warehouse_zone": c10.selectbox("Зона склада", columns, index=columns.index(detected["warehouse_zone"]) if detected["warehouse_zone"] in columns else 0, key="receipt_map_zone"),
+                "characteristic_code": c11.selectbox("Код характеристики", columns, index=columns.index(detected["characteristic_code"]) if detected["characteristic_code"] in columns else 0, key="receipt_map_char_code"),
+                "characteristic_name": c12.selectbox("Характеристика", columns, index=columns.index(detected["characteristic_name"]) if detected["characteristic_name"] in columns else 0, key="receipt_map_char_name"),
+                "batch": c13.selectbox("Партия", columns, index=columns.index(detected["batch"]) if detected["batch"] in columns else 0, key="receipt_map_batch"),
+                "expiry_date": c14.selectbox("Срок годности", columns, index=columns.index(detected["expiry_date"]) if detected["expiry_date"] in columns else 0, key="receipt_map_expiry"),
+                "comment": c15.selectbox("Комментарий", columns, index=columns.index(detected["comment"]) if detected["comment"] in columns else 0, key="receipt_map_comment"),
+            }
+            normalized_receipts, receipt_diagnostics, receipt_messages = normalize_receipt_table_cached(receipt_df.to_json(orient="split", force_ascii=False), json.dumps(mapping, ensure_ascii=False))
+            if receipt_messages:
+                st.dataframe(pd.DataFrame(receipt_messages), use_container_width=True)
+            if st.button("Загрузить приходы", type="primary", key="receipt_import_button"):
+                if any(item.get("level") == "error" for item in receipt_messages):
+                    st.error("Исправьте обязательные колонки или ошибки данных перед загрузкой приходов.")
+                elif not replace_current and receipts:
+                    st.error("Подтвердите замену текущих загруженных приходов или очистите их вручную.")
+                else:
+                    new_state = make_receipts_state(model, receipt_file.name, receipt_hash, normalized_receipts, receipt_diagnostics, mapping)
+                    save_receipts_state(new_state)
+                    st.success("Приходы загружены и сохранены. Все строки имеют статус ‘Не размещено’.")
+                    st.rerun()
+
+    with data_tab:
+        if not receipts:
+            st.info("Загруженных приходов пока нет.")
+        else:
+            st.dataframe(_receipt_dataframe(receipts), use_container_width=True)
+            b1, b2, b3 = st.columns(3)
+            b1.download_button("Скачать загруженные приходы", export_receipts_excel_bytes(state), file_name="receipts.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            if b2.button("Очистить загруженные приходы", key="receipt_clear_button"):
+                clear_receipts_state()
+                st.success("Загруженные приходы очищены.")
+                st.rerun()
+            if b3.button("Рассчитать размещение приходов", key="receipt_calculate_stub"):
+                st.info("Алгоритм размещения приходов ещё не реализован. Сейчас можно только загрузить приходы, проверить данные и сохранить их для следующего этапа.")
+
+    with diag_tab:
+        st.subheader("Диагностика приходов")
+        if diagnostics:
+            st.dataframe(pd.DataFrame([{"Показатель": key, "Значение": value} for key, value in diagnostics.items() if key != "messages"]), use_container_width=True)
+            messages = diagnostics.get("messages", [])
+            if messages:
+                st.dataframe(pd.DataFrame(messages), use_container_width=True)
+        else:
+            st.info("Диагностика появится после загрузки файла приходов.")
+
 def render_excel_geometry_warehouse() -> None:
     st.title("Симулятор скорости сборки")
     st.header("Склад из Excel: ряды + ячейки + проезды")
@@ -1089,10 +1265,11 @@ def render_geometry_model_view(model: dict) -> None:
         st.dataframe(pd.DataFrame(diagnostics), use_container_width=True)
     render_manual_cell_editor(model)
     model = render_inventory_placement(model)
+    render_receipts_section(model)
     st.subheader("Карта склада")
     detailed = st.toggle("Детальный режим", value=len(model.get("cells", [])) <= 1500)
     scale = st.slider("Масштаб, px/м", min_value=4.0, max_value=40.0, value=18.0, step=1.0)
-    label_settings = render_label_settings_editor()
+    label_settings = render_map_settings_editor()
     render_started = perf_counter()
     html = build_geometry_html_cached(json.dumps(model, ensure_ascii=False), scale, detailed, json.dumps(label_settings, ensure_ascii=False, sort_keys=True))
     components.html(html, height=760, scrolling=True)

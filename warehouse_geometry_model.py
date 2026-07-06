@@ -694,7 +694,22 @@ def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bo
         "label_mode": "Авто",
         "row_label_position": "авто",
     }
+    default_colors = {
+        "cell_color": "#DCEBFF",
+        "deep_lane_cell_color": "#CFE8D5",
+        "aisle_color": "#F2F2F2",
+        "top_road_color": "#FFE8A3",
+        "bottom_road_color": "#FFE8A3",
+        "exit_color": "#FFCC80",
+        "selected_cell_color": "#FF7043",
+        "hover_cell_color": "#FFF59D",
+        "occupied_cell_color": "#90CAF9",
+        "deep_lane_partial_color": "#A5D6A7",
+        "deep_lane_full_color": "#66BB6A",
+    }
     settings.update(label_settings or {})
+    colors = dict(default_colors)
+    colors.update(settings.get("colors", {}))
     label_mode = str(settings.get("label_mode", "Авто"))
     parts = [f"<div style='position:relative;width:{width}px;height:{height}px;background:#f8fafc;border:1px solid #cbd5e1;overflow:auto'>"]
 
@@ -726,7 +741,7 @@ def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bo
                 return lines, size
         return [], 0
 
-    def rect(x_min, y_min, x_max, y_max, color, border, label="", title="", short_label="", label_lines=None, short_lines=None, force_label=False, vertical=False):
+    def rect(x_min, y_min, x_max, y_max, color, border, label="", title="", short_label="", label_lines=None, short_lines=None, force_label=False, vertical=False, hover_color=""):
         left = x_min * scale + 60
         top = height - (y_max * scale + y_offset)
         w = max(2, (x_max - x_min) * scale)
@@ -744,16 +759,24 @@ def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bo
             content_style = f"display:flex;align-items:center;justify-content:center;width:100%;height:100%;padding:1px;box-sizing:border-box;font:{font_size}px/{line_height}px Arial;text-align:center;overflow:hidden;color:#0f172a;"
         else:
             content_style = "display:block;width:100%;height:100%;overflow:hidden;"
-        parts.append(f"<div title='{html.escape(title or label)}' style='position:absolute;left:{left:.1f}px;top:{top:.1f}px;width:{w:.1f}px;height:{h:.1f}px;background:{color};border:{border};box-sizing:border-box;overflow:hidden;clip-path:inset(0);'><div style='{content_style}'>{content}</div></div>")
+        hover_attrs = ""
+        if hover_color:
+            safe_hover = html.escape(str(hover_color), quote=True)
+            safe_color = html.escape(str(color), quote=True)
+            hover_attrs = f" onmouseenter=\"this.dataset.bg=this.style.background;this.style.background=\'{safe_hover}\'\" onmouseleave=\"this.style.background=this.dataset.bg||\'{safe_color}\'\""
+        parts.append(f"<div title='{html.escape(title or label)}'{hover_attrs} style='position:absolute;left:{left:.1f}px;top:{top:.1f}px;width:{w:.1f}px;height:{h:.1f}px;background:{color};border:{border};box-sizing:border-box;overflow:hidden;clip-path:inset(0);'><div style='{content_style}'>{content}</div></div>")
 
     for road in roads:
         label = "верхний проезд" if road["road_type"] == "top" else "нижний проезд"
         road_label = label if settings.get("show_aisle_labels", True) else ""
-        rect(road["x_min"], road["y_min"], road["x_max"], road["y_max"], "#dbeafe", "1px solid #60a5fa", road_label, f"{label}: {road['width_m']} м", short_label="проезд")
+        road_color = colors["top_road_color"] if road["road_type"] == "top" else colors["bottom_road_color"]
+        if road.get("road_type") == "exit":
+            road_color = colors["exit_color"]
+        rect(road["x_min"], road["y_min"], road["x_max"], road["y_max"], road_color, "1px solid #60a5fa", road_label, f"{label}: {road['width_m']} м", short_label="проезд")
     for aisle in aisles:
         y_max = max_y - model["settings"].get("top_road_width_m", 3.4)
         aisle_label = "проезд" if settings.get("show_aisle_labels", True) else ""
-        rect(aisle["x_min"], 0, aisle["x_max"], y_max, "#fef3c7", "1px solid #f59e0b", aisle_label, f"{aisle['row_from']} → {aisle['row_to']}: {aisle['aisle_width_m']} м", short_label="↕")
+        rect(aisle["x_min"], 0, aisle["x_max"], y_max, colors["aisle_color"], "1px solid #f59e0b", aisle_label, f"{aisle['row_from']} → {aisle['row_to']}: {aisle['aisle_width_m']} м", short_label="↕")
     if detailed:
         for cell in cells:
             source_label = {"excel": "Excel", "manual_add": "добавлена вручную", "manual_update": "изменена вручную"}.get(str(cell.get("source", "excel")), str(cell.get("source", "excel")))
@@ -772,13 +795,13 @@ def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bo
                 color = "#fecaca"
                 border = "2px solid #dc2626"
             elif occupied >= capacity:
-                color = "#bbf7d0"
+                color = colors["deep_lane_full_color"] if cell.get("storage_type") == "deep_lane" else colors["occupied_cell_color"]
                 border = "2px solid #16a34a"
             elif occupied > 0:
-                color = "#fde68a"
+                color = colors["deep_lane_partial_color"] if cell.get("storage_type") == "deep_lane" else colors["occupied_cell_color"]
                 border = "2px solid #d97706"
             else:
-                color = "#fef3c7" if cell.get("storage_type") == "deep_lane" else "#e2e8f0"
+                color = colors["deep_lane_cell_color"] if cell.get("storage_type") == "deep_lane" else colors["cell_color"]
                 border = "2px solid #d97706" if cell.get("storage_type") == "deep_lane" else "1px solid #64748b"
             cell_number_label = str(cell["cell_number"]) if settings.get("show_cell_labels", True) else ""
             occupancy_text = occupancy_label if settings.get("show_occupancy_labels", True) and occupied > 0 else ""
@@ -791,7 +814,7 @@ def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bo
             else:
                 full_lines = [cell_number_label, occupancy_text] if occupancy_text else [cell_number_label]
                 short_lines = [occupancy_text] if occupancy_text else [cell_number_label]
-            rect(cell["x_min"], cell["y_min"], cell["x_max"], cell["y_max"], color, border, cell_number_label, title, short_label=occupancy_text or cell_number_label, label_lines=full_lines, short_lines=short_lines)
+            rect(cell["x_min"], cell["y_min"], cell["x_max"], cell["y_max"], color, border, cell_number_label, title, short_label=occupancy_text or cell_number_label, label_lines=full_lines, short_lines=short_lines, hover_color=colors["hover_cell_color"])
             occupied_slots = int(min(round(occupied), len(cell.get("physical_slots", []))))
             for slot in cell.get("physical_slots", []):
                 slot_color = "rgba(34,197,94,0.45)" if slot.get("slot_index", 0) <= occupied_slots else "rgba(255,255,255,0.18)"
@@ -799,7 +822,7 @@ def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bo
     else:
         for row in rows:
             row_label = f"ряд {row['row_number']} ({row['cells_count']})" if settings.get("show_row_labels", True) else ""
-            rect(row["x_min"], row["y_min"], row["x_max"], row["y_max"], "#e2e8f0", "1px solid #64748b", row_label, short_label=str(row.get("row_number", "")), vertical=True)
+            rect(row["x_min"], row["y_min"], row["x_max"], row["y_max"], colors["cell_color"], "1px solid #64748b", row_label, short_label=str(row.get("row_number", "")), vertical=True)
     if settings.get("show_row_labels", True):
         row_position = str(settings.get("row_label_position", "авто"))
         for idx, row in enumerate(rows):
