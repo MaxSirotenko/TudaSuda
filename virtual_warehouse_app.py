@@ -275,8 +275,17 @@ def load_render_settings() -> dict:
 
 
 def save_render_settings(settings: dict) -> None:
-    payload = {key: settings.get(key, value) for key, value in DEFAULT_RENDER_LABEL_SETTINGS.items()}
-    payload["colors"] = {key: settings.get("colors", {}).get(key, value) for key, value in DEFAULT_RENDER_COLOR_SETTINGS.items()}
+    payload = {}
+    if RENDER_SETTINGS_PATH.exists():
+        try:
+            payload = json.loads(RENDER_SETTINGS_PATH.read_text(encoding="utf-8-sig"))
+        except json.JSONDecodeError:
+            payload = {}
+    payload.update({key: settings.get(key, value) for key, value in DEFAULT_RENDER_LABEL_SETTINGS.items()})
+    existing_colors = payload.get("colors", {}) if isinstance(payload.get("colors"), dict) else {}
+    colors = dict(existing_colors)
+    colors.update({key: settings.get("colors", {}).get(key, value) for key, value in DEFAULT_RENDER_COLOR_SETTINGS.items()})
+    payload["colors"] = colors
     write_json_atomic(RENDER_SETTINGS_PATH, payload)
 
 
@@ -321,22 +330,7 @@ def render_color_settings_editor(settings: dict) -> dict:
             save_render_settings(settings)
             st.success("Цвета карты сохранены.")
         if b2.button("Сбросить цвета по умолчанию", key="reset_render_colors"):
-            reset_widget_keys = {
-                "color_cell": "cell_color",
-                "color_deep_lane": "deep_lane_cell_color",
-                "color_aisle": "aisle_color",
-                "color_top_road": "top_road_color",
-                "color_bottom_road": "bottom_road_color",
-                "color_exit": "exit_color",
-                "color_selected": "selected_cell_color",
-                "color_hover": "hover_cell_color",
-                "color_occupied": "occupied_cell_color",
-                "color_deep_partial": "deep_lane_partial_color",
-                "color_deep_full": "deep_lane_full_color",
-            }
             colors = dict(DEFAULT_RENDER_COLOR_SETTINGS)
-            for widget_key, color_key in reset_widget_keys.items():
-                st.session_state[widget_key] = colors[color_key]
             settings["colors"] = colors
             save_render_settings(settings)
             st.success("Цвета сброшены по умолчанию.")
