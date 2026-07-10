@@ -725,6 +725,9 @@ def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bo
     colors = dict(default_colors)
     colors.update(settings.get("colors", {}))
     label_mode = str(settings.get("label_mode", "Авто"))
+    edit_mode = bool(settings.get("edit_mode", False))
+    selected_cell_key = str(settings.get("selected_cell_key", ""))
+    selected_row_number = str(settings.get("selected_row_number", ""))
     model_id = re.sub(r"[^a-zA-Z0-9_-]", "_", str(model.get("model_id") or "warehouse"))
     root_id = f"warehouse-map-{model_id}"
     canvas_id = f"warehouse-map-canvas-{model_id}"
@@ -774,7 +777,7 @@ def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bo
                 return lines, size
         return [], 0
 
-    def rect(x_min, y_min, x_max, y_max, color, border, label="", title="", short_label="", label_lines=None, short_lines=None, force_label=False, vertical=False, hover_color=""):
+    def rect(x_min, y_min, x_max, y_max, color, border, label="", title="", short_label="", label_lines=None, short_lines=None, force_label=False, vertical=False, hover_color="", extra_attrs=""):
         left = x_min * scale + 60
         top = height - (y_max * scale + y_offset)
         w = max(2, (x_max - x_min) * scale)
@@ -797,7 +800,7 @@ def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bo
             safe_hover = html.escape(str(hover_color), quote=True)
             safe_color = html.escape(str(color), quote=True)
             hover_attrs = f" onmouseenter=\"this.dataset.bg=this.style.background;this.style.background=\'{safe_hover}\'\" onmouseleave=\"this.style.background=this.dataset.bg||\'{safe_color}\'\""
-        parts.append(f"<div title='{html.escape(title or label)}'{hover_attrs} style='position:absolute;left:{left:.1f}px;top:{top:.1f}px;width:{w:.1f}px;height:{h:.1f}px;background:{color};border:{border};box-sizing:border-box;overflow:hidden;clip-path:inset(0);'><div style='{content_style}'>{content}</div></div>")
+        parts.append(f"<div title='{html.escape(title or label)}'{hover_attrs}{extra_attrs} style='position:absolute;left:{left:.1f}px;top:{top:.1f}px;width:{w:.1f}px;height:{h:.1f}px;background:{color};border:{border};box-sizing:border-box;overflow:hidden;clip-path:inset(0);'><div style='{content_style}'>{content}</div></div>")
 
     for road in roads:
         label = "верхний проезд" if road["road_type"] == "top" else "нижний проезд"
@@ -824,6 +827,7 @@ def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bo
             placement_source = ", ".join(sorted({str(item.get("source", "")) for item in placements if item.get("source")})) or "—"
             confidence = ", ".join(sorted({str(item.get("confidence", "")) for item in placements if item.get("confidence")})) or "—"
             title = f"Код: {cell['code']}\nРяд: {cell['row_number']}\nЯчейка: {cell['cell_number']}\nЯрус: {cell['tier']}\nТип: {storage_label}\nВместимость: {capacity:g} паллет\nЗанято: {occupied:g}\nСвободно: {free:g}\nSKU: {sku_text}\nНаименование: {item_text}\nИсточник размещения: {placement_source}\nТочность: {confidence}\nФизических мест: {cell.get('deep_lane_width', 1)}\nОбъём: {cell.get('volume_m3', 0)} м³\nНаправление: {_direction_label(cell.get('cell_direction', 'bottom_to_top'))}\nX: {cell['x_center']:.2f}\nY: {cell['y_center']:.2f}\nИсточник ячейки: {source_label}"
+            current_cell_key = f"{cell.get('row_number')}|{cell.get('cell_number')}|{cell.get('tier') or '1'}"
             if occupied > capacity:
                 color = "#fecaca"
                 border = "2px solid #dc2626"
@@ -847,7 +851,11 @@ def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bo
             else:
                 full_lines = [cell_number_label, occupancy_text] if occupancy_text else [cell_number_label]
                 short_lines = [occupancy_text] if occupancy_text else [cell_number_label]
-            rect(cell["x_min"], cell["y_min"], cell["x_max"], cell["y_max"], color, border, cell_number_label, title, short_label=occupancy_text or cell_number_label, label_lines=full_lines, short_lines=short_lines, hover_color=colors["hover_cell_color"])
+            if current_cell_key == selected_cell_key:
+                color = colors["selected_cell_color"]
+                border = "3px solid #7c2d12"
+            cell_attrs = f" data-edit-select='cell' data-cell-key='{html.escape(current_cell_key, quote=True)}' data-row-number='{html.escape(str(cell.get('row_number')), quote=True)}'" if edit_mode else ""
+            rect(cell["x_min"], cell["y_min"], cell["x_max"], cell["y_max"], color, border, cell_number_label, title, short_label=occupancy_text or cell_number_label, label_lines=full_lines, short_lines=short_lines, hover_color=colors["hover_cell_color"], extra_attrs=cell_attrs)
             occupied_slots = int(min(round(occupied), len(cell.get("physical_slots", []))))
             for slot in cell.get("physical_slots", []):
                 slot_color = "rgba(34,197,94,0.45)" if slot.get("slot_index", 0) <= occupied_slots else "rgba(255,255,255,0.18)"
@@ -855,7 +863,9 @@ def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bo
     else:
         for row in rows:
             row_label = f"ряд {row['row_number']} ({row['cells_count']})" if settings.get("show_row_labels", True) else ""
-            rect(row["x_min"], row["y_min"], row["x_max"], row["y_max"], colors["cell_color"], "1px solid #64748b", row_label, short_label=str(row.get("row_number", "")), vertical=True)
+            row_color = colors["selected_cell_color"] if str(row.get("row_number", "")) == selected_row_number else colors["cell_color"]
+            row_attrs = f" data-edit-select='row' data-row-number='{html.escape(str(row.get('row_number', '')), quote=True)}'" if edit_mode else ""
+            rect(row["x_min"], row["y_min"], row["x_max"], row["y_max"], row_color, "1px solid #64748b", row_label, short_label=str(row.get("row_number", "")), vertical=True, extra_attrs=row_attrs)
     if settings.get("show_row_labels", True):
         row_position = str(settings.get("row_label_position", "авто"))
         for idx, row in enumerate(rows):
@@ -867,9 +877,13 @@ def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bo
                 positions = ["bottom"]
             for position in positions:
                 if position == "bottom":
-                    rect(row["x_min"], row["y_min"] - 0.4, row["x_max"], row["y_min"], "#bfdbfe", "1px solid #2563eb", row_label, f"Ряд {row_label}", short_label=row_label, vertical=True)
+                    label_color = colors["selected_cell_color"] if row_label == selected_row_number else "#bfdbfe"
+                    row_attrs = f" data-edit-select='row' data-row-number='{html.escape(row_label, quote=True)}'" if edit_mode else ""
+                    rect(row["x_min"], row["y_min"] - 0.4, row["x_max"], row["y_min"], label_color, "1px solid #2563eb", row_label, f"Ряд {row_label}", short_label=row_label, vertical=True, extra_attrs=row_attrs)
                 else:
-                    rect(row["x_min"], row["y_max"], row["x_max"], row["y_max"] + 0.4, "#bfdbfe", "1px solid #2563eb", row_label, f"Ряд {row_label}", short_label=row_label, vertical=True)
+                    label_color = colors["selected_cell_color"] if row_label == selected_row_number else "#bfdbfe"
+                    row_attrs = f" data-edit-select='row' data-row-number='{html.escape(row_label, quote=True)}'" if edit_mode else ""
+                    rect(row["x_min"], row["y_max"], row["x_max"], row["y_max"] + 0.4, label_color, "1px solid #2563eb", row_label, f"Ряд {row_label}", short_label=row_label, vertical=True, extra_attrs=row_attrs)
     parts.append("</div>")
     script = f"""
 <script>
@@ -986,6 +1000,19 @@ def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bo
     if (event.target.closest('button')) return;
     event.preventDefault();
     fitAll();
+  }});
+  root.addEventListener('click', function(event) {{
+    const target = event.target.closest('[data-edit-select]');
+    if (!target) return;
+    root.querySelectorAll('[data-edit-selected="1"]').forEach(function(item) {{
+      item.dataset.editSelected = '0';
+      item.style.outline = '';
+      item.style.outlineOffset = '';
+    }});
+    target.dataset.editSelected = '1';
+    target.style.outline = '3px solid #ff7043';
+    target.style.outlineOffset = '2px';
+    try {{ localStorage.setItem(storageKey + ':selected', JSON.stringify(target.dataset)); }} catch (err) {{}}
   }});
 
   let restored = false;
