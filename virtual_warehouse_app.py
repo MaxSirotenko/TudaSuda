@@ -1234,6 +1234,88 @@ def _localized_dataframe(rows: list[dict]) -> pd.DataFrame:
         df["source"] = df["source"].map(_source_label)
     return df.rename(columns=RUSSIAN_COLUMN_LABELS)
 
+def _model_aisle_config_dataframe(model: dict) -> pd.DataFrame:
+    rows = []
+    for aisle in model.get("aisles", []):
+        rows.append({
+            "row_from": aisle.get("row_from", ""),
+            "row_to": aisle.get("row_to", ""),
+            "aisle_width_m": aisle.get("aisle_width_m", model.get("settings", {}).get("aisle_width_m", 3.4)),
+            "aisle_type": aisle.get("aisle_type", "межрядный проезд"),
+            "comment": aisle.get("comment", ""),
+        })
+    return pd.DataFrame(rows, columns=["row_from", "row_to", "aisle_width_m", "aisle_type", "comment"])
+
+
+def render_active_model_aisle_editor(model: dict) -> dict:
+    st.subheader("Настройки проездов между рядами")
+    st.caption("Изменение проездов перестраивает только геометрию активной модели по текущим ячейкам и не очищает ручные изменения, размещение товара или приходы.")
+    settings = model.get("settings", {})
+    model_key = model.get("model_id", "model")
+    c1, c2, c3 = st.columns(3)
+    default_aisle_width = c1.number_input(
+        "Межрядный проезд по умолчанию, м",
+        min_value=0.1,
+        value=float(settings.get("aisle_width_m", 3.4) or 3.4),
+        step=0.1,
+        key=f"active_aisle_default_width_{model_key}",
+    )
+    top_road_width = c2.number_input(
+        "Верхний проезд, м",
+        min_value=0.1,
+        value=float(settings.get("top_road_width_m", 3.4) or 3.4),
+        step=0.1,
+        key=f"active_top_road_width_{model_key}",
+    )
+    bottom_road_width = c3.number_input(
+        "Нижний проезд, м",
+        min_value=0.1,
+        value=float(settings.get("bottom_road_width_m", 3.4) or 3.4),
+        step=0.1,
+        key=f"active_bottom_road_width_{model_key}",
+    )
+    st.caption("Если пары «ряд от → ряд до» нет в таблице, ряды стоят плотно. Если есть — между ними добавляется проезд.")
+    aisle_config = st.data_editor(
+        _model_aisle_config_dataframe(model),
+        num_rows="dynamic",
+        use_container_width=True,
+        key=f"active_aisle_config_{model_key}",
+        column_config={
+            "row_from": "Ряд от",
+            "row_to": "Ряд до",
+            "aisle_width_m": st.column_config.NumberColumn("Ширина проезда, м", min_value=0.1, step=0.1),
+            "aisle_type": "Тип проезда",
+            "comment": "Комментарий",
+        },
+    )
+    b1, b2 = st.columns(2)
+    if b1.button("Сохранить настройки проездов", key="active_aisle_save", type="primary"):
+        geometry_settings = GeometrySettings(
+            cell_length_m=float(settings.get("cell_length_m", 1.2) or 1.2),
+            cell_width_m=float(settings.get("cell_width_m", 0.8) or 0.8),
+            aisle_width_m=default_aisle_width,
+            top_road_width_m=top_road_width,
+            bottom_road_width_m=bottom_road_width,
+            pallet_height_m=float(settings.get("pallet_height_m", 2.2) or 2.2),
+            selected_tier=str(settings.get("selected_tier", "1") or "1"),
+            tier_mode=str(settings.get("tier_mode", "selected") or "selected"),
+            row_order_mode=str(settings.get("row_order_mode", "row_order_or_number") or "row_order_or_number"),
+        )
+        rebuilt = rebuild_geometry_from_cells(model, model.get("cells", []), keep_base_cells=True, settings=geometry_settings, aisle_config=aisle_config)
+        rebuilt["manual_change_counts"] = model.get("manual_change_counts", rebuilt.get("manual_change_counts", {}))
+        save_geometry_model(rebuilt)
+        st.session_state["geometry_model"] = rebuilt
+        st.success("Настройки проездов сохранены, геометрия активной модели перестроена.")
+        st.rerun()
+    if b2.button("Сбросить таблицу проездов", key="active_aisle_reset"):
+        rebuilt = rebuild_geometry_from_cells(model, model.get("cells", []), keep_base_cells=True, aisle_config=empty_aisle_config())
+        save_geometry_model(rebuilt)
+        st.session_state["geometry_model"] = rebuilt
+        st.success("Межрядные проезды удалены из активной модели.")
+        st.rerun()
+    return model
+
+
 def render_geometry_model_view(model: dict) -> None:
     st.subheader("Активная модель")
     overrides = load_manual_overrides()
@@ -1258,6 +1340,9 @@ def render_geometry_model_view(model: dict) -> None:
     if diagnostics:
         st.dataframe(pd.DataFrame(diagnostics), use_container_width=True)
     render_manual_cell_editor(model)
+    model = st.session_state.get("geometry_model", model)
+    render_active_model_aisle_editor(model)
+    model = st.session_state.get("geometry_model", model)
     model = render_inventory_placement(model)
     render_receipts_section(model)
     st.subheader("Карта склада")
