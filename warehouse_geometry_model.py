@@ -628,12 +628,19 @@ def settings_from_model(model: dict[str, Any]) -> GeometrySettings:
     )
 
 
-def rebuild_geometry_from_cells(model: dict[str, Any], cells: list[dict[str, Any]], keep_base_cells: bool = True) -> dict[str, Any]:
+def rebuild_geometry_from_cells(
+    model: dict[str, Any],
+    cells: list[dict[str, Any]],
+    keep_base_cells: bool = True,
+    settings: GeometrySettings | None = None,
+    row_config: pd.DataFrame | None = None,
+    aisle_config: pd.DataFrame | None = None,
+) -> dict[str, Any]:
     rebuilt, _ = build_geometry_model(
         _cells_to_df(cells),
-        settings_from_model(model),
-        _row_config_from_model(model),
-        _aisle_config_from_model(model),
+        settings or settings_from_model(model),
+        row_config if row_config is not None else _row_config_from_model(model),
+        aisle_config if aisle_config is not None else _aisle_config_from_model(model),
         source_file_name=model.get("source_file_name", ""),
         source_sheet_name=model.get("source_sheet_name", ""),
         source_file_hash=model.get("source_file_hash", ""),
