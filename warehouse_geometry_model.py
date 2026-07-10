@@ -728,6 +728,9 @@ def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bo
     edit_mode = bool(settings.get("edit_mode", False))
     selected_cell_key = str(settings.get("selected_cell_key", ""))
     selected_row_number = str(settings.get("selected_row_number", ""))
+    edit_tool = str(settings.get("edit_tool", "Выбор"))
+    snap_enabled = bool(settings.get("snap_enabled", True))
+    snap_step = float(settings.get("snap_step", 0.1) or 0.1)
     model_id = re.sub(r"[^a-zA-Z0-9_-]", "_", str(model.get("model_id") or "warehouse"))
     root_id = f"warehouse-map-{model_id}"
     canvas_id = f"warehouse-map-canvas-{model_id}"
@@ -897,6 +900,10 @@ def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bo
   const maxScale = 8;
   const buttonFactor = 1.2;
   const storageKey = root.dataset.storageKey || {json.dumps(storage_key)};
+  const editTool = {json.dumps(edit_tool)};
+  const snapEnabled = {json.dumps(snap_enabled)};
+  const snapStep = {json.dumps(snap_step)};
+  let spacePressed = false;
   const base = {{ scale: 1, x: 0, y: 0 }};
   const view = {{ scale: 1, x: 0, y: 0 }};
 
@@ -973,21 +980,90 @@ def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bo
   }}, {{ passive: false }});
 
   let dragging = false;
+  let movingRow = null;
+  let selectingBox = null;
   let dragStart = {{ x: 0, y: 0, viewX: 0, viewY: 0 }};
+  window.addEventListener('keydown', function(event) {{ if (event.code === 'Space') spacePressed = true; if (event.code === 'Escape') cancelTransient(); }});
+  window.addEventListener('keyup', function(event) {{ if (event.code === 'Space') spacePressed = false; }});
+  function rowElements(rowNumber) {{ return Array.from(root.querySelectorAll(`[data-row-number="${{CSS.escape(rowNumber)}}"]`)); }}
+  function snappedMeters(pixelDelta) {{
+    const meters = pixelDelta / (view.scale * {scale});
+    const snapped = snapEnabled && snapStep > 0 ? Math.round(meters / snapStep) * snapStep : meters;
+    return snapped * view.scale * {scale};
+  }}
+  function cancelTransient() {{
+    if (movingRow) {{ movingRow.items.forEach(function(item) {{ item.style.transform = ''; item.style.opacity = ''; }}); movingRow = null; }}
+    if (selectingBox) {{ selectingBox.el.remove(); selectingBox = null; }}
+  }}
   root.addEventListener('pointerdown', function(event) {{
     if (event.target.closest('button')) return;
+    const editTarget = event.target.closest('[data-edit-select]');
+    if (!spacePressed && editTool === 'Перемещение' && editTarget && editTarget.dataset.rowNumber) {{
+      movingRow = {{ row: editTarget.dataset.rowNumber, x: event.clientX, y: event.clientY, items: rowElements(editTarget.dataset.rowNumber) }};
+      movingRow.items.forEach(function(item) {{ item.style.opacity = '0.58'; }});
+      root.setPointerCapture(event.pointerId);
+      return;
+    }}
+    if (!spacePressed && editTool === 'Выделение рамкой') {{
+      const rect = root.getBoundingClientRect();
+      const el = document.createElement('div');
+      el.style.cssText = 'position:absolute;z-index:25;border:1px dashed #2563eb;background:rgba(37,99,235,0.12);pointer-events:none;';
+      root.appendChild(el);
+      selectingBox = {{ el, x: event.clientX - rect.left, y: event.clientY - rect.top, shift: event.shiftKey, ctrl: event.ctrlKey }};
+      root.setPointerCapture(event.pointerId);
+      return;
+    }}
     dragging = true;
     dragStart = {{ x: event.clientX, y: event.clientY, viewX: view.x, viewY: view.y }};
     canvas.style.cursor = 'grabbing';
     root.setPointerCapture(event.pointerId);
   }});
   root.addEventListener('pointermove', function(event) {{
+    if (movingRow) {{
+      const dx = snappedMeters(event.clientX - movingRow.x);
+      const dy = snappedMeters(event.clientY - movingRow.y);
+      movingRow.items.forEach(function(item) {{ item.style.transform = `translate(${{dx}}px, ${{dy}}px)`; }});
+      return;
+    }}
+    if (selectingBox) {{
+      const rect = root.getBoundingClientRect();
+      const x2 = event.clientX - rect.left;
+      const y2 = event.clientY - rect.top;
+      const left = Math.min(selectingBox.x, x2);
+      const top = Math.min(selectingBox.y, y2);
+      selectingBox.el.style.left = `${{left}}px`;
+      selectingBox.el.style.top = `${{top}}px`;
+      selectingBox.el.style.width = `${{Math.abs(x2 - selectingBox.x)}}px`;
+      selectingBox.el.style.height = `${{Math.abs(y2 - selectingBox.y)}}px`;
+      return;
+    }}
     if (!dragging) return;
     view.x = dragStart.viewX + event.clientX - dragStart.x;
     view.y = dragStart.viewY + event.clientY - dragStart.y;
     applyView();
   }});
   function stopDrag(event) {{
+    if (movingRow) {{
+      try {{ localStorage.setItem(storageKey + ':row-preview:' + movingRow.row, JSON.stringify({{ row: movingRow.row }})); }} catch (err) {{}}
+      movingRow.items.forEach(function(item) {{ item.style.opacity = ''; }});
+      movingRow = null;
+      try {{ root.releasePointerCapture(event.pointerId); }} catch (err) {{}}
+      return;
+    }}
+    if (selectingBox) {{
+      const box = selectingBox.el.getBoundingClientRect();
+      if (!selectingBox.shift && !selectingBox.ctrl) root.querySelectorAll('[data-edit-selected="1"]').forEach(function(item) {{ item.dataset.editSelected = '0'; item.style.outline = ''; item.style.outlineOffset = ''; }});
+      root.querySelectorAll('[data-edit-select]').forEach(function(item) {{
+        const r = item.getBoundingClientRect();
+        const hit = r.left < box.right && r.right > box.left && r.top < box.bottom && r.bottom > box.top;
+        if (!hit) return;
+        if (selectingBox.ctrl) {{ item.dataset.editSelected = '0'; item.style.outline = ''; item.style.outlineOffset = ''; }}
+        else {{ item.dataset.editSelected = '1'; item.style.outline = '3px solid #ff7043'; item.style.outlineOffset = '2px'; }}
+      }});
+      selectingBox.el.remove(); selectingBox = null;
+      try {{ root.releasePointerCapture(event.pointerId); }} catch (err) {{}}
+      return;
+    }}
     if (!dragging) return;
     dragging = false;
     canvas.style.cursor = 'grab';

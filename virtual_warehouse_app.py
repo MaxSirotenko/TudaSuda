@@ -1527,6 +1527,116 @@ def _add_cell_near(model: dict, selected: dict, where: str, new_number: str) -> 
     return True, "Ячейка добавлена."
 
 
+
+
+def _selection_stats(model: dict, row_numbers: list[str], cell_keys: list[str]) -> dict:
+    selected_cells = [c for c in model.get("cells", []) if _map_cell_key(c) in set(cell_keys) or str(c.get("row_number")) in set(row_numbers)]
+    unique = {_map_cell_key(c): c for c in selected_cells}.values()
+    capacity = sum(float(c.get("capacity_pallets", 1) or 1) for c in unique)
+    occupied = sum(_occupied_for_cell(model, _map_cell_key(c)) for c in unique)
+    return {"rows": len(set(row_numbers)), "cells": len(list(unique)), "capacity": capacity, "occupied": occupied, "free": max(capacity - occupied, 0)}
+
+
+def _shift_rows(model: dict, row_numbers: list[str], dx: float, dy: float, snap: bool, step: float) -> tuple[bool, str]:
+    if snap and step > 0:
+        dx = round(dx / step) * step
+        dy = round(dy / step) * step
+    moving = [row for row in model.get("rows", []) if str(row.get("row_number")) in set(row_numbers)]
+    if not moving:
+        return False, "Выберите ряды для сдвига."
+    snapshots = {str(r.get("row_number")): dict(r) for r in moving}
+    for row in moving:
+        row["x_min"] = float(row.get("x_min", 0) or 0) + dx
+        row["x_max"] = float(row.get("x_max", 0) or 0) + dx
+        row["x_center"] = float(row.get("x_center", 0) or 0) + dx
+        row["y_min"] = float(row.get("y_min", 0) or 0) + dy
+        row["y_max"] = float(row.get("y_max", 0) or 0) + dy
+    for cell in model.get("cells", []):
+        if str(cell.get("row_number")) in set(row_numbers):
+            for key in ["x_min", "x_max", "x_center"]:
+                cell[key] = float(cell.get(key, 0) or 0) + dx
+            for key in ["y_min", "y_max", "y_center"]:
+                cell[key] = float(cell.get(key, 0) or 0) + dy
+            for slot in cell.get("physical_slots", []):
+                for key in ["x_min", "x_max"]:
+                    slot[key] = float(slot.get(key, 0) or 0) + dx
+                for key in ["y_min", "y_max"]:
+                    slot[key] = float(slot.get(key, 0) or 0) + dy
+    # block row intersections after move
+    rows = model.get("rows", [])
+    for idx, a in enumerate(rows):
+        for b in rows[idx + 1:]:
+            if str(a.get("row_number")) == str(b.get("row_number")):
+                continue
+            overlap_x = float(a.get("x_min", 0)) < float(b.get("x_max", 0)) and float(a.get("x_max", 0)) > float(b.get("x_min", 0))
+            overlap_y = float(a.get("y_min", 0)) < float(b.get("y_max", 0)) and float(a.get("y_max", 0)) > float(b.get("y_min", 0))
+            if overlap_x and overlap_y:
+                for row in moving:
+                    row.update(snapshots[str(row.get("row_number"))])
+                return False, f"Нельзя сохранить: ряд {a.get('row_number')} пересекается с рядом {b.get('row_number')}."
+    return True, "Ряды сдвинуты."
+
+
+def render_bulk_map_actions(model: dict, snap: bool, snap_step: float) -> dict:
+    row_choices = _row_options(model)
+    cell_choices = _cell_options(model)
+    selected_row_labels = st.multiselect("Массовое выделение рядов", list(row_choices), key="map_bulk_rows")
+    selected_cell_labels = st.multiselect("Массовое выделение ячеек", list(cell_choices), key="map_bulk_cells")
+    row_numbers = [row_choices[label] for label in selected_row_labels]
+    cell_keys = [cell_choices[label] for label in selected_cell_labels]
+    stats = _selection_stats(model, row_numbers, cell_keys)
+    s1, s2, s3, s4, s5 = st.columns(5)
+    s1.metric("Выбрано рядов", stats["rows"])
+    s2.metric("Выбрано ячеек", stats["cells"])
+    s3.metric("Вместимость", f"{stats['capacity']:g}")
+    s4.metric("Занято", f"{stats['occupied']:g}")
+    s5.metric("Свободно", f"{stats['free']:g}")
+    if st.button("Снять выделение", key="map_clear_bulk_selection"):
+        st.session_state["map_bulk_rows"] = []
+        st.session_state["map_bulk_cells"] = []
+        st.rerun()
+    with st.expander("Массовые действия", expanded=False):
+        b1, b2, b3, b4 = st.columns(4)
+        zone = b1.selectbox("weight_zone", ["heavy", "medium", "light", "unassigned"], key="bulk_zone")
+        direction = b2.selectbox("Направление", ["bottom_to_top", "top_to_bottom"], key="bulk_direction")
+        storage = b3.selectbox("Тип", ["normal", "deep_lane"], key="bulk_storage")
+        capacity = b4.number_input("capacity_pallets", min_value=0.0, value=1.0, step=1.0, key="bulk_capacity")
+        block = st.checkbox("Заблокировать выбранные объекты", key="bulk_block")
+        if st.button("Применить к выбранным", key="bulk_apply"):
+            if any(_occupied_for_cell(model, key) > capacity for key in cell_keys):
+                st.error("Нельзя уменьшить вместимость ниже занятого количества паллет.")
+            else:
+                _save_map_edit_snapshot(model)
+                for row in model.get("rows", []):
+                    if str(row.get("row_number")) in set(row_numbers):
+                        row.update({"weight_zone": zone, "cell_direction": direction, "row_storage_type": storage})
+                for cell in model.get("cells", []):
+                    if _map_cell_key(cell) in set(cell_keys) or str(cell.get("row_number")) in set(row_numbers):
+                        cell.update({"weight_zone": zone if str(cell.get("row_number")) in set(row_numbers) else cell.get("weight_zone"), "cell_direction": direction, "storage_type": storage, "capacity_pallets": capacity, "source": "block_manual" if block else "manual_update"})
+                _persist_map_edit(model, "Массовые изменения применены.")
+                st.rerun()
+        dx = st.number_input("Сдвиг выбранных рядов X, м", value=0.0, step=snap_step, key="bulk_shift_x")
+        dy = st.number_input("Сдвиг выбранных рядов Y, м", value=0.0, step=snap_step, key="bulk_shift_y")
+        if st.button("Сдвинуть выбранные ряды", key="bulk_shift_rows"):
+            _save_map_edit_snapshot(model)
+            ok, msg = _shift_rows(model, row_numbers, dx, dy, snap, snap_step)
+            if ok:
+                _persist_map_edit(model, msg)
+                st.rerun()
+            else:
+                st.error(msg)
+        confirm = st.checkbox("Подтвердить массовое удаление пустых ячеек", key="bulk_delete_confirm")
+        if st.button("Удалить выбранные пустые ячейки", disabled=not confirm, key="bulk_delete_cells"):
+            occupied_keys = [key for key in cell_keys if _occupied_for_cell(model, key) > 0]
+            if occupied_keys:
+                st.error("Нельзя удалить занятые ячейки.")
+            else:
+                _save_map_edit_snapshot(model)
+                model["cells"] = [c for c in model.get("cells", []) if _map_cell_key(c) not in set(cell_keys)]
+                _persist_map_edit(model, "Пустые ячейки удалены.")
+                st.rerun()
+    return model
+
 def render_map_edit_panel(model: dict) -> dict:
     edit_mode = st.toggle("Режим редактирования", key="map_edit_mode")
     if not edit_mode:
@@ -1535,9 +1645,19 @@ def render_map_edit_panel(model: dict) -> dict:
         st.session_state.pop("map_selected_row_number", None)
         return model
     st.caption("В режиме редактирования клики по карте подсвечивают объект. Для применения изменений выберите объект в панели ниже.")
+    tool = st.radio("Инструмент", ["Выбор", "Перемещение", "Выделение рамкой"], horizontal=True, key="map_edit_tool")
+    snap = st.checkbox("Привязка к сетке", value=True, key="map_snap_enabled")
+    snap_step = st.selectbox("Шаг сетки, м", [0.1, 0.2, 0.5, 1.0], key="map_snap_step")
     quick = st.columns(7)
     quick[0].button("Выбор", key="map_quick_select")
+    if quick[1].button("Снять выделение", key="map_quick_clear_selection"):
+        st.session_state["map_bulk_rows"] = []
+        st.session_state["map_bulk_cells"] = []
+        st.session_state.pop("map_selected_cell_key", None)
+        st.session_state.pop("map_selected_row_number", None)
+        st.rerun()
     object_type = st.radio("Объект", ["Ячейка", "Ряд"], horizontal=True, key="map_edit_object_type")
+    model = render_bulk_map_actions(model, snap, float(snap_step))
     if quick[5].button("Сохранить", key="map_edit_save"):
         save_geometry_model(model)
         st.success("Текущая модель сохранена.")
@@ -1681,6 +1801,9 @@ def render_geometry_map_view(model: dict) -> None:
     label_settings["edit_mode"] = bool(st.session_state.get("map_edit_mode", False))
     label_settings["selected_cell_key"] = st.session_state.get("map_selected_cell_key", "")
     label_settings["selected_row_number"] = st.session_state.get("map_selected_row_number", "")
+    label_settings["edit_tool"] = st.session_state.get("map_edit_tool", "Выбор")
+    label_settings["snap_enabled"] = bool(st.session_state.get("map_snap_enabled", True))
+    label_settings["snap_step"] = float(st.session_state.get("map_snap_step", 0.1) or 0.1)
     render_started = perf_counter()
     html = build_geometry_html_cached(json.dumps(model, ensure_ascii=False), scale, detailed, json.dumps(label_settings, ensure_ascii=False, sort_keys=True))
     components.html(html, height=980, scrolling=True)
