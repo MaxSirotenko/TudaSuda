@@ -1007,6 +1007,18 @@ def render_excel_geometry_warehouse() -> None:
         else:
             st.caption("Сохранённой геометрии пока нет.")
 
+    constructor_tab, map_tab = st.tabs(["Конструктор склада", "Карта склада"])
+    with constructor_tab:
+        render_geometry_constructor_tab(saved_model)
+    with map_tab:
+        model = st.session_state.get("geometry_model")
+        if model:
+            render_geometry_map_view(model)
+        else:
+            st.info("Сначала загрузите Excel или используйте сохранённую геометрию на вкладке «Конструктор склада».")
+
+
+def render_geometry_constructor_tab(saved_model: dict | None) -> None:
     uploaded = st.file_uploader("Excel со списком фактических ячеек", type=["xlsx"], key="geometry_cells_file")
     if uploaded is None:
         if saved_model:
@@ -1015,7 +1027,7 @@ def render_excel_geometry_warehouse() -> None:
             st.info("Загрузите Excel со списком ячеек в формате: Код | Ряд | Ячейка | Ярус.")
         model = st.session_state.get("geometry_model")
         if model:
-            render_geometry_model_view(model)
+            render_geometry_constructor_view(model)
         return
 
     file_bytes = uploaded.getvalue()
@@ -1181,7 +1193,7 @@ def render_excel_geometry_warehouse() -> None:
 
     model = st.session_state.get("geometry_model")
     if model:
-        render_geometry_model_view(model)
+        render_geometry_constructor_view(model)
 
 
 
@@ -1316,7 +1328,33 @@ def render_active_model_aisle_editor(model: dict) -> dict:
     return model
 
 
-def render_geometry_model_view(model: dict) -> None:
+def _model_summary_metrics(model: dict) -> None:
+    deep_lane_rows = [row for row in model.get("rows", []) if row.get("row_storage_type") == "deep_lane"]
+    total_capacity = sum(float(cell.get("capacity_pallets", 1) or 1) for cell in model.get("cells", []))
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Рядов", len(model.get("rows", [])))
+    c2.metric("Логических ячеек", len(model.get("cells", [])))
+    c3.metric("Набивных рядов", len(deep_lane_rows))
+    c4.metric("Вместимость, паллет", f"{total_capacity:g}")
+
+
+def render_geometry_data_tabs(model: dict) -> None:
+    tabs = st.tabs(["Ряды", "Ячейки", "Проезды", "Навигация", "JSON"])
+    with tabs[0]:
+        st.dataframe(_localized_dataframe(model.get("rows", [])), use_container_width=True)
+    with tabs[1]:
+        st.dataframe(_localized_dataframe(model.get("cells", [])).head(10000), use_container_width=True)
+    with tabs[2]:
+        st.dataframe(_localized_dataframe(model.get("aisles", [])), use_container_width=True)
+        st.dataframe(_localized_dataframe(model.get("roads", [])), use_container_width=True)
+    with tabs[3]:
+        st.dataframe(_localized_dataframe(model.get("navigation_nodes", [])), use_container_width=True)
+        st.dataframe(_localized_dataframe(model.get("navigation_edges", [])), use_container_width=True)
+    with tabs[4]:
+        st.download_button("Скачать модель JSON", json.dumps(model, ensure_ascii=False, indent=2).encode("utf-8"), file_name="warehouse_model.json", mime="application/json")
+
+
+def render_geometry_constructor_view(model: dict) -> None:
     st.subheader("Активная модель")
     overrides = load_manual_overrides()
     if overrides and overrides.get("source_model_id") != model.get("model_id"):
@@ -1324,11 +1362,10 @@ def render_geometry_model_view(model: dict) -> None:
     counts = manual_change_counts(overrides)
     st.caption(f"Последний склад загружен из Excel: {model.get('source_file_name', '—')} · Дата построения: {model.get('created_at', '—')}")
     st.caption(f"Ручных изменений: {counts['total']} · Добавлено вручную: {counts['add']} · Изменено вручную: {counts['update']} · Удалено вручную: {counts['delete']}")
+    _model_summary_metrics(model)
     st.subheader("Диагностика импорта")
     settings = model.get("settings", {})
     stats = [
-        ("Рядов", len(model.get("rows", []))),
-        ("Ячеек", len(model.get("cells", []))),
         ("Проездов между рядами", len(model.get("aisles", []))),
         ("Верхний проезд", f"{settings.get('top_road_width_m', 0)} м"),
         ("Нижний проезд", f"{settings.get('bottom_road_width_m', 0)} м"),
@@ -1345,27 +1382,22 @@ def render_geometry_model_view(model: dict) -> None:
     model = st.session_state.get("geometry_model", model)
     model = render_inventory_placement(model)
     render_receipts_section(model)
+    render_geometry_data_tabs(model)
+
+
+def render_geometry_map_view(model: dict) -> None:
     st.subheader("Карта склада")
-    detailed = st.toggle("Детальный режим", value=len(model.get("cells", [])) <= 1500)
-    scale = st.slider("Масштаб, px/м", min_value=4.0, max_value=40.0, value=18.0, step=1.0)
+    _model_summary_metrics(model)
+    control_left, control_right = st.columns([1, 2])
+    with control_left:
+        detailed = st.toggle("Детальный режим", value=len(model.get("cells", [])) <= 1500, key="map_detailed_mode")
+    with control_right:
+        scale = st.slider("Масштаб, px/м", min_value=4.0, max_value=60.0, value=22.0, step=1.0, key="map_scale")
     label_settings = render_map_settings_editor()
     render_started = perf_counter()
     html = build_geometry_html_cached(json.dumps(model, ensure_ascii=False), scale, detailed, json.dumps(label_settings, ensure_ascii=False, sort_keys=True))
-    components.html(html, height=760, scrolling=True)
+    components.html(html, height=980, scrolling=True)
     st.caption(f"Рендер карты: {perf_counter() - render_started:.2f} сек. Модель: data/last_import/warehouse_model.json")
-    tabs = st.tabs(["Ряды", "Ячейки", "Проезды", "Навигация", "JSON"])
-    with tabs[0]:
-        st.dataframe(_localized_dataframe(model.get("rows", [])), use_container_width=True)
-    with tabs[1]:
-        st.dataframe(_localized_dataframe(model.get("cells", [])).head(10000), use_container_width=True)
-    with tabs[2]:
-        st.dataframe(_localized_dataframe(model.get("aisles", [])), use_container_width=True)
-        st.dataframe(_localized_dataframe(model.get("roads", [])), use_container_width=True)
-    with tabs[3]:
-        st.dataframe(_localized_dataframe(model.get("navigation_nodes", [])), use_container_width=True)
-        st.dataframe(_localized_dataframe(model.get("navigation_edges", [])), use_container_width=True)
-    with tabs[4]:
-        st.download_button("Скачать модель JSON", json.dumps(model, ensure_ascii=False, indent=2).encode("utf-8"), file_name="warehouse_model.json", mime="application/json")
 
 
 def render_virtual_warehouse_excel() -> None:
