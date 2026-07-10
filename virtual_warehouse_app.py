@@ -47,6 +47,8 @@ from warehouse_geometry_model import (
 from warehouse_inventory_placement import (
     attach_placements_to_model,
     auto_place_unplaced,
+    calculate_basic_weight_placement,
+    clear_calculated_placements,
     clear_placement_state,
     delete_placement,
     detect_inventory_columns,
@@ -275,8 +277,17 @@ def load_render_settings() -> dict:
 
 
 def save_render_settings(settings: dict) -> None:
-    payload = {key: settings.get(key, value) for key, value in DEFAULT_RENDER_LABEL_SETTINGS.items()}
-    payload["colors"] = {key: settings.get("colors", {}).get(key, value) for key, value in DEFAULT_RENDER_COLOR_SETTINGS.items()}
+    payload = {}
+    if RENDER_SETTINGS_PATH.exists():
+        try:
+            payload = json.loads(RENDER_SETTINGS_PATH.read_text(encoding="utf-8-sig"))
+        except json.JSONDecodeError:
+            payload = {}
+    payload.update({key: settings.get(key, value) for key, value in DEFAULT_RENDER_LABEL_SETTINGS.items()})
+    existing_colors = payload.get("colors", {}) if isinstance(payload.get("colors"), dict) else {}
+    colors = dict(existing_colors)
+    colors.update({key: settings.get("colors", {}).get(key, value) for key, value in DEFAULT_RENDER_COLOR_SETTINGS.items()})
+    payload["colors"] = colors
     write_json_atomic(RENDER_SETTINGS_PATH, payload)
 
 
@@ -321,22 +332,7 @@ def render_color_settings_editor(settings: dict) -> dict:
             save_render_settings(settings)
             st.success("Цвета карты сохранены.")
         if b2.button("Сбросить цвета по умолчанию", key="reset_render_colors"):
-            reset_widget_keys = {
-                "color_cell": "cell_color",
-                "color_deep_lane": "deep_lane_cell_color",
-                "color_aisle": "aisle_color",
-                "color_top_road": "top_road_color",
-                "color_bottom_road": "bottom_road_color",
-                "color_exit": "exit_color",
-                "color_selected": "selected_cell_color",
-                "color_hover": "hover_cell_color",
-                "color_occupied": "occupied_cell_color",
-                "color_deep_partial": "deep_lane_partial_color",
-                "color_deep_full": "deep_lane_full_color",
-            }
             colors = dict(DEFAULT_RENDER_COLOR_SETTINGS)
-            for widget_key, color_key in reset_widget_keys.items():
-                st.session_state[widget_key] = colors[color_key]
             settings["colors"] = colors
             save_render_settings(settings)
             st.success("Цвета сброшены по умолчанию.")
@@ -739,7 +735,9 @@ def render_inventory_placement(model: dict) -> dict:
                 "cell_number": c7.selectbox("Ячейка", columns, index=columns.index(detected["cell_number"]) if detected["cell_number"] in columns else 0, key="inv_map_cell"),
                 "tier": c8.selectbox("Ярус", columns, index=columns.index(detected["tier"]) if detected["tier"] in columns else 0, key="inv_map_tier"),
             }
-            for key in ["expiry_date", "batch", "characteristic", "weight", "volume"]:
+            c9 = st.columns(1)[0]
+            mapping["weight_class"] = c9.selectbox("Весовая категория", columns, index=columns.index(detected["weight_class"]) if detected.get("weight_class") in columns else 0, key="inv_map_weight_class")
+            for key in ["expiry_date", "batch", "characteristic", "characteristic_code", "characteristic_name", "weight", "volume"]:
                 mapping[key] = detected.get(key)
             normalized_inventory, inv_diagnostics = normalize_inventory_table_cached(inv_df.to_json(orient="split", force_ascii=False), json.dumps(mapping, ensure_ascii=False))
             if inv_diagnostics:
@@ -772,6 +770,18 @@ def render_inventory_placement(model: dict) -> dict:
             st.dataframe(pd.DataFrame(unplaced), use_container_width=True)
         else:
             st.info("Товаров без привязки к ячейкам сейчас нет.")
+        st.info("Размещение выполняется последовательно по маршруту внутри весовых зон. Алгоритм пока не учитывает ABC, прогноз, соседство и другие правила оптимизации.")
+        if st.button("Рассчитать базовое размещение", key="basic_weight_place_inventory"):
+            receipts_state, receipts_warning = load_receipts_state(model)
+            if receipts_warning:
+                st.warning(receipts_warning)
+            state, basic_diag = calculate_basic_weight_placement(model, state, receipts_state)
+            st.session_state["placement_state"] = state
+            st.success("Базовое размещение по весовым зонам выполнено.")
+            st.dataframe(pd.DataFrame([{"Показатель": key, "Значение": value} for key, value in basic_diag.items() if key != "Неразмещённые позиции"]), use_container_width=True)
+            if basic_diag.get("Неразмещённые позиции"):
+                st.dataframe(pd.DataFrame(basic_diag["Неразмещённые позиции"]), use_container_width=True)
+            st.rerun()
         if st.button("Разложить автоматически по складу", disabled=not unplaced, key="auto_place_inventory"):
             state, auto_diag = auto_place_unplaced(model, state, allow_mixed_sku_in_deep_lane=allow_mixed)
             st.session_state["placement_state"] = state
@@ -855,10 +865,10 @@ def render_inventory_placement(model: dict) -> dict:
             state["journal"] = []
             save_placement_state(state)
             st.rerun()
-        if st.button("Очистить размещение", key="placement_clear_all"):
-            clear_placement_state()
-            st.session_state.pop("placement_state", None)
-            st.success("Размещение очищено.")
+        if st.button("Сбросить рассчитанное размещение", key="placement_clear_all"):
+            state = clear_calculated_placements(state)
+            st.session_state["placement_state"] = state
+            st.success("Рассчитанное размещение очищено. Фактические остатки, приходы и настройки зон сохранены.")
             st.rerun()
 
     return attach_placements_to_model(model, state)
@@ -930,6 +940,7 @@ def render_receipts_section(model: dict) -> None:
             c1, c2, c3, c4, c5 = st.columns(5)
             c6, c7, c8, c9, c10 = st.columns(5)
             c11, c12, c13, c14, c15 = st.columns(5)
+            c16 = st.columns(1)[0]
             mapping = {
                 "sku_code": c1.selectbox("Код товара", columns, index=columns.index(detected["sku_code"]) if detected["sku_code"] in columns else 0, key="receipt_map_sku"),
                 "sku_name": c2.selectbox("Наименование", columns, index=columns.index(detected["sku_name"]) if detected["sku_name"] in columns else 0, key="receipt_map_name"),
@@ -946,6 +957,7 @@ def render_receipts_section(model: dict) -> None:
                 "batch": c13.selectbox("Партия", columns, index=columns.index(detected["batch"]) if detected["batch"] in columns else 0, key="receipt_map_batch"),
                 "expiry_date": c14.selectbox("Срок годности", columns, index=columns.index(detected["expiry_date"]) if detected["expiry_date"] in columns else 0, key="receipt_map_expiry"),
                 "comment": c15.selectbox("Комментарий", columns, index=columns.index(detected["comment"]) if detected["comment"] in columns else 0, key="receipt_map_comment"),
+                "weight_class": c16.selectbox("Весовая категория", columns, index=columns.index(detected["weight_class"]) if detected.get("weight_class") in columns else 0, key="receipt_map_weight_class"),
             }
             normalized_receipts, receipt_diagnostics, receipt_messages = normalize_receipt_table_cached(receipt_df.to_json(orient="split", force_ascii=False), json.dumps(mapping, ensure_ascii=False))
             if receipt_messages:
@@ -1013,6 +1025,18 @@ def render_excel_geometry_warehouse() -> None:
         else:
             st.caption("Сохранённой геометрии пока нет.")
 
+    constructor_tab, map_tab = st.tabs(["Конструктор склада", "Карта склада"])
+    with constructor_tab:
+        render_geometry_constructor_tab(saved_model)
+    with map_tab:
+        model = st.session_state.get("geometry_model")
+        if model:
+            render_geometry_map_view(model)
+        else:
+            st.info("Сначала загрузите Excel или используйте сохранённую геометрию на вкладке «Конструктор склада».")
+
+
+def render_geometry_constructor_tab(saved_model: dict | None) -> None:
     uploaded = st.file_uploader("Excel со списком фактических ячеек", type=["xlsx"], key="geometry_cells_file")
     if uploaded is None:
         if saved_model:
@@ -1021,7 +1045,7 @@ def render_excel_geometry_warehouse() -> None:
             st.info("Загрузите Excel со списком ячеек в формате: Код | Ряд | Ячейка | Ярус.")
         model = st.session_state.get("geometry_model")
         if model:
-            render_geometry_model_view(model)
+            render_geometry_constructor_view(model)
         return
 
     file_bytes = uploaded.getvalue()
@@ -1079,6 +1103,9 @@ def render_excel_geometry_warehouse() -> None:
     row_config_display = row_config_source.copy()
     row_config_display["row_storage_type"] = row_config_display["row_storage_type"].map({"normal": "Обычный ряд", "deep_lane": "Набивной ряд"}).fillna(row_config_display["row_storage_type"])
     row_config_display["cell_direction"] = row_config_display["cell_direction"].map({"bottom_to_top": "Снизу вверх", "top_to_bottom": "Сверху вниз"}).fillna(row_config_display["cell_direction"])
+    if "weight_zone" not in row_config_display.columns:
+        row_config_display["weight_zone"] = "unassigned"
+    row_config_display["weight_zone"] = row_config_display["weight_zone"].map({"heavy": "Тяжёлое", "medium": "Среднее", "light": "Лёгкое", "unassigned": "Не назначено"}).fillna("Не назначено")
     row_config = st.data_editor(
         row_config_display,
         num_rows="dynamic",
@@ -1090,6 +1117,7 @@ def render_excel_geometry_warehouse() -> None:
             "row_storage_type": st.column_config.SelectboxColumn("Тип ряда", options=["Обычный ряд", "Набивной ряд"]),
             "deep_lane_width": st.column_config.NumberColumn("Набивных паллетомест", min_value=1, max_value=7, step=1),
             "cell_direction": st.column_config.SelectboxColumn("Направление ячеек", options=["Снизу вверх", "Сверху вниз"]),
+            "weight_zone": st.column_config.SelectboxColumn("Весовая зона", options=["Тяжёлое", "Среднее", "Лёгкое", "Не назначено"]),
             "row_group": "Группа рядов",
             "side": "Сторона/зона",
             "comment": "Комментарий",
@@ -1097,6 +1125,9 @@ def render_excel_geometry_warehouse() -> None:
     )
     row_config["row_storage_type"] = row_config["row_storage_type"].map({"Обычный ряд": "normal", "Набивной ряд": "deep_lane"}).fillna(row_config["row_storage_type"])
     row_config["cell_direction"] = row_config["cell_direction"].map({"Снизу вверх": "bottom_to_top", "Сверху вниз": "top_to_bottom"}).fillna(row_config["cell_direction"])
+    if "weight_zone" not in row_config.columns:
+        row_config["weight_zone"] = "Не назначено"
+    row_config["weight_zone"] = row_config["weight_zone"].map({"Тяжёлое": "heavy", "Среднее": "medium", "Лёгкое": "light", "Не назначено": "unassigned"}).fillna("unassigned")
     st.session_state["geometry_row_config_data"] = row_config
 
     st.subheader("Набивные ряды")
@@ -1187,7 +1218,7 @@ def render_excel_geometry_warehouse() -> None:
 
     model = st.session_state.get("geometry_model")
     if model:
-        render_geometry_model_view(model)
+        render_geometry_constructor_view(model)
 
 
 
@@ -1240,40 +1271,139 @@ def _localized_dataframe(rows: list[dict]) -> pd.DataFrame:
         df["source"] = df["source"].map(_source_label)
     return df.rename(columns=RUSSIAN_COLUMN_LABELS)
 
-def render_geometry_model_view(model: dict) -> None:
-    st.subheader("Активная модель")
-    overrides = load_manual_overrides()
-    if overrides and overrides.get("source_model_id") != model.get("model_id"):
-        overrides = None
-    counts = manual_change_counts(overrides)
-    st.caption(f"Последний склад загружен из Excel: {model.get('source_file_name', '—')} · Дата построения: {model.get('created_at', '—')}")
-    st.caption(f"Ручных изменений: {counts['total']} · Добавлено вручную: {counts['add']} · Изменено вручную: {counts['update']} · Удалено вручную: {counts['delete']}")
-    st.subheader("Диагностика импорта")
+def _model_aisle_config_dataframe(model: dict) -> pd.DataFrame:
+    rows = []
+    for aisle in model.get("aisles", []):
+        rows.append({
+            "row_from": aisle.get("row_from", ""),
+            "row_to": aisle.get("row_to", ""),
+            "aisle_width_m": aisle.get("aisle_width_m", model.get("settings", {}).get("aisle_width_m", 3.4)),
+            "aisle_type": aisle.get("aisle_type", "межрядный проезд"),
+            "comment": aisle.get("comment", ""),
+        })
+    return pd.DataFrame(rows, columns=["row_from", "row_to", "aisle_width_m", "aisle_type", "comment"])
+
+
+
+def render_weight_zone_editor(model: dict) -> dict:
+    st.subheader("Весовые зоны рядов")
+    zone_to_label = {"heavy": "Тяжёлое", "medium": "Среднее", "light": "Лёгкое", "unassigned": "Не назначено"}
+    label_to_zone = {value: key for key, value in zone_to_label.items()}
+    rows_df = pd.DataFrame([
+        {"row_number": row.get("row_number"), "weight_zone": zone_to_label.get(row.get("weight_zone", "unassigned"), "Не назначено")}
+        for row in model.get("rows", [])
+    ])
+    selected_rows = st.multiselect("Ряды для массового назначения", rows_df["row_number"].astype(str).tolist() if not rows_df.empty else [], key="weight_zone_bulk_rows")
+    z1, z2 = st.columns([1, 2])
+    bulk_zone = z1.selectbox("Назначить зону", ["Тяжёлое", "Среднее", "Лёгкое", "Не назначено"], key="weight_zone_bulk_value")
+    if z2.button("Применить зону к выбранным рядам", disabled=not selected_rows, key="weight_zone_bulk_apply"):
+        rows_df.loc[rows_df["row_number"].astype(str).isin(selected_rows), "weight_zone"] = bulk_zone
+    edited = st.data_editor(
+        rows_df,
+        use_container_width=True,
+        hide_index=True,
+        key=f"weight_zone_editor_{model.get('model_id', 'model')}",
+        column_config={
+            "row_number": st.column_config.TextColumn("Номер ряда", disabled=True),
+            "weight_zone": st.column_config.SelectboxColumn("Текущая зона", options=["Тяжёлое", "Среднее", "Лёгкое", "Не назначено"]),
+        },
+    )
+    if st.button("Сохранить весовые зоны рядов", key="weight_zone_save", type="primary"):
+        zone_by_row = {str(row["row_number"]): label_to_zone.get(row["weight_zone"], "unassigned") for _, row in edited.iterrows()}
+        for row in model.get("rows", []):
+            row["weight_zone"] = zone_by_row.get(str(row.get("row_number")), "unassigned")
+        for cell in model.get("cells", []):
+            cell["weight_zone"] = zone_by_row.get(str(cell.get("row_number")), "unassigned")
+        for cell in model.get("base_cells", []):
+            cell["weight_zone"] = zone_by_row.get(str(cell.get("row_number")), "unassigned")
+        for row_setting in model.get("row_settings", []):
+            row_setting["weight_zone"] = zone_by_row.get(str(row_setting.get("row_number")), "unassigned")
+        save_geometry_model(model)
+        st.session_state["geometry_model"] = model
+        st.success("Весовые зоны рядов сохранены вместе с моделью склада.")
+        st.rerun()
+    return model
+
+def render_active_model_aisle_editor(model: dict) -> dict:
+    st.subheader("Настройки проездов между рядами")
+    st.caption("Изменение проездов перестраивает только геометрию активной модели по текущим ячейкам и не очищает ручные изменения, размещение товара или приходы.")
     settings = model.get("settings", {})
-    stats = [
-        ("Рядов", len(model.get("rows", []))),
-        ("Ячеек", len(model.get("cells", []))),
-        ("Проездов между рядами", len(model.get("aisles", []))),
-        ("Верхний проезд", f"{settings.get('top_road_width_m', 0)} м"),
-        ("Нижний проезд", f"{settings.get('bottom_road_width_m', 0)} м"),
-    ]
-    cols = st.columns(len(stats))
-    for col, (label, value) in zip(cols, stats):
-        col.metric(label, value)
-    diagnostics = model.get("diagnostics", [])
-    if diagnostics:
-        st.dataframe(pd.DataFrame(diagnostics), use_container_width=True)
-    render_manual_cell_editor(model)
-    model = render_inventory_placement(model)
-    render_receipts_section(model)
-    st.subheader("Карта склада")
-    detailed = st.toggle("Детальный режим", value=len(model.get("cells", [])) <= 1500)
-    scale = st.slider("Масштаб, px/м", min_value=4.0, max_value=40.0, value=18.0, step=1.0)
-    label_settings = render_map_settings_editor()
-    render_started = perf_counter()
-    html = build_geometry_html_cached(json.dumps(model, ensure_ascii=False), scale, detailed, json.dumps(label_settings, ensure_ascii=False, sort_keys=True))
-    components.html(html, height=760, scrolling=True)
-    st.caption(f"Рендер карты: {perf_counter() - render_started:.2f} сек. Модель: data/last_import/warehouse_model.json")
+    model_key = model.get("model_id", "model")
+    c1, c2, c3 = st.columns(3)
+    default_aisle_width = c1.number_input(
+        "Межрядный проезд по умолчанию, м",
+        min_value=0.1,
+        value=float(settings.get("aisle_width_m", 3.4) or 3.4),
+        step=0.1,
+        key=f"active_aisle_default_width_{model_key}",
+    )
+    top_road_width = c2.number_input(
+        "Верхний проезд, м",
+        min_value=0.1,
+        value=float(settings.get("top_road_width_m", 3.4) or 3.4),
+        step=0.1,
+        key=f"active_top_road_width_{model_key}",
+    )
+    bottom_road_width = c3.number_input(
+        "Нижний проезд, м",
+        min_value=0.1,
+        value=float(settings.get("bottom_road_width_m", 3.4) or 3.4),
+        step=0.1,
+        key=f"active_bottom_road_width_{model_key}",
+    )
+    st.caption("Если пары «ряд от → ряд до» нет в таблице, ряды стоят плотно. Если есть — между ними добавляется проезд.")
+    aisle_config = st.data_editor(
+        _model_aisle_config_dataframe(model),
+        num_rows="dynamic",
+        use_container_width=True,
+        key=f"active_aisle_config_{model_key}",
+        column_config={
+            "row_from": "Ряд от",
+            "row_to": "Ряд до",
+            "aisle_width_m": st.column_config.NumberColumn("Ширина проезда, м", min_value=0.1, step=0.1),
+            "aisle_type": "Тип проезда",
+            "comment": "Комментарий",
+        },
+    )
+    b1, b2 = st.columns(2)
+    if b1.button("Сохранить настройки проездов", key="active_aisle_save", type="primary"):
+        geometry_settings = GeometrySettings(
+            cell_length_m=float(settings.get("cell_length_m", 1.2) or 1.2),
+            cell_width_m=float(settings.get("cell_width_m", 0.8) or 0.8),
+            aisle_width_m=default_aisle_width,
+            top_road_width_m=top_road_width,
+            bottom_road_width_m=bottom_road_width,
+            pallet_height_m=float(settings.get("pallet_height_m", 2.2) or 2.2),
+            selected_tier=str(settings.get("selected_tier", "1") or "1"),
+            tier_mode=str(settings.get("tier_mode", "selected") or "selected"),
+            row_order_mode=str(settings.get("row_order_mode", "row_order_or_number") or "row_order_or_number"),
+        )
+        rebuilt = rebuild_geometry_from_cells(model, model.get("cells", []), keep_base_cells=True, settings=geometry_settings, aisle_config=aisle_config)
+        rebuilt["manual_change_counts"] = model.get("manual_change_counts", rebuilt.get("manual_change_counts", {}))
+        save_geometry_model(rebuilt)
+        st.session_state["geometry_model"] = rebuilt
+        st.success("Настройки проездов сохранены, геометрия активной модели перестроена.")
+        st.rerun()
+    if b2.button("Сбросить таблицу проездов", key="active_aisle_reset"):
+        rebuilt = rebuild_geometry_from_cells(model, model.get("cells", []), keep_base_cells=True, aisle_config=empty_aisle_config())
+        save_geometry_model(rebuilt)
+        st.session_state["geometry_model"] = rebuilt
+        st.success("Межрядные проезды удалены из активной модели.")
+        st.rerun()
+    return model
+
+
+def _model_summary_metrics(model: dict) -> None:
+    deep_lane_rows = [row for row in model.get("rows", []) if row.get("row_storage_type") == "deep_lane"]
+    total_capacity = sum(float(cell.get("capacity_pallets", 1) or 1) for cell in model.get("cells", []))
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Рядов", len(model.get("rows", [])))
+    c2.metric("Логических ячеек", len(model.get("cells", [])))
+    c3.metric("Набивных рядов", len(deep_lane_rows))
+    c4.metric("Вместимость, паллет", f"{total_capacity:g}")
+
+
+def render_geometry_data_tabs(model: dict) -> None:
     tabs = st.tabs(["Ряды", "Ячейки", "Проезды", "Навигация", "JSON"])
     with tabs[0]:
         st.dataframe(_localized_dataframe(model.get("rows", [])), use_container_width=True)
@@ -1287,6 +1417,54 @@ def render_geometry_model_view(model: dict) -> None:
         st.dataframe(_localized_dataframe(model.get("navigation_edges", [])), use_container_width=True)
     with tabs[4]:
         st.download_button("Скачать модель JSON", json.dumps(model, ensure_ascii=False, indent=2).encode("utf-8"), file_name="warehouse_model.json", mime="application/json")
+
+
+def render_geometry_constructor_view(model: dict) -> None:
+    st.subheader("Активная модель")
+    overrides = load_manual_overrides()
+    if overrides and overrides.get("source_model_id") != model.get("model_id"):
+        overrides = None
+    counts = manual_change_counts(overrides)
+    st.caption(f"Последний склад загружен из Excel: {model.get('source_file_name', '—')} · Дата построения: {model.get('created_at', '—')}")
+    st.caption(f"Ручных изменений: {counts['total']} · Добавлено вручную: {counts['add']} · Изменено вручную: {counts['update']} · Удалено вручную: {counts['delete']}")
+    _model_summary_metrics(model)
+    st.subheader("Диагностика импорта")
+    settings = model.get("settings", {})
+    stats = [
+        ("Проездов между рядами", len(model.get("aisles", []))),
+        ("Верхний проезд", f"{settings.get('top_road_width_m', 0)} м"),
+        ("Нижний проезд", f"{settings.get('bottom_road_width_m', 0)} м"),
+    ]
+    cols = st.columns(len(stats))
+    for col, (label, value) in zip(cols, stats):
+        col.metric(label, value)
+    diagnostics = model.get("diagnostics", [])
+    if diagnostics:
+        st.dataframe(pd.DataFrame(diagnostics), use_container_width=True)
+    render_manual_cell_editor(model)
+    model = st.session_state.get("geometry_model", model)
+    model = render_weight_zone_editor(model)
+    model = st.session_state.get("geometry_model", model)
+    render_active_model_aisle_editor(model)
+    model = st.session_state.get("geometry_model", model)
+    model = render_inventory_placement(model)
+    render_receipts_section(model)
+    render_geometry_data_tabs(model)
+
+
+def render_geometry_map_view(model: dict) -> None:
+    st.subheader("Карта склада")
+    _model_summary_metrics(model)
+    control_left, control_right = st.columns([1, 2])
+    with control_left:
+        detailed = st.toggle("Детальный режим", value=len(model.get("cells", [])) <= 1500, key="map_detailed_mode")
+    with control_right:
+        scale = st.slider("Масштаб, px/м", min_value=4.0, max_value=60.0, value=22.0, step=1.0, key="map_scale")
+    label_settings = render_map_settings_editor()
+    render_started = perf_counter()
+    html = build_geometry_html_cached(json.dumps(model, ensure_ascii=False), scale, detailed, json.dumps(label_settings, ensure_ascii=False, sort_keys=True))
+    components.html(html, height=980, scrolling=True)
+    st.caption(f"Рендер карты: {perf_counter() - render_started:.2f} сек. Модель: data/last_import/warehouse_model.json")
 
 
 def render_virtual_warehouse_excel() -> None:
