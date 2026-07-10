@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import shutil
@@ -47,6 +48,8 @@ from warehouse_geometry_model import (
 from warehouse_inventory_placement import (
     attach_placements_to_model,
     auto_place_unplaced,
+    calculate_basic_weight_placement,
+    clear_calculated_placements,
     clear_placement_state,
     delete_placement,
     detect_inventory_columns,
@@ -275,8 +278,17 @@ def load_render_settings() -> dict:
 
 
 def save_render_settings(settings: dict) -> None:
-    payload = {key: settings.get(key, value) for key, value in DEFAULT_RENDER_LABEL_SETTINGS.items()}
-    payload["colors"] = {key: settings.get("colors", {}).get(key, value) for key, value in DEFAULT_RENDER_COLOR_SETTINGS.items()}
+    payload = {}
+    if RENDER_SETTINGS_PATH.exists():
+        try:
+            payload = json.loads(RENDER_SETTINGS_PATH.read_text(encoding="utf-8-sig"))
+        except json.JSONDecodeError:
+            payload = {}
+    payload.update({key: settings.get(key, value) for key, value in DEFAULT_RENDER_LABEL_SETTINGS.items()})
+    existing_colors = payload.get("colors", {}) if isinstance(payload.get("colors"), dict) else {}
+    colors = dict(existing_colors)
+    colors.update({key: settings.get("colors", {}).get(key, value) for key, value in DEFAULT_RENDER_COLOR_SETTINGS.items()})
+    payload["colors"] = colors
     write_json_atomic(RENDER_SETTINGS_PATH, payload)
 
 
@@ -321,22 +333,7 @@ def render_color_settings_editor(settings: dict) -> dict:
             save_render_settings(settings)
             st.success("Цвета карты сохранены.")
         if b2.button("Сбросить цвета по умолчанию", key="reset_render_colors"):
-            reset_widget_keys = {
-                "color_cell": "cell_color",
-                "color_deep_lane": "deep_lane_cell_color",
-                "color_aisle": "aisle_color",
-                "color_top_road": "top_road_color",
-                "color_bottom_road": "bottom_road_color",
-                "color_exit": "exit_color",
-                "color_selected": "selected_cell_color",
-                "color_hover": "hover_cell_color",
-                "color_occupied": "occupied_cell_color",
-                "color_deep_partial": "deep_lane_partial_color",
-                "color_deep_full": "deep_lane_full_color",
-            }
             colors = dict(DEFAULT_RENDER_COLOR_SETTINGS)
-            for widget_key, color_key in reset_widget_keys.items():
-                st.session_state[widget_key] = colors[color_key]
             settings["colors"] = colors
             save_render_settings(settings)
             st.success("Цвета сброшены по умолчанию.")
@@ -739,7 +736,9 @@ def render_inventory_placement(model: dict) -> dict:
                 "cell_number": c7.selectbox("Ячейка", columns, index=columns.index(detected["cell_number"]) if detected["cell_number"] in columns else 0, key="inv_map_cell"),
                 "tier": c8.selectbox("Ярус", columns, index=columns.index(detected["tier"]) if detected["tier"] in columns else 0, key="inv_map_tier"),
             }
-            for key in ["expiry_date", "batch", "characteristic", "weight", "volume"]:
+            c9 = st.columns(1)[0]
+            mapping["weight_class"] = c9.selectbox("Весовая категория", columns, index=columns.index(detected["weight_class"]) if detected.get("weight_class") in columns else 0, key="inv_map_weight_class")
+            for key in ["expiry_date", "batch", "characteristic", "characteristic_code", "characteristic_name", "weight", "volume"]:
                 mapping[key] = detected.get(key)
             normalized_inventory, inv_diagnostics = normalize_inventory_table_cached(inv_df.to_json(orient="split", force_ascii=False), json.dumps(mapping, ensure_ascii=False))
             if inv_diagnostics:
@@ -772,6 +771,18 @@ def render_inventory_placement(model: dict) -> dict:
             st.dataframe(pd.DataFrame(unplaced), use_container_width=True)
         else:
             st.info("Товаров без привязки к ячейкам сейчас нет.")
+        st.info("Размещение выполняется последовательно по маршруту внутри весовых зон. Алгоритм пока не учитывает ABC, прогноз, соседство и другие правила оптимизации.")
+        if st.button("Рассчитать базовое размещение", key="basic_weight_place_inventory"):
+            receipts_state, receipts_warning = load_receipts_state(model)
+            if receipts_warning:
+                st.warning(receipts_warning)
+            state, basic_diag = calculate_basic_weight_placement(model, state, receipts_state)
+            st.session_state["placement_state"] = state
+            st.success("Базовое размещение по весовым зонам выполнено.")
+            st.dataframe(pd.DataFrame([{"Показатель": key, "Значение": value} for key, value in basic_diag.items() if key != "Неразмещённые позиции"]), use_container_width=True)
+            if basic_diag.get("Неразмещённые позиции"):
+                st.dataframe(pd.DataFrame(basic_diag["Неразмещённые позиции"]), use_container_width=True)
+            st.rerun()
         if st.button("Разложить автоматически по складу", disabled=not unplaced, key="auto_place_inventory"):
             state, auto_diag = auto_place_unplaced(model, state, allow_mixed_sku_in_deep_lane=allow_mixed)
             st.session_state["placement_state"] = state
@@ -855,10 +866,10 @@ def render_inventory_placement(model: dict) -> dict:
             state["journal"] = []
             save_placement_state(state)
             st.rerun()
-        if st.button("Очистить размещение", key="placement_clear_all"):
-            clear_placement_state()
-            st.session_state.pop("placement_state", None)
-            st.success("Размещение очищено.")
+        if st.button("Сбросить рассчитанное размещение", key="placement_clear_all"):
+            state = clear_calculated_placements(state)
+            st.session_state["placement_state"] = state
+            st.success("Рассчитанное размещение очищено. Фактические остатки, приходы и настройки зон сохранены.")
             st.rerun()
 
     return attach_placements_to_model(model, state)
@@ -930,6 +941,7 @@ def render_receipts_section(model: dict) -> None:
             c1, c2, c3, c4, c5 = st.columns(5)
             c6, c7, c8, c9, c10 = st.columns(5)
             c11, c12, c13, c14, c15 = st.columns(5)
+            c16 = st.columns(1)[0]
             mapping = {
                 "sku_code": c1.selectbox("Код товара", columns, index=columns.index(detected["sku_code"]) if detected["sku_code"] in columns else 0, key="receipt_map_sku"),
                 "sku_name": c2.selectbox("Наименование", columns, index=columns.index(detected["sku_name"]) if detected["sku_name"] in columns else 0, key="receipt_map_name"),
@@ -946,6 +958,7 @@ def render_receipts_section(model: dict) -> None:
                 "batch": c13.selectbox("Партия", columns, index=columns.index(detected["batch"]) if detected["batch"] in columns else 0, key="receipt_map_batch"),
                 "expiry_date": c14.selectbox("Срок годности", columns, index=columns.index(detected["expiry_date"]) if detected["expiry_date"] in columns else 0, key="receipt_map_expiry"),
                 "comment": c15.selectbox("Комментарий", columns, index=columns.index(detected["comment"]) if detected["comment"] in columns else 0, key="receipt_map_comment"),
+                "weight_class": c16.selectbox("Весовая категория", columns, index=columns.index(detected["weight_class"]) if detected.get("weight_class") in columns else 0, key="receipt_map_weight_class"),
             }
             normalized_receipts, receipt_diagnostics, receipt_messages = normalize_receipt_table_cached(receipt_df.to_json(orient="split", force_ascii=False), json.dumps(mapping, ensure_ascii=False))
             if receipt_messages:
@@ -1013,6 +1026,18 @@ def render_excel_geometry_warehouse() -> None:
         else:
             st.caption("Сохранённой геометрии пока нет.")
 
+    constructor_tab, map_tab = st.tabs(["Конструктор склада", "Карта склада"])
+    with constructor_tab:
+        render_geometry_constructor_tab(saved_model)
+    with map_tab:
+        model = st.session_state.get("geometry_model")
+        if model:
+            render_geometry_map_view(model)
+        else:
+            st.info("Сначала загрузите Excel или используйте сохранённую геометрию на вкладке «Конструктор склада».")
+
+
+def render_geometry_constructor_tab(saved_model: dict | None) -> None:
     uploaded = st.file_uploader("Excel со списком фактических ячеек", type=["xlsx"], key="geometry_cells_file")
     if uploaded is None:
         if saved_model:
@@ -1021,7 +1046,7 @@ def render_excel_geometry_warehouse() -> None:
             st.info("Загрузите Excel со списком ячеек в формате: Код | Ряд | Ячейка | Ярус.")
         model = st.session_state.get("geometry_model")
         if model:
-            render_geometry_model_view(model)
+            render_geometry_constructor_view(model)
         return
 
     file_bytes = uploaded.getvalue()
@@ -1079,6 +1104,9 @@ def render_excel_geometry_warehouse() -> None:
     row_config_display = row_config_source.copy()
     row_config_display["row_storage_type"] = row_config_display["row_storage_type"].map({"normal": "Обычный ряд", "deep_lane": "Набивной ряд"}).fillna(row_config_display["row_storage_type"])
     row_config_display["cell_direction"] = row_config_display["cell_direction"].map({"bottom_to_top": "Снизу вверх", "top_to_bottom": "Сверху вниз"}).fillna(row_config_display["cell_direction"])
+    if "weight_zone" not in row_config_display.columns:
+        row_config_display["weight_zone"] = "unassigned"
+    row_config_display["weight_zone"] = row_config_display["weight_zone"].map({"heavy": "Тяжёлое", "medium": "Среднее", "light": "Лёгкое", "unassigned": "Не назначено"}).fillna("Не назначено")
     row_config = st.data_editor(
         row_config_display,
         num_rows="dynamic",
@@ -1090,6 +1118,7 @@ def render_excel_geometry_warehouse() -> None:
             "row_storage_type": st.column_config.SelectboxColumn("Тип ряда", options=["Обычный ряд", "Набивной ряд"]),
             "deep_lane_width": st.column_config.NumberColumn("Набивных паллетомест", min_value=1, max_value=7, step=1),
             "cell_direction": st.column_config.SelectboxColumn("Направление ячеек", options=["Снизу вверх", "Сверху вниз"]),
+            "weight_zone": st.column_config.SelectboxColumn("Весовая зона", options=["Тяжёлое", "Среднее", "Лёгкое", "Не назначено"]),
             "row_group": "Группа рядов",
             "side": "Сторона/зона",
             "comment": "Комментарий",
@@ -1097,6 +1126,9 @@ def render_excel_geometry_warehouse() -> None:
     )
     row_config["row_storage_type"] = row_config["row_storage_type"].map({"Обычный ряд": "normal", "Набивной ряд": "deep_lane"}).fillna(row_config["row_storage_type"])
     row_config["cell_direction"] = row_config["cell_direction"].map({"Снизу вверх": "bottom_to_top", "Сверху вниз": "top_to_bottom"}).fillna(row_config["cell_direction"])
+    if "weight_zone" not in row_config.columns:
+        row_config["weight_zone"] = "Не назначено"
+    row_config["weight_zone"] = row_config["weight_zone"].map({"Тяжёлое": "heavy", "Среднее": "medium", "Лёгкое": "light", "Не назначено": "unassigned"}).fillna("unassigned")
     st.session_state["geometry_row_config_data"] = row_config
 
     st.subheader("Набивные ряды")
@@ -1187,7 +1219,7 @@ def render_excel_geometry_warehouse() -> None:
 
     model = st.session_state.get("geometry_model")
     if model:
-        render_geometry_model_view(model)
+        render_geometry_constructor_view(model)
 
 
 
@@ -1240,40 +1272,139 @@ def _localized_dataframe(rows: list[dict]) -> pd.DataFrame:
         df["source"] = df["source"].map(_source_label)
     return df.rename(columns=RUSSIAN_COLUMN_LABELS)
 
-def render_geometry_model_view(model: dict) -> None:
-    st.subheader("Активная модель")
-    overrides = load_manual_overrides()
-    if overrides and overrides.get("source_model_id") != model.get("model_id"):
-        overrides = None
-    counts = manual_change_counts(overrides)
-    st.caption(f"Последний склад загружен из Excel: {model.get('source_file_name', '—')} · Дата построения: {model.get('created_at', '—')}")
-    st.caption(f"Ручных изменений: {counts['total']} · Добавлено вручную: {counts['add']} · Изменено вручную: {counts['update']} · Удалено вручную: {counts['delete']}")
-    st.subheader("Диагностика импорта")
+def _model_aisle_config_dataframe(model: dict) -> pd.DataFrame:
+    rows = []
+    for aisle in model.get("aisles", []):
+        rows.append({
+            "row_from": aisle.get("row_from", ""),
+            "row_to": aisle.get("row_to", ""),
+            "aisle_width_m": aisle.get("aisle_width_m", model.get("settings", {}).get("aisle_width_m", 3.4)),
+            "aisle_type": aisle.get("aisle_type", "межрядный проезд"),
+            "comment": aisle.get("comment", ""),
+        })
+    return pd.DataFrame(rows, columns=["row_from", "row_to", "aisle_width_m", "aisle_type", "comment"])
+
+
+
+def render_weight_zone_editor(model: dict) -> dict:
+    st.subheader("Весовые зоны рядов")
+    zone_to_label = {"heavy": "Тяжёлое", "medium": "Среднее", "light": "Лёгкое", "unassigned": "Не назначено"}
+    label_to_zone = {value: key for key, value in zone_to_label.items()}
+    rows_df = pd.DataFrame([
+        {"row_number": row.get("row_number"), "weight_zone": zone_to_label.get(row.get("weight_zone", "unassigned"), "Не назначено")}
+        for row in model.get("rows", [])
+    ])
+    selected_rows = st.multiselect("Ряды для массового назначения", rows_df["row_number"].astype(str).tolist() if not rows_df.empty else [], key="weight_zone_bulk_rows")
+    z1, z2 = st.columns([1, 2])
+    bulk_zone = z1.selectbox("Назначить зону", ["Тяжёлое", "Среднее", "Лёгкое", "Не назначено"], key="weight_zone_bulk_value")
+    if z2.button("Применить зону к выбранным рядам", disabled=not selected_rows, key="weight_zone_bulk_apply"):
+        rows_df.loc[rows_df["row_number"].astype(str).isin(selected_rows), "weight_zone"] = bulk_zone
+    edited = st.data_editor(
+        rows_df,
+        use_container_width=True,
+        hide_index=True,
+        key=f"weight_zone_editor_{model.get('model_id', 'model')}",
+        column_config={
+            "row_number": st.column_config.TextColumn("Номер ряда", disabled=True),
+            "weight_zone": st.column_config.SelectboxColumn("Текущая зона", options=["Тяжёлое", "Среднее", "Лёгкое", "Не назначено"]),
+        },
+    )
+    if st.button("Сохранить весовые зоны рядов", key="weight_zone_save", type="primary"):
+        zone_by_row = {str(row["row_number"]): label_to_zone.get(row["weight_zone"], "unassigned") for _, row in edited.iterrows()}
+        for row in model.get("rows", []):
+            row["weight_zone"] = zone_by_row.get(str(row.get("row_number")), "unassigned")
+        for cell in model.get("cells", []):
+            cell["weight_zone"] = zone_by_row.get(str(cell.get("row_number")), "unassigned")
+        for cell in model.get("base_cells", []):
+            cell["weight_zone"] = zone_by_row.get(str(cell.get("row_number")), "unassigned")
+        for row_setting in model.get("row_settings", []):
+            row_setting["weight_zone"] = zone_by_row.get(str(row_setting.get("row_number")), "unassigned")
+        save_geometry_model(model)
+        st.session_state["geometry_model"] = model
+        st.success("Весовые зоны рядов сохранены вместе с моделью склада.")
+        st.rerun()
+    return model
+
+def render_active_model_aisle_editor(model: dict) -> dict:
+    st.subheader("Настройки проездов между рядами")
+    st.caption("Изменение проездов перестраивает только геометрию активной модели по текущим ячейкам и не очищает ручные изменения, размещение товара или приходы.")
     settings = model.get("settings", {})
-    stats = [
-        ("Рядов", len(model.get("rows", []))),
-        ("Ячеек", len(model.get("cells", []))),
-        ("Проездов между рядами", len(model.get("aisles", []))),
-        ("Верхний проезд", f"{settings.get('top_road_width_m', 0)} м"),
-        ("Нижний проезд", f"{settings.get('bottom_road_width_m', 0)} м"),
-    ]
-    cols = st.columns(len(stats))
-    for col, (label, value) in zip(cols, stats):
-        col.metric(label, value)
-    diagnostics = model.get("diagnostics", [])
-    if diagnostics:
-        st.dataframe(pd.DataFrame(diagnostics), use_container_width=True)
-    render_manual_cell_editor(model)
-    model = render_inventory_placement(model)
-    render_receipts_section(model)
-    st.subheader("Карта склада")
-    detailed = st.toggle("Детальный режим", value=len(model.get("cells", [])) <= 1500)
-    scale = st.slider("Масштаб, px/м", min_value=4.0, max_value=40.0, value=18.0, step=1.0)
-    label_settings = render_map_settings_editor()
-    render_started = perf_counter()
-    html = build_geometry_html_cached(json.dumps(model, ensure_ascii=False), scale, detailed, json.dumps(label_settings, ensure_ascii=False, sort_keys=True))
-    components.html(html, height=760, scrolling=True)
-    st.caption(f"Рендер карты: {perf_counter() - render_started:.2f} сек. Модель: data/last_import/warehouse_model.json")
+    model_key = model.get("model_id", "model")
+    c1, c2, c3 = st.columns(3)
+    default_aisle_width = c1.number_input(
+        "Межрядный проезд по умолчанию, м",
+        min_value=0.1,
+        value=float(settings.get("aisle_width_m", 3.4) or 3.4),
+        step=0.1,
+        key=f"active_aisle_default_width_{model_key}",
+    )
+    top_road_width = c2.number_input(
+        "Верхний проезд, м",
+        min_value=0.1,
+        value=float(settings.get("top_road_width_m", 3.4) or 3.4),
+        step=0.1,
+        key=f"active_top_road_width_{model_key}",
+    )
+    bottom_road_width = c3.number_input(
+        "Нижний проезд, м",
+        min_value=0.1,
+        value=float(settings.get("bottom_road_width_m", 3.4) or 3.4),
+        step=0.1,
+        key=f"active_bottom_road_width_{model_key}",
+    )
+    st.caption("Если пары «ряд от → ряд до» нет в таблице, ряды стоят плотно. Если есть — между ними добавляется проезд.")
+    aisle_config = st.data_editor(
+        _model_aisle_config_dataframe(model),
+        num_rows="dynamic",
+        use_container_width=True,
+        key=f"active_aisle_config_{model_key}",
+        column_config={
+            "row_from": "Ряд от",
+            "row_to": "Ряд до",
+            "aisle_width_m": st.column_config.NumberColumn("Ширина проезда, м", min_value=0.1, step=0.1),
+            "aisle_type": "Тип проезда",
+            "comment": "Комментарий",
+        },
+    )
+    b1, b2 = st.columns(2)
+    if b1.button("Сохранить настройки проездов", key="active_aisle_save", type="primary"):
+        geometry_settings = GeometrySettings(
+            cell_length_m=float(settings.get("cell_length_m", 1.2) or 1.2),
+            cell_width_m=float(settings.get("cell_width_m", 0.8) or 0.8),
+            aisle_width_m=default_aisle_width,
+            top_road_width_m=top_road_width,
+            bottom_road_width_m=bottom_road_width,
+            pallet_height_m=float(settings.get("pallet_height_m", 2.2) or 2.2),
+            selected_tier=str(settings.get("selected_tier", "1") or "1"),
+            tier_mode=str(settings.get("tier_mode", "selected") or "selected"),
+            row_order_mode=str(settings.get("row_order_mode", "row_order_or_number") or "row_order_or_number"),
+        )
+        rebuilt = rebuild_geometry_from_cells(model, model.get("cells", []), keep_base_cells=True, settings=geometry_settings, aisle_config=aisle_config)
+        rebuilt["manual_change_counts"] = model.get("manual_change_counts", rebuilt.get("manual_change_counts", {}))
+        save_geometry_model(rebuilt)
+        st.session_state["geometry_model"] = rebuilt
+        st.success("Настройки проездов сохранены, геометрия активной модели перестроена.")
+        st.rerun()
+    if b2.button("Сбросить таблицу проездов", key="active_aisle_reset"):
+        rebuilt = rebuild_geometry_from_cells(model, model.get("cells", []), keep_base_cells=True, aisle_config=empty_aisle_config())
+        save_geometry_model(rebuilt)
+        st.session_state["geometry_model"] = rebuilt
+        st.success("Межрядные проезды удалены из активной модели.")
+        st.rerun()
+    return model
+
+
+def _model_summary_metrics(model: dict) -> None:
+    deep_lane_rows = [row for row in model.get("rows", []) if row.get("row_storage_type") == "deep_lane"]
+    total_capacity = sum(float(cell.get("capacity_pallets", 1) or 1) for cell in model.get("cells", []))
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Рядов", len(model.get("rows", [])))
+    c2.metric("Логических ячеек", len(model.get("cells", [])))
+    c3.metric("Набивных рядов", len(deep_lane_rows))
+    c4.metric("Вместимость, паллет", f"{total_capacity:g}")
+
+
+def render_geometry_data_tabs(model: dict) -> None:
     tabs = st.tabs(["Ряды", "Ячейки", "Проезды", "Навигация", "JSON"])
     with tabs[0]:
         st.dataframe(_localized_dataframe(model.get("rows", [])), use_container_width=True)
@@ -1287,6 +1418,396 @@ def render_geometry_model_view(model: dict) -> None:
         st.dataframe(_localized_dataframe(model.get("navigation_edges", [])), use_container_width=True)
     with tabs[4]:
         st.download_button("Скачать модель JSON", json.dumps(model, ensure_ascii=False, indent=2).encode("utf-8"), file_name="warehouse_model.json", mime="application/json")
+
+
+def render_geometry_constructor_view(model: dict) -> None:
+    st.subheader("Активная модель")
+    overrides = load_manual_overrides()
+    if overrides and overrides.get("source_model_id") != model.get("model_id"):
+        overrides = None
+    counts = manual_change_counts(overrides)
+    st.caption(f"Последний склад загружен из Excel: {model.get('source_file_name', '—')} · Дата построения: {model.get('created_at', '—')}")
+    st.caption(f"Ручных изменений: {counts['total']} · Добавлено вручную: {counts['add']} · Изменено вручную: {counts['update']} · Удалено вручную: {counts['delete']}")
+    _model_summary_metrics(model)
+    st.subheader("Диагностика импорта")
+    settings = model.get("settings", {})
+    stats = [
+        ("Проездов между рядами", len(model.get("aisles", []))),
+        ("Верхний проезд", f"{settings.get('top_road_width_m', 0)} м"),
+        ("Нижний проезд", f"{settings.get('bottom_road_width_m', 0)} м"),
+    ]
+    cols = st.columns(len(stats))
+    for col, (label, value) in zip(cols, stats):
+        col.metric(label, value)
+    diagnostics = model.get("diagnostics", [])
+    if diagnostics:
+        st.dataframe(pd.DataFrame(diagnostics), use_container_width=True)
+    render_manual_cell_editor(model)
+    model = st.session_state.get("geometry_model", model)
+    model = render_weight_zone_editor(model)
+    model = st.session_state.get("geometry_model", model)
+    render_active_model_aisle_editor(model)
+    model = st.session_state.get("geometry_model", model)
+    model = render_inventory_placement(model)
+    render_receipts_section(model)
+    render_geometry_data_tabs(model)
+
+
+
+
+def _map_cell_key(cell: dict) -> str:
+    return f"{cell.get('row_number')}|{cell.get('cell_number')}|{cell.get('tier') or '1'}"
+
+
+def _occupied_for_cell(model: dict, key: str) -> float:
+    return sum(float(p.get("occupied_capacity_pallets", p.get("qty_pallets", 0)) or 0) for p in model.get("placements", []) if p.get("cell_key") == key)
+
+
+def _save_map_edit_snapshot(model: dict) -> None:
+    st.session_state["map_edit_undo_model"] = copy.deepcopy(model)
+
+
+def _persist_map_edit(model: dict, message: str) -> None:
+    save_geometry_model(model)
+    st.session_state["geometry_model"] = model
+    st.success(message)
+
+
+def _cell_options(model: dict) -> dict[str, str]:
+    return {f"Ряд {c.get('row_number')} · ячейка {c.get('cell_number')} · ярус {c.get('tier') or '1'}": _map_cell_key(c) for c in model.get("cells", [])}
+
+
+def _row_options(model: dict) -> dict[str, str]:
+    return {f"Ряд {r.get('row_number')} · порядок {r.get('row_order')}": str(r.get("row_number")) for r in model.get("rows", [])}
+
+
+def _find_map_cell(model: dict, key: str) -> dict | None:
+    return next((cell for cell in model.get("cells", []) if _map_cell_key(cell) == key), None)
+
+
+def _find_map_row(model: dict, row_number: str) -> dict | None:
+    return next((row for row in model.get("rows", []) if str(row.get("row_number")) == str(row_number)), None)
+
+
+def _cell_duplicate_exists(model: dict, row_number: str, cell_number: str, tier: str, original_key: str = "") -> bool:
+    new_key = f"{row_number}|{cell_number}|{tier or '1'}"
+    return any(_map_cell_key(cell) == new_key and _map_cell_key(cell) != original_key for cell in model.get("cells", []))
+
+
+def _row_has_placements(model: dict, row_number: str) -> bool:
+    row_cells = {_map_cell_key(cell) for cell in model.get("cells", []) if str(cell.get("row_number")) == str(row_number)}
+    return any(p.get("cell_key") in row_cells for p in model.get("placements", []))
+
+
+def _add_cell_near(model: dict, selected: dict, where: str, new_number: str) -> tuple[bool, str]:
+    tier = str(selected.get("tier") or "1")
+    row_number = str(selected.get("row_number"))
+    if _cell_duplicate_exists(model, row_number, new_number, tier):
+        return False, "Ячейка с таким адресом уже существует."
+    _save_map_edit_snapshot(model)
+    row_cells = [cell for cell in model.get("cells", []) if str(cell.get("row_number")) == row_number]
+    selected_idx = sorted(row_cells, key=lambda c: float(c.get("y_min", 0))).index(selected) if selected in row_cells else len(row_cells) - 1
+    insert_idx = selected_idx if where == "before" else selected_idx + 1
+    length = float(selected.get("length_m", 1.2) or 1.2)
+    y_min = insert_idx * length
+    new_cell = dict(selected)
+    new_cell.update({"code": "", "cell_number": str(new_number), "y_min": y_min, "y_max": y_min + length, "y_center": y_min + length / 2, "source": "manual_add"})
+    if selected.get("storage_type") != "deep_lane":
+        new_cell["capacity_pallets"] = 1
+    model["cells"].append(new_cell)
+    for idx, cell in enumerate(sorted([c for c in model["cells"] if str(c.get("row_number")) == row_number], key=lambda c: float(c.get("y_min", 0)))):
+        cell["y_min"] = idx * length
+        cell["y_max"] = cell["y_min"] + length
+        cell["y_center"] = cell["y_min"] + length / 2
+    row = _find_map_row(model, row_number)
+    if row:
+        row["cells_count"] = len([c for c in model["cells"] if str(c.get("row_number")) == row_number])
+        row["capacity_pallets"] = sum(float(c.get("capacity_pallets", 1) or 1) for c in model["cells"] if str(c.get("row_number")) == row_number)
+        row["y_max"] = row["cells_count"] * length
+    return True, "Ячейка добавлена."
+
+
+
+
+def _selection_stats(model: dict, row_numbers: list[str], cell_keys: list[str]) -> dict:
+    selected_cells = [c for c in model.get("cells", []) if _map_cell_key(c) in set(cell_keys) or str(c.get("row_number")) in set(row_numbers)]
+    unique = {_map_cell_key(c): c for c in selected_cells}.values()
+    capacity = sum(float(c.get("capacity_pallets", 1) or 1) for c in unique)
+    occupied = sum(_occupied_for_cell(model, _map_cell_key(c)) for c in unique)
+    return {"rows": len(set(row_numbers)), "cells": len(list(unique)), "capacity": capacity, "occupied": occupied, "free": max(capacity - occupied, 0)}
+
+
+def _shift_rows(model: dict, row_numbers: list[str], dx: float, dy: float, snap: bool, step: float) -> tuple[bool, str]:
+    if snap and step > 0:
+        dx = round(dx / step) * step
+        dy = round(dy / step) * step
+    moving = [row for row in model.get("rows", []) if str(row.get("row_number")) in set(row_numbers)]
+    if not moving:
+        return False, "Выберите ряды для сдвига."
+    snapshots = {str(r.get("row_number")): dict(r) for r in moving}
+    for row in moving:
+        row["x_min"] = float(row.get("x_min", 0) or 0) + dx
+        row["x_max"] = float(row.get("x_max", 0) or 0) + dx
+        row["x_center"] = float(row.get("x_center", 0) or 0) + dx
+        row["y_min"] = float(row.get("y_min", 0) or 0) + dy
+        row["y_max"] = float(row.get("y_max", 0) or 0) + dy
+    for cell in model.get("cells", []):
+        if str(cell.get("row_number")) in set(row_numbers):
+            for key in ["x_min", "x_max", "x_center"]:
+                cell[key] = float(cell.get(key, 0) or 0) + dx
+            for key in ["y_min", "y_max", "y_center"]:
+                cell[key] = float(cell.get(key, 0) or 0) + dy
+            for slot in cell.get("physical_slots", []):
+                for key in ["x_min", "x_max"]:
+                    slot[key] = float(slot.get(key, 0) or 0) + dx
+                for key in ["y_min", "y_max"]:
+                    slot[key] = float(slot.get(key, 0) or 0) + dy
+    # block row intersections after move
+    rows = model.get("rows", [])
+    for idx, a in enumerate(rows):
+        for b in rows[idx + 1:]:
+            if str(a.get("row_number")) == str(b.get("row_number")):
+                continue
+            overlap_x = float(a.get("x_min", 0)) < float(b.get("x_max", 0)) and float(a.get("x_max", 0)) > float(b.get("x_min", 0))
+            overlap_y = float(a.get("y_min", 0)) < float(b.get("y_max", 0)) and float(a.get("y_max", 0)) > float(b.get("y_min", 0))
+            if overlap_x and overlap_y:
+                for row in moving:
+                    row.update(snapshots[str(row.get("row_number"))])
+                return False, f"Нельзя сохранить: ряд {a.get('row_number')} пересекается с рядом {b.get('row_number')}."
+    return True, "Ряды сдвинуты."
+
+
+def render_bulk_map_actions(model: dict, snap: bool, snap_step: float) -> dict:
+    row_choices = _row_options(model)
+    cell_choices = _cell_options(model)
+    selected_row_labels = st.multiselect("Массовое выделение рядов", list(row_choices), key="map_bulk_rows")
+    selected_cell_labels = st.multiselect("Массовое выделение ячеек", list(cell_choices), key="map_bulk_cells")
+    row_numbers = [row_choices[label] for label in selected_row_labels]
+    cell_keys = [cell_choices[label] for label in selected_cell_labels]
+    stats = _selection_stats(model, row_numbers, cell_keys)
+    s1, s2, s3, s4, s5 = st.columns(5)
+    s1.metric("Выбрано рядов", stats["rows"])
+    s2.metric("Выбрано ячеек", stats["cells"])
+    s3.metric("Вместимость", f"{stats['capacity']:g}")
+    s4.metric("Занято", f"{stats['occupied']:g}")
+    s5.metric("Свободно", f"{stats['free']:g}")
+    if st.button("Снять выделение", key="map_clear_bulk_selection"):
+        st.session_state["map_bulk_rows"] = []
+        st.session_state["map_bulk_cells"] = []
+        st.rerun()
+    with st.expander("Массовые действия", expanded=False):
+        b1, b2, b3, b4 = st.columns(4)
+        zone = b1.selectbox("weight_zone", ["heavy", "medium", "light", "unassigned"], key="bulk_zone")
+        direction = b2.selectbox("Направление", ["bottom_to_top", "top_to_bottom"], key="bulk_direction")
+        storage = b3.selectbox("Тип", ["normal", "deep_lane"], key="bulk_storage")
+        capacity = b4.number_input("capacity_pallets", min_value=0.0, value=1.0, step=1.0, key="bulk_capacity")
+        block = st.checkbox("Заблокировать выбранные объекты", key="bulk_block")
+        if st.button("Применить к выбранным", key="bulk_apply"):
+            if any(_occupied_for_cell(model, key) > capacity for key in cell_keys):
+                st.error("Нельзя уменьшить вместимость ниже занятого количества паллет.")
+            else:
+                _save_map_edit_snapshot(model)
+                for row in model.get("rows", []):
+                    if str(row.get("row_number")) in set(row_numbers):
+                        row.update({"weight_zone": zone, "cell_direction": direction, "row_storage_type": storage})
+                for cell in model.get("cells", []):
+                    if _map_cell_key(cell) in set(cell_keys) or str(cell.get("row_number")) in set(row_numbers):
+                        cell.update({"weight_zone": zone if str(cell.get("row_number")) in set(row_numbers) else cell.get("weight_zone"), "cell_direction": direction, "storage_type": storage, "capacity_pallets": capacity, "source": "block_manual" if block else "manual_update"})
+                _persist_map_edit(model, "Массовые изменения применены.")
+                st.rerun()
+        dx = st.number_input("Сдвиг выбранных рядов X, м", value=0.0, step=snap_step, key="bulk_shift_x")
+        dy = st.number_input("Сдвиг выбранных рядов Y, м", value=0.0, step=snap_step, key="bulk_shift_y")
+        if st.button("Сдвинуть выбранные ряды", key="bulk_shift_rows"):
+            _save_map_edit_snapshot(model)
+            ok, msg = _shift_rows(model, row_numbers, dx, dy, snap, snap_step)
+            if ok:
+                _persist_map_edit(model, msg)
+                st.rerun()
+            else:
+                st.error(msg)
+        confirm = st.checkbox("Подтвердить массовое удаление пустых ячеек", key="bulk_delete_confirm")
+        if st.button("Удалить выбранные пустые ячейки", disabled=not confirm, key="bulk_delete_cells"):
+            occupied_keys = [key for key in cell_keys if _occupied_for_cell(model, key) > 0]
+            if occupied_keys:
+                st.error("Нельзя удалить занятые ячейки.")
+            else:
+                _save_map_edit_snapshot(model)
+                model["cells"] = [c for c in model.get("cells", []) if _map_cell_key(c) not in set(cell_keys)]
+                _persist_map_edit(model, "Пустые ячейки удалены.")
+                st.rerun()
+    return model
+
+def render_map_edit_panel(model: dict) -> dict:
+    edit_mode = st.toggle("Режим редактирования", key="map_edit_mode")
+    if not edit_mode:
+        st.caption("Режим редактирования выключен: zoom и pan работают без изменения склада.")
+        st.session_state.pop("map_selected_cell_key", None)
+        st.session_state.pop("map_selected_row_number", None)
+        return model
+    st.caption("В режиме редактирования клики по карте подсвечивают объект. Для применения изменений выберите объект в панели ниже.")
+    tool = st.radio("Инструмент", ["Выбор", "Перемещение", "Выделение рамкой"], horizontal=True, key="map_edit_tool")
+    snap = st.checkbox("Привязка к сетке", value=True, key="map_snap_enabled")
+    snap_step = st.selectbox("Шаг сетки, м", [0.1, 0.2, 0.5, 1.0], key="map_snap_step")
+    quick = st.columns(7)
+    quick[0].button("Выбор", key="map_quick_select")
+    if quick[1].button("Снять выделение", key="map_quick_clear_selection"):
+        st.session_state["map_bulk_rows"] = []
+        st.session_state["map_bulk_cells"] = []
+        st.session_state.pop("map_selected_cell_key", None)
+        st.session_state.pop("map_selected_row_number", None)
+        st.rerun()
+    object_type = st.radio("Объект", ["Ячейка", "Ряд"], horizontal=True, key="map_edit_object_type")
+    model = render_bulk_map_actions(model, snap, float(snap_step))
+    if quick[5].button("Сохранить", key="map_edit_save"):
+        save_geometry_model(model)
+        st.success("Текущая модель сохранена.")
+    if quick[6].button("Отменить последнее изменение", key="map_edit_undo"):
+        undo = st.session_state.get("map_edit_undo_model")
+        if undo:
+            save_geometry_model(undo)
+            st.session_state["geometry_model"] = undo
+            st.success("Последнее изменение отменено.")
+            st.rerun()
+        else:
+            st.warning("Нет изменения для отмены.")
+
+    if object_type == "Ячейка":
+        options = _cell_options(model)
+        if not options:
+            st.info("В модели нет ячеек.")
+            return model
+        label = st.selectbox("Выбранная ячейка", list(options), key="map_cell_select")
+        key = options[label]
+        st.session_state["map_selected_cell_key"] = key
+        st.session_state.pop("map_selected_row_number", None)
+        cell = _find_map_cell(model, key)
+        if not cell:
+            return model
+        occupied = _occupied_for_cell(model, key)
+        capacity = float(cell.get("capacity_pallets", 1) or 1)
+        st.write({"ряд": cell.get("row_number"), "ячейка": cell.get("cell_number"), "ярус": cell.get("tier"), "адрес": key, "тип": cell.get("storage_type"), "вместимость": capacity, "занято": occupied, "свободно": max(capacity - occupied, 0), "весовая зона": cell.get("weight_zone", "unassigned"), "активна": "block" not in str(cell.get("source", "")).lower()})
+        c1, c2, c3, c4 = st.columns(4)
+        new_number = c1.text_input("Новый номер ячейки", value=str(cell.get("cell_number", "")), key="map_cell_new_number")
+        new_capacity = c2.number_input("Вместимость", min_value=0.0, value=capacity, step=1.0, key="map_cell_capacity")
+        new_type = c3.selectbox("Тип", ["normal", "deep_lane"], index=1 if cell.get("storage_type") == "deep_lane" else 0, key="map_cell_type")
+        blocked = c4.checkbox("Заблокирована", value="block" in str(cell.get("source", "")).lower(), key="map_cell_blocked")
+        if st.button("Применить изменения ячейки", key="map_cell_apply"):
+            if _cell_duplicate_exists(model, str(cell.get("row_number")), new_number, str(cell.get("tier") or "1"), key):
+                st.error("Ячейка с таким адресом уже существует.")
+            elif new_capacity < occupied:
+                st.error("Нельзя уменьшить вместимость ниже занятого количества паллет.")
+            else:
+                _save_map_edit_snapshot(model)
+                old_key = _map_cell_key(cell)
+                cell["cell_number"] = str(new_number)
+                cell["capacity_pallets"] = new_capacity
+                cell["storage_type"] = new_type
+                cell["source"] = "block_manual" if blocked else "manual_update"
+                new_key = _map_cell_key(cell)
+                for placement in model.get("placements", []):
+                    if placement.get("cell_key") == old_key:
+                        placement["cell_key"] = new_key
+                        placement["cell_number"] = str(new_number)
+                _persist_map_edit(model, "Ячейка обновлена.")
+                st.rerun()
+        add_number = st.text_input("Номер добавляемой ячейки", value=str(int(float(cell.get("cell_number", 0) or 0)) + 1) if str(cell.get("cell_number", "")).isdigit() else "", key="map_cell_add_number")
+        a1, a2, a3 = st.columns(3)
+        if a1.button("Добавить до", key="map_cell_add_before"):
+            ok, msg = _add_cell_near(model, cell, "before", add_number)
+            (st.success if ok else st.error)(msg)
+            if ok:
+                _persist_map_edit(model, msg); st.rerun()
+        if a2.button("Добавить после", key="map_cell_add_after"):
+            ok, msg = _add_cell_near(model, cell, "after", add_number)
+            (st.success if ok else st.error)(msg)
+            if ok:
+                _persist_map_edit(model, msg); st.rerun()
+        confirm = st.checkbox("Подтвердить удаление ячейки", key="map_cell_delete_confirm")
+        if a3.button("Удалить ячейку", disabled=not confirm, key="map_cell_delete"):
+            if occupied > 0:
+                st.error("Ячейка занята. Сначала переместите или сбросьте размещение товара.")
+            else:
+                _save_map_edit_snapshot(model)
+                model["cells"] = [c for c in model.get("cells", []) if _map_cell_key(c) != key]
+                _persist_map_edit(model, "Ячейка удалена.")
+                st.session_state.pop("map_selected_cell_key", None)
+                st.rerun()
+        quick[1].button("+ Ячейка", key="map_quick_add_cell", disabled=False)
+        quick[2].button("− Ячейка", key="map_quick_del_cell", disabled=False)
+    else:
+        options = _row_options(model)
+        if not options:
+            st.info("В модели нет рядов.")
+            return model
+        label = st.selectbox("Выбранный ряд", list(options), key="map_row_select")
+        row_number = options[label]
+        st.session_state["map_selected_row_number"] = row_number
+        st.session_state.pop("map_selected_cell_key", None)
+        row = _find_map_row(model, row_number)
+        row_cells = [c for c in model.get("cells", []) if str(c.get("row_number")) == row_number]
+        occupied = sum(_occupied_for_cell(model, _map_cell_key(c)) for c in row_cells)
+        st.write({"номер ряда": row_number, "row_order": row.get("row_order"), "ячеек": len(row_cells), "направление": row.get("cell_direction"), "тип": row.get("row_storage_type"), "весовая зона": row.get("weight_zone", "unassigned"), "вместимость": sum(float(c.get("capacity_pallets", 1) or 1) for c in row_cells), "занято": occupied})
+        r1, r2, r3, r4 = st.columns(4)
+        new_row_number = r1.text_input("Новый номер ряда", value=row_number, key="map_row_new_number")
+        new_order = r2.number_input("row_order", value=float(row.get("row_order", 1) or 1), step=1.0, key="map_row_order")
+        new_direction = r3.selectbox("Направление", ["bottom_to_top", "top_to_bottom"], index=1 if row.get("cell_direction") == "top_to_bottom" else 0, key="map_row_direction")
+        new_zone = r4.selectbox("Весовая зона", ["heavy", "medium", "light", "unassigned"], index=["heavy", "medium", "light", "unassigned"].index(row.get("weight_zone", "unassigned")) if row.get("weight_zone", "unassigned") in ["heavy", "medium", "light", "unassigned"] else 3, key="map_row_zone")
+        new_storage = st.selectbox("Тип хранения ряда", ["normal", "deep_lane"], index=1 if row.get("row_storage_type") == "deep_lane" else 0, key="map_row_storage")
+        row_capacity = st.number_input("Массовая вместимость ячеек ряда", min_value=0.0, value=float(row_cells[0].get("capacity_pallets", 1) if row_cells else 1), step=1.0, key="map_row_capacity")
+        if st.button("Применить изменения ряда", key="map_row_apply"):
+            if new_row_number != row_number and any(str(r.get("row_number")) == new_row_number for r in model.get("rows", [])):
+                st.error("Ряд с таким номером уже существует.")
+            elif any(_occupied_for_cell(model, _map_cell_key(c)) > row_capacity for c in row_cells):
+                st.error("Нельзя уменьшить вместимость ниже занятого количества паллет.")
+            else:
+                _save_map_edit_snapshot(model)
+                for r in model.get("rows", []):
+                    if str(r.get("row_number")) == row_number:
+                        r.update({"row_number": new_row_number, "row_order": new_order, "cell_direction": new_direction, "weight_zone": new_zone, "row_storage_type": new_storage, "capacity_pallets": row_capacity * len(row_cells)})
+                for c in row_cells:
+                    old_key = _map_cell_key(c)
+                    c.update({"row_number": new_row_number, "row_order": new_order, "cell_direction": new_direction, "weight_zone": new_zone, "storage_type": new_storage, "capacity_pallets": row_capacity})
+                    new_key = _map_cell_key(c)
+                    for p in model.get("placements", []):
+                        if p.get("cell_key") == old_key:
+                            p.update({"cell_key": new_key, "row_number": new_row_number, "weight_zone": new_zone})
+                _persist_map_edit(model, "Ряд обновлён.")
+                st.rerun()
+        confirm_row = st.checkbox("Подтвердить удаление ряда", key="map_row_delete_confirm")
+        if st.button("Удалить ряд", disabled=not confirm_row, key="map_row_delete"):
+            if _row_has_placements(model, row_number):
+                st.error("В ряду есть товар. Сначала переместите или сбросьте размещение товара.")
+            else:
+                _save_map_edit_snapshot(model)
+                model["rows"] = [r for r in model.get("rows", []) if str(r.get("row_number")) != row_number]
+                model["cells"] = [c for c in model.get("cells", []) if str(c.get("row_number")) != row_number]
+                _persist_map_edit(model, "Ряд удалён.")
+                st.session_state.pop("map_selected_row_number", None)
+                st.rerun()
+        quick[3].button("+ Ряд", key="map_quick_add_row")
+        quick[4].button("− Ряд", key="map_quick_del_row", disabled=False)
+    return model
+
+def render_geometry_map_view(model: dict) -> None:
+    st.subheader("Карта склада")
+    _model_summary_metrics(model)
+    model = render_map_edit_panel(model)
+    control_left, control_right = st.columns([1, 2])
+    with control_left:
+        detailed = st.toggle("Детальный режим", value=len(model.get("cells", [])) <= 1500, key="map_detailed_mode")
+    with control_right:
+        scale = st.slider("Масштаб, px/м", min_value=4.0, max_value=60.0, value=22.0, step=1.0, key="map_scale")
+    label_settings = render_map_settings_editor()
+    label_settings["edit_mode"] = bool(st.session_state.get("map_edit_mode", False))
+    label_settings["selected_cell_key"] = st.session_state.get("map_selected_cell_key", "")
+    label_settings["selected_row_number"] = st.session_state.get("map_selected_row_number", "")
+    label_settings["edit_tool"] = st.session_state.get("map_edit_tool", "Выбор")
+    label_settings["snap_enabled"] = bool(st.session_state.get("map_snap_enabled", True))
+    label_settings["snap_step"] = float(st.session_state.get("map_snap_step", 0.1) or 0.1)
+    render_started = perf_counter()
+    html = build_geometry_html_cached(json.dumps(model, ensure_ascii=False), scale, detailed, json.dumps(label_settings, ensure_ascii=False, sort_keys=True))
+    components.html(html, height=980, scrolling=True)
+    st.caption(f"Рендер карты: {perf_counter() - render_started:.2f} сек. Модель: data/last_import/warehouse_model.json")
 
 
 def render_virtual_warehouse_excel() -> None:
