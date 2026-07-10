@@ -170,6 +170,7 @@ def default_row_config(df: pd.DataFrame) -> pd.DataFrame:
             "row_group": [""] * len(rows),
             "side": [""] * len(rows),
             "comment": [""] * len(rows),
+            "weight_zone": ["unassigned"] * len(rows),
         }
     )
 
@@ -241,6 +242,7 @@ def _row_order_map(row_config: pd.DataFrame | None) -> dict[str, dict[str, Any]]
             "row_group": _display_value(row.get("row_group")),
             "side": _display_value(row.get("side")),
             "comment": _display_value(row.get("comment")),
+            "weight_zone": _display_value(row.get("weight_zone")) if _display_value(row.get("weight_zone")) in {"heavy", "medium", "light", "unassigned"} else "unassigned",
         }
     return result
 
@@ -324,6 +326,7 @@ def build_geometry_model(
         storage_type = meta.get("row_storage_type", "normal")
         deep_lane_width = int(meta.get("deep_lane_width", 1))
         cell_direction = meta.get("cell_direction", "bottom_to_top")
+        weight_zone = meta.get("weight_zone", "unassigned")
         row_width_m = settings.cell_width_m * deep_lane_width
         row_order_value = meta.get("row_order") or len(rows) + 1
         row_x_min = x_cursor
@@ -370,6 +373,7 @@ def build_geometry_model(
                 "volume_m3": round(volume_m3, 4),
                 "cell_direction": cell_direction,
                 "row_order": row_order_value,
+                "weight_zone": weight_zone,
                 "physical_slots": physical_slots,
             }
             cells.append(cell)
@@ -390,6 +394,7 @@ def build_geometry_model(
             "row_group": meta.get("row_group", ""),
             "side": meta.get("side", ""),
             "comment": meta.get("comment", ""),
+            "weight_zone": weight_zone,
             "x_min": row_x_min,
             "x_max": row_x_max,
             "y_min": 0.0,
@@ -458,6 +463,7 @@ def build_geometry_model(
                 "row_storage_type": row.get("row_storage_type", "normal"),
                 "deep_lane_width": row.get("deep_lane_width", 1),
                 "cell_direction": row.get("cell_direction", "bottom_to_top"),
+                "weight_zone": row.get("weight_zone", "unassigned"),
                 "updated_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
                 "comment": row.get("comment", ""),
             }
@@ -595,6 +601,7 @@ def _row_config_from_model(model: dict[str, Any]) -> pd.DataFrame:
             "row_group": row.get("row_group", ""),
             "side": row.get("side", ""),
             "comment": row.get("comment", ""),
+            "weight_zone": row.get("weight_zone", "unassigned"),
         }
         for row in model.get("rows", [])
     ])

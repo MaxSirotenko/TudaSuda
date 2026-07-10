@@ -27,6 +27,7 @@ CHARACTERISTIC_NAME_ALIASES = ["характеристика", "характер
 BATCH_ALIASES = ["batch", "партия"]
 EXPIRY_DATE_ALIASES = ["expiry_date", "срок годности", "датасрокагодности", "годен до"]
 COMMENT_ALIASES = ["comment", "комментарий", "примечание"]
+WEIGHT_CLASS_ALIASES = ["weight_class", "weight_zone", "весоваякатегория", "весовая категория", "категориявеса", "зонаразмещения", "зона размещения"]
 
 RECEIPT_COLUMNS = [
     "receipt_id",
@@ -47,6 +48,7 @@ RECEIPT_COLUMNS = [
     "placement_status",
     "placement_mode",
     "comment",
+    "weight_class",
 ]
 
 
@@ -69,6 +71,17 @@ def _display_value(value: Any) -> str:
     if isinstance(value, float) and value.is_integer():
         return str(int(value))
     return str(value).strip()
+
+
+def _normalize_weight_class(value: Any) -> str:
+    text = _clean_label(value).replace("ё", "е").replace(" ", "")
+    if text in {"heavy", "тяжелое", "тяжелый"}:
+        return "heavy"
+    if text in {"medium", "среднее", "средний"}:
+        return "medium"
+    if text in {"light", "легкое", "легкий"}:
+        return "light"
+    return "unclassified"
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -132,6 +145,7 @@ def detect_receipt_columns(df: pd.DataFrame) -> dict[str, str | None]:
         "batch": _find_column(columns, BATCH_ALIASES),
         "expiry_date": _find_column(columns, EXPIRY_DATE_ALIASES),
         "comment": _find_column(columns, COMMENT_ALIASES),
+        "weight_class": _find_column(columns, WEIGHT_CLASS_ALIASES),
     }
 
 
@@ -167,6 +181,7 @@ def normalize_receipt_table(df: pd.DataFrame, mapping: dict[str, str | None]) ->
             "placement_status": "not_placed",
             "placement_mode": "not_calculated",
             "comment": _display_value(row.get(mapping.get("comment"))) if mapping.get("comment") else "",
+            "weight_class": _normalize_weight_class(row.get(mapping.get("weight_class"))) if mapping.get("weight_class") else "unclassified",
         }
         rows.append(receipt)
     result = pd.DataFrame(rows, columns=RECEIPT_COLUMNS)
