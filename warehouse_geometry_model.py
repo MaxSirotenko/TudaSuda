@@ -628,12 +628,19 @@ def settings_from_model(model: dict[str, Any]) -> GeometrySettings:
     )
 
 
-def rebuild_geometry_from_cells(model: dict[str, Any], cells: list[dict[str, Any]], keep_base_cells: bool = True) -> dict[str, Any]:
+def rebuild_geometry_from_cells(
+    model: dict[str, Any],
+    cells: list[dict[str, Any]],
+    keep_base_cells: bool = True,
+    settings: GeometrySettings | None = None,
+    row_config: pd.DataFrame | None = None,
+    aisle_config: pd.DataFrame | None = None,
+) -> dict[str, Any]:
     rebuilt, _ = build_geometry_model(
         _cells_to_df(cells),
-        settings_from_model(model),
-        _row_config_from_model(model),
-        _aisle_config_from_model(model),
+        settings or settings_from_model(model),
+        row_config if row_config is not None else _row_config_from_model(model),
+        aisle_config if aisle_config is not None else _aisle_config_from_model(model),
         source_file_name=model.get("source_file_name", ""),
         source_sheet_name=model.get("source_sheet_name", ""),
         source_file_hash=model.get("source_file_hash", ""),
@@ -711,7 +718,26 @@ def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bo
     colors = dict(default_colors)
     colors.update(settings.get("colors", {}))
     label_mode = str(settings.get("label_mode", "Авто"))
-    parts = [f"<div style='position:relative;width:{width}px;height:{height}px;background:#f8fafc;border:1px solid #cbd5e1;overflow:auto'>"]
+    model_id = re.sub(r"[^a-zA-Z0-9_-]", "_", str(model.get("model_id") or "warehouse"))
+    root_id = f"warehouse-map-{model_id}"
+    canvas_id = f"warehouse-map-canvas-{model_id}"
+    zoom_label_id = f"warehouse-map-zoom-{model_id}"
+    storage_key = f"warehouse-map-view:{model_id}"
+    parts = [
+        f"<div id='{root_id}' data-storage-key='{html.escape(storage_key, quote=True)}' "
+        f"style='position:relative;width:100%;height:calc(100vh - 4px);min-height:720px;background:#f8fafc;border:1px solid #cbd5e1;overflow:hidden;touch-action:none;user-select:none;'>"
+        f"<div style='position:absolute;z-index:20;left:10px;top:10px;display:flex;gap:6px;align-items:center;"
+        f"padding:6px 8px;background:rgba(255,255,255,0.92);border:1px solid #cbd5e1;border-radius:10px;"
+        f"box-shadow:0 4px 14px rgba(15,23,42,0.12);font:13px Arial;color:#0f172a;'>"
+        f"<button type='button' data-action='zoom-in' style='width:30px;height:28px;border:1px solid #94a3b8;border-radius:7px;background:#fff;cursor:pointer;font-weight:700'>+</button>"
+        f"<button type='button' data-action='zoom-out' style='width:30px;height:28px;border:1px solid #94a3b8;border-radius:7px;background:#fff;cursor:pointer;font-weight:700'>−</button>"
+        f"<button type='button' data-action='reset' style='height:28px;border:1px solid #94a3b8;border-radius:7px;background:#fff;cursor:pointer'>100%</button>"
+        f"<button type='button' data-action='fit' style='height:28px;border:1px solid #94a3b8;border-radius:7px;background:#fff;cursor:pointer'>Весь склад</button>"
+        f"<span id='{zoom_label_id}' style='min-width:48px;text-align:right;font-weight:700'>100%</span>"
+        f"</div>"
+        f"<div id='{canvas_id}' style='position:absolute;left:0;top:0;width:{width}px;height:{height}px;"
+        f"transform-origin:0 0;will-change:transform;cursor:grab;'>"
+    ]
 
     def label_font_size(label_lines, w, h) -> int:
         lines = [str(line) for line in label_lines if str(line)]
@@ -838,4 +864,137 @@ def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bo
                 else:
                     rect(row["x_min"], row["y_max"], row["x_max"], row["y_max"] + 0.4, "#bfdbfe", "1px solid #2563eb", row_label, f"Ряд {row_label}", short_label=row_label, vertical=True)
     parts.append("</div>")
+    script = f"""
+<script>
+(function() {{
+  const root = document.getElementById({json.dumps(root_id)});
+  const canvas = document.getElementById({json.dumps(canvas_id)});
+  const zoomLabel = document.getElementById({json.dumps(zoom_label_id)});
+  if (!root || !canvas || root.dataset.navReady === '1') return;
+  root.dataset.navReady = '1';
+  const minScale = 0.25;
+  const maxScale = 8;
+  const buttonFactor = 1.2;
+  const storageKey = root.dataset.storageKey || {json.dumps(storage_key)};
+  const base = {{ scale: 1, x: 0, y: 0 }};
+  const view = {{ scale: 1, x: 0, y: 0 }};
+
+  function clamp(value, min, max) {{ return Math.max(min, Math.min(max, value)); }}
+  function viewportSize() {{
+    return {{ width: Math.max(root.clientWidth, 1), height: Math.max(root.clientHeight, 1) }};
+  }}
+  function canvasSize() {{
+    return {{ width: Math.max(canvas.offsetWidth, 1), height: Math.max(canvas.offsetHeight, 1) }};
+  }}
+  function saveView() {{
+    try {{ localStorage.setItem(storageKey, JSON.stringify(view)); }} catch (err) {{}}
+  }}
+  function applyView(shouldSave = true) {{
+    view.scale = clamp(view.scale, minScale, maxScale);
+    canvas.style.transform = `translate(${{view.x}}px, ${{view.y}}px) scale(${{view.scale}})`;
+    if (zoomLabel) zoomLabel.textContent = `${{Math.round(view.scale * 100)}}%`;
+    if (shouldSave) saveView();
+  }}
+  function centerAt(scale) {{
+    const vp = viewportSize();
+    const cs = canvasSize();
+    view.scale = clamp(scale, minScale, maxScale);
+    view.x = (vp.width - cs.width * view.scale) / 2;
+    view.y = (vp.height - cs.height * view.scale) / 2;
+    applyView();
+  }}
+  function fitAll() {{
+    const vp = viewportSize();
+    const cs = canvasSize();
+    const padding = 24;
+    const sx = (vp.width - padding * 2) / cs.width;
+    const sy = (vp.height - padding * 2) / cs.height;
+    const nextScale = clamp(Math.min(sx, sy), minScale, maxScale);
+    view.scale = nextScale;
+    view.x = (vp.width - cs.width * nextScale) / 2;
+    view.y = (vp.height - cs.height * nextScale) / 2;
+    applyView();
+  }}
+  function reset100() {{ centerAt(base.scale); }}
+  function zoomAt(clientX, clientY, factor) {{
+    const rect = root.getBoundingClientRect();
+    const px = clientX - rect.left;
+    const py = clientY - rect.top;
+    const oldScale = view.scale;
+    const nextScale = clamp(oldScale * factor, minScale, maxScale);
+    if (nextScale === oldScale) return;
+    const worldX = (px - view.x) / oldScale;
+    const worldY = (py - view.y) / oldScale;
+    view.scale = nextScale;
+    view.x = px - worldX * nextScale;
+    view.y = py - worldY * nextScale;
+    applyView();
+  }}
+  function zoomCenter(factor) {{
+    const rect = root.getBoundingClientRect();
+    zoomAt(rect.left + rect.width / 2, rect.top + rect.height / 2, factor);
+  }}
+
+  root.addEventListener('click', function(event) {{
+    const button = event.target.closest('button[data-action]');
+    if (!button) return;
+    event.preventDefault();
+    const action = button.dataset.action;
+    if (action === 'zoom-in') zoomCenter(buttonFactor);
+    if (action === 'zoom-out') zoomCenter(1 / buttonFactor);
+    if (action === 'reset') reset100();
+    if (action === 'fit') fitAll();
+  }});
+  root.addEventListener('wheel', function(event) {{
+    event.preventDefault();
+    const factor = event.deltaY < 0 ? buttonFactor : 1 / buttonFactor;
+    zoomAt(event.clientX, event.clientY, factor);
+  }}, {{ passive: false }});
+
+  let dragging = false;
+  let dragStart = {{ x: 0, y: 0, viewX: 0, viewY: 0 }};
+  root.addEventListener('pointerdown', function(event) {{
+    if (event.target.closest('button')) return;
+    dragging = true;
+    dragStart = {{ x: event.clientX, y: event.clientY, viewX: view.x, viewY: view.y }};
+    canvas.style.cursor = 'grabbing';
+    root.setPointerCapture(event.pointerId);
+  }});
+  root.addEventListener('pointermove', function(event) {{
+    if (!dragging) return;
+    view.x = dragStart.viewX + event.clientX - dragStart.x;
+    view.y = dragStart.viewY + event.clientY - dragStart.y;
+    applyView();
+  }});
+  function stopDrag(event) {{
+    if (!dragging) return;
+    dragging = false;
+    canvas.style.cursor = 'grab';
+    try {{ root.releasePointerCapture(event.pointerId); }} catch (err) {{}}
+    saveView();
+  }}
+  root.addEventListener('pointerup', stopDrag);
+  root.addEventListener('pointercancel', stopDrag);
+  root.addEventListener('dblclick', function(event) {{
+    if (event.target.closest('button')) return;
+    event.preventDefault();
+    fitAll();
+  }});
+
+  let restored = false;
+  try {{
+    const stored = JSON.parse(localStorage.getItem(storageKey) || 'null');
+    if (stored && Number.isFinite(stored.scale) && Number.isFinite(stored.x) && Number.isFinite(stored.y)) {{
+      view.scale = clamp(stored.scale, minScale, maxScale);
+      view.x = stored.x;
+      view.y = stored.y;
+      restored = true;
+    }}
+  }} catch (err) {{}}
+  if (restored) applyView(false); else fitAll();
+  window.addEventListener('resize', function() {{ applyView(false); }});
+}})();
+</script>
+"""
+    parts.append(f"</div>{script}")
     return "".join(parts)
