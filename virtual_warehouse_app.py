@@ -110,6 +110,26 @@ DEFAULT_RENDER_COLOR_SETTINGS = {
     "deep_lane_full_color": "#66BB6A",
 }
 
+WEIGHT_ZONE_LABELS = {"heavy": "Тяжёлое", "medium": "Среднее", "light": "Лёгкое", "unassigned": "Не назначено"}
+WEIGHT_ZONE_VALUES = list(WEIGHT_ZONE_LABELS)
+WEIGHT_ZONE_LABEL_TO_VALUE = {label: value for value, label in WEIGHT_ZONE_LABELS.items()}
+STORAGE_TYPE_LABELS = {"normal": "Обычная", "deep_lane": "Набивная"}
+STORAGE_TYPE_VALUES = list(STORAGE_TYPE_LABELS)
+STORAGE_TYPE_LABEL_TO_VALUE = {label: value for value, label in STORAGE_TYPE_LABELS.items()}
+ROW_STORAGE_TYPE_LABELS = {"normal": "Обычный ряд", "deep_lane": "Набивной ряд"}
+DIRECTION_LABELS = {"bottom_to_top": "Снизу вверх", "top_to_bottom": "Сверху вниз"}
+DIRECTION_VALUES = list(DIRECTION_LABELS)
+DIRECTION_LABEL_TO_VALUE = {label: value for value, label in DIRECTION_LABELS.items()}
+CELL_STATE_LABELS = {True: "Активна", False: "Заблокирована"}
+
+def display_label(mapping: dict, value, default: str = "—") -> str:
+    return mapping.get(str(value), default if value in (None, "") else str(value))
+
+def select_internal(label: str, mapping: dict[str, str], current: str, *, key: str, container=st):
+    values = list(mapping)
+    index = values.index(current) if current in values else 0
+    return container.selectbox(label, values, index=index, format_func=lambda value: mapping.get(value, str(value)), key=key)
+
 
 @st.cache_data(show_spinner=False)
 def get_git_release_info() -> dict[str, str]:
@@ -294,6 +314,7 @@ def save_render_settings(settings: dict) -> None:
 
 def render_label_settings_editor(settings: dict) -> dict:
     with st.expander("Настройки подписей", expanded=False):
+        st.caption("Выберите, какие подписи показывать на карте. После сохранения настройки применяются к текущему рендеру без перестроения склада.")
         c1, c2, c3, c4 = st.columns(4)
         settings["show_row_labels"] = c1.checkbox("Показывать номера рядов", value=bool(settings.get("show_row_labels", True)), key="show_row_labels")
         settings["show_cell_labels"] = c2.checkbox("Показывать номера ячеек", value=bool(settings.get("show_cell_labels", True)), key="show_cell_labels")
@@ -312,6 +333,7 @@ def render_color_settings_editor(settings: dict) -> dict:
     colors = dict(DEFAULT_RENDER_COLOR_SETTINGS)
     colors.update(settings.get("colors", {}))
     with st.expander("Настройки цветов карты", expanded=False):
+        st.caption("Настройте цвета ячеек, проездов и состояний занятости. Сохранение обновляет только цвета и не меняет геометрию склада.")
         c1, c2, c3 = st.columns(3)
         colors["cell_color"] = c1.color_picker("Цвет обычных ячеек", colors["cell_color"], key="color_cell")
         colors["deep_lane_cell_color"] = c2.color_picker("Цвет набивных ячеек", colors["deep_lane_cell_color"], key="color_deep_lane")
@@ -544,6 +566,7 @@ def _manual_changes_dataframe(overrides: dict | None) -> pd.DataFrame:
 
 def render_manual_cell_editor(model: dict) -> None:
     st.subheader("Ручное редактирование ячеек")
+    st.caption("Добавляйте, изменяйте или удаляйте ячейки без правки исходного Excel. Все ручные операции сохраняются в текущей модели и журнале изменений.")
     overrides = load_manual_overrides()
     if overrides and overrides.get("source_model_id") != model.get("model_id"):
         overrides = None
@@ -689,6 +712,7 @@ def render_manual_cell_editor(model: dict) -> None:
 
 def render_inventory_placement(model: dict) -> dict:
     st.subheader("Размещение товара")
+    st.caption("Загрузите переходящие остатки или рассчитайте базовое размещение. Результат сохраняется отдельно от геометрии склада.")
     state, state_warning = load_placement_state(model)
     if state_warning:
         st.warning(state_warning)
@@ -709,6 +733,7 @@ def render_inventory_placement(model: dict) -> dict:
     ])
 
     with upload_tab:
+        st.caption("Загрузите Excel с переходящими остатками. После импорта товары с адресом попадут в фактическое размещение, а товары без адреса — в список для расчёта.")
         inventory_file = st.file_uploader("Загрузить Excel с остатками", type=["xlsx"], key="inventory_upload")
         replace_current = st.checkbox("Заменить текущее размещение", value=True, key="inventory_replace_current")
         if inventory_file is not None:
@@ -771,6 +796,7 @@ def render_inventory_placement(model: dict) -> dict:
             st.dataframe(pd.DataFrame(unplaced), use_container_width=True)
         else:
             st.info("Товаров без привязки к ячейкам сейчас нет.")
+        st.caption("Нажмите кнопку расчёта, чтобы последовательно разместить остатки и приходы по назначенным весовым зонам.")
         st.info("Размещение выполняется последовательно по маршруту внутри весовых зон. Алгоритм пока не учитывает ABC, прогноз, соседство и другие правила оптимизации.")
         if st.button("Рассчитать базовое размещение", key="basic_weight_place_inventory"):
             receipts_state, receipts_warning = load_receipts_state(model)
@@ -924,6 +950,7 @@ def render_receipts_section(model: dict) -> None:
     upload_tab, data_tab, diag_tab = st.tabs(["Загрузка приходов", "Приходы к размещению", "Диагностика приходов"])
 
     with upload_tab:
+        st.caption("Загрузите Excel с приходами и проверьте соответствие колонок. После загрузки приходы сохраняются как отдельный слой данных.")
         receipt_file = st.file_uploader("Загрузить Excel с приходами", type=["xlsx"], key="receipt_upload")
         replace_current = st.checkbox("Заменить текущие загруженные приходы", value=True, key="receipt_replace_current")
         if receipt_file is not None:
@@ -1038,6 +1065,7 @@ def render_excel_geometry_warehouse() -> None:
 
 
 def render_geometry_constructor_tab(saved_model: dict | None) -> None:
+    st.caption("Загрузите Excel со схемой склада и выберите лист с ячейками. После построения модель сохранится и будет доступна на вкладке «Карта склада».")
     uploaded = st.file_uploader("Excel со списком фактических ячеек", type=["xlsx"], key="geometry_cells_file")
     if uploaded is None:
         if saved_model:
@@ -1053,6 +1081,7 @@ def render_geometry_constructor_tab(saved_model: dict | None) -> None:
     content_hash = file_hash(file_bytes)
     sheet_names = get_geometry_sheet_names(file_bytes)
     sheet_name = st.selectbox("Лист со списком ячеек", sheet_names, key="geometry_sheet")
+    st.caption("Выберите лист, где находятся строки с кодом, рядом, ячейкой и ярусом. Предпросмотр ниже поможет проверить, что выбран правильный лист.")
     header_rows = st.radio("Строк заголовка", [1, 2], index=1, horizontal=True, help="Если в Excel сверху 'Ряд', а ниже 'Ссылка', выберите 2 строки заголовка.")
 
     timings: dict[str, float] = {}
@@ -1065,6 +1094,7 @@ def render_geometry_constructor_tab(saved_model: dict | None) -> None:
 
     detected = detect_column_mapping(df)
     st.subheader("Колонки")
+    st.caption("Проверьте автоопределение колонок или выберите их вручную. Эти настройки используются только для чтения текущего Excel.")
     columns = [None] + list(df.columns)
     c1, c2, c3, c4 = st.columns(4)
     mapping = {
@@ -1083,6 +1113,7 @@ def render_geometry_constructor_tab(saved_model: dict | None) -> None:
         return
 
     st.subheader("Размеры и ярусы")
+    st.caption("Укажите размеры ячеек, проездов и ярусы для построения склада. Нажатие «Построить склад» пересчитает геометрию по этим параметрам.")
     s1, s2, s3, s4, s5 = st.columns(5)
     cell_length_m = s1.number_input("Длина ячейки вдоль ряда, м", min_value=0.1, value=1.2, step=0.1)
     cell_width_m = s2.number_input("Ширина ряда, м", min_value=0.1, value=0.8, step=0.1)
@@ -1099,6 +1130,7 @@ def render_geometry_constructor_tab(saved_model: dict | None) -> None:
         st.session_state["geometry_row_config_hash"] = content_hash
 
     st.subheader("Настройки рядов")
+    st.caption("Настройте порядок, направление и тип хранения каждого ряда. Эти значения попадут в модель после построения склада.")
     st.caption("Обычный ряд хранит одну паллету на системную ячейку. Набивной ряд хранит несколько физических паллетомест внутри одной системной ячейки.")
     row_config_source = st.session_state.get("geometry_row_config_data", row_config_default)
     row_config_display = row_config_source.copy()
@@ -1132,6 +1164,7 @@ def render_geometry_constructor_tab(saved_model: dict | None) -> None:
     st.session_state["geometry_row_config_data"] = row_config
 
     st.subheader("Набивные ряды")
+    st.caption("Выберите ряды, которые должны работать как набивные. После применения нажмите «Построить склад», чтобы обновить вместимость.")
     available_rows = sorted(row_config["row_number"].dropna().astype(str).tolist(), key=lambda value: (not value.isdigit(), value))
     selected_deep_rows = st.multiselect("Выберите ряды", available_rows, key="deep_lane_selected_rows")
     d1, d2, d3 = st.columns(3)
@@ -1288,6 +1321,7 @@ def _model_aisle_config_dataframe(model: dict) -> pd.DataFrame:
 
 def render_weight_zone_editor(model: dict) -> dict:
     st.subheader("Весовые зоны рядов")
+    st.caption("Назначьте рядам зоны «Тяжёлое», «Среднее» или «Лёгкое». При базовом размещении SKU будут использовать только соответствующую зону.")
     zone_to_label = {"heavy": "Тяжёлое", "medium": "Среднее", "light": "Лёгкое", "unassigned": "Не назначено"}
     label_to_zone = {value: key for key, value in zone_to_label.items()}
     rows_df = pd.DataFrame([
@@ -1422,6 +1456,7 @@ def render_geometry_data_tabs(model: dict) -> None:
 
 def render_geometry_constructor_view(model: dict) -> None:
     st.subheader("Активная модель")
+    st.caption("Здесь собраны инструменты конструктора: ручные правки, зоны, проезды, остатки, приходы и диагностика. Карта показана отдельно на вкладке «Карта склада».")
     overrides = load_manual_overrides()
     if overrides and overrides.get("source_model_id") != model.get("model_id"):
         overrides = None
@@ -1430,6 +1465,7 @@ def render_geometry_constructor_view(model: dict) -> None:
     st.caption(f"Ручных изменений: {counts['total']} · Добавлено вручную: {counts['add']} · Изменено вручную: {counts['update']} · Удалено вручную: {counts['delete']}")
     _model_summary_metrics(model)
     st.subheader("Диагностика импорта")
+    st.caption("Проверьте предупреждения и статистику построения. Диагностика помогает найти проблемы в исходной схеме без изменения модели.")
     settings = model.get("settings", {})
     stats = [
         ("Проездов между рядами", len(model.get("aisles", []))),
@@ -1597,10 +1633,10 @@ def render_bulk_map_actions(model: dict, snap: bool, snap_step: float) -> dict:
         st.rerun()
     with st.expander("Массовые действия", expanded=False):
         b1, b2, b3, b4 = st.columns(4)
-        zone = b1.selectbox("weight_zone", ["heavy", "medium", "light", "unassigned"], key="bulk_zone")
-        direction = b2.selectbox("Направление", ["bottom_to_top", "top_to_bottom"], key="bulk_direction")
-        storage = b3.selectbox("Тип", ["normal", "deep_lane"], key="bulk_storage")
-        capacity = b4.number_input("capacity_pallets", min_value=0.0, value=1.0, step=1.0, key="bulk_capacity")
+        zone = select_internal("Весовая зона", WEIGHT_ZONE_LABELS, "unassigned", key="bulk_zone", container=b1)
+        direction = select_internal("Направление", DIRECTION_LABELS, "bottom_to_top", key="bulk_direction", container=b2)
+        storage = select_internal("Тип хранения", STORAGE_TYPE_LABELS, "normal", key="bulk_storage", container=b3)
+        capacity = b4.number_input("Вместимость, паллет", min_value=0.0, value=1.0, step=1.0, key="bulk_capacity")
         block = st.checkbox("Заблокировать выбранные объекты", key="bulk_block")
         if st.button("Применить к выбранным", key="bulk_apply"):
             if any(_occupied_for_cell(model, key) > capacity for key in cell_keys):
@@ -1638,6 +1674,7 @@ def render_bulk_map_actions(model: dict, snap: bool, snap_step: float) -> dict:
     return model
 
 def render_map_edit_panel(model: dict) -> dict:
+    st.caption("Включите ручное редактирование, чтобы менять выбранные ряды и ячейки прямо рядом с картой. Изменения сохраняются через текущий механизм ручных правок.")
     edit_mode = st.toggle("Режим редактирования", key="map_edit_mode")
     if not edit_mode:
         st.caption("Режим редактирования выключен: zoom и pan работают без изменения склада.")
@@ -1685,11 +1722,11 @@ def render_map_edit_panel(model: dict) -> dict:
             return model
         occupied = _occupied_for_cell(model, key)
         capacity = float(cell.get("capacity_pallets", 1) or 1)
-        st.write({"ряд": cell.get("row_number"), "ячейка": cell.get("cell_number"), "ярус": cell.get("tier"), "адрес": key, "тип": cell.get("storage_type"), "вместимость": capacity, "занято": occupied, "свободно": max(capacity - occupied, 0), "весовая зона": cell.get("weight_zone", "unassigned"), "активна": "block" not in str(cell.get("source", "")).lower()})
+        st.write({"ряд": cell.get("row_number"), "ячейка": cell.get("cell_number"), "ярус": cell.get("tier"), "адрес": key, "тип": display_label(STORAGE_TYPE_LABELS, cell.get("storage_type")), "вместимость": capacity, "занято": occupied, "свободно": max(capacity - occupied, 0), "весовая зона": display_label(WEIGHT_ZONE_LABELS, cell.get("weight_zone", "unassigned")), "состояние": CELL_STATE_LABELS["block" not in str(cell.get("source", "")).lower()]})
         c1, c2, c3, c4 = st.columns(4)
         new_number = c1.text_input("Новый номер ячейки", value=str(cell.get("cell_number", "")), key="map_cell_new_number")
         new_capacity = c2.number_input("Вместимость", min_value=0.0, value=capacity, step=1.0, key="map_cell_capacity")
-        new_type = c3.selectbox("Тип", ["normal", "deep_lane"], index=1 if cell.get("storage_type") == "deep_lane" else 0, key="map_cell_type")
+        new_type = select_internal("Тип", STORAGE_TYPE_LABELS, str(cell.get("storage_type", "normal")), key="map_cell_type", container=c3)
         blocked = c4.checkbox("Заблокирована", value="block" in str(cell.get("source", "")).lower(), key="map_cell_blocked")
         if st.button("Применить изменения ячейки", key="map_cell_apply"):
             if _cell_duplicate_exists(model, str(cell.get("row_number")), new_number, str(cell.get("tier") or "1"), key):
@@ -1746,13 +1783,13 @@ def render_map_edit_panel(model: dict) -> dict:
         row = _find_map_row(model, row_number)
         row_cells = [c for c in model.get("cells", []) if str(c.get("row_number")) == row_number]
         occupied = sum(_occupied_for_cell(model, _map_cell_key(c)) for c in row_cells)
-        st.write({"номер ряда": row_number, "row_order": row.get("row_order"), "ячеек": len(row_cells), "направление": row.get("cell_direction"), "тип": row.get("row_storage_type"), "весовая зона": row.get("weight_zone", "unassigned"), "вместимость": sum(float(c.get("capacity_pallets", 1) or 1) for c in row_cells), "занято": occupied})
+        st.write({"номер ряда": row_number, "порядок ряда": row.get("row_order"), "ячеек": len(row_cells), "направление": display_label(DIRECTION_LABELS, row.get("cell_direction")), "тип": display_label(ROW_STORAGE_TYPE_LABELS, row.get("row_storage_type")), "весовая зона": display_label(WEIGHT_ZONE_LABELS, row.get("weight_zone", "unassigned")), "вместимость": sum(float(c.get("capacity_pallets", 1) or 1) for c in row_cells), "занято": occupied})
         r1, r2, r3, r4 = st.columns(4)
         new_row_number = r1.text_input("Новый номер ряда", value=row_number, key="map_row_new_number")
-        new_order = r2.number_input("row_order", value=float(row.get("row_order", 1) or 1), step=1.0, key="map_row_order")
-        new_direction = r3.selectbox("Направление", ["bottom_to_top", "top_to_bottom"], index=1 if row.get("cell_direction") == "top_to_bottom" else 0, key="map_row_direction")
-        new_zone = r4.selectbox("Весовая зона", ["heavy", "medium", "light", "unassigned"], index=["heavy", "medium", "light", "unassigned"].index(row.get("weight_zone", "unassigned")) if row.get("weight_zone", "unassigned") in ["heavy", "medium", "light", "unassigned"] else 3, key="map_row_zone")
-        new_storage = st.selectbox("Тип хранения ряда", ["normal", "deep_lane"], index=1 if row.get("row_storage_type") == "deep_lane" else 0, key="map_row_storage")
+        new_order = r2.number_input("Порядок ряда", value=float(row.get("row_order", 1) or 1), step=1.0, key="map_row_order")
+        new_direction = select_internal("Направление", DIRECTION_LABELS, str(row.get("cell_direction", "bottom_to_top")), key="map_row_direction", container=r3)
+        new_zone = select_internal("Весовая зона", WEIGHT_ZONE_LABELS, str(row.get("weight_zone", "unassigned")), key="map_row_zone", container=r4)
+        new_storage = select_internal("Тип хранения ряда", ROW_STORAGE_TYPE_LABELS, str(row.get("row_storage_type", "normal")), key="map_row_storage")
         row_capacity = st.number_input("Массовая вместимость ячеек ряда", min_value=0.0, value=float(row_cells[0].get("capacity_pallets", 1) if row_cells else 1), step=1.0, key="map_row_capacity")
         if st.button("Применить изменения ряда", key="map_row_apply"):
             if new_row_number != row_number and any(str(r.get("row_number")) == new_row_number for r in model.get("rows", [])):
@@ -1790,6 +1827,7 @@ def render_map_edit_panel(model: dict) -> dict:
 
 def render_geometry_map_view(model: dict) -> None:
     st.subheader("Карта склада")
+    st.caption("Используйте кнопки масштаба, колесо мыши и перетаскивание для навигации по карте. Переключение вкладок не перестраивает склад и не сбрасывает ручные правки.")
     _model_summary_metrics(model)
     model = render_map_edit_panel(model)
     control_left, control_right = st.columns([1, 2])

@@ -738,10 +738,10 @@ def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bo
     storage_key = f"warehouse-map-view:{model_id}"
     parts = [
         f"<div id='{root_id}' data-storage-key='{html.escape(storage_key, quote=True)}' "
-        f"style='position:relative;width:100%;height:calc(100vh - 4px);min-height:720px;background:#f8fafc;border:1px solid #cbd5e1;overflow:hidden;touch-action:none;user-select:none;'>"
+        f"style='position:relative;width:100%;height:calc(100vh - 4px);min-height:720px;background:#F7F8FA;border:1px solid #D7DEE8;overflow:hidden;touch-action:none;user-select:none;'>"
         f"<div style='position:absolute;z-index:20;left:10px;top:10px;display:flex;gap:6px;align-items:center;"
         f"padding:6px 8px;background:rgba(255,255,255,0.92);border:1px solid #cbd5e1;border-radius:10px;"
-        f"box-shadow:0 4px 14px rgba(15,23,42,0.12);font:13px Arial;color:#0f172a;'>"
+        f"box-shadow:0 4px 14px rgba(15,23,42,0.12);font:13px Arial;color:#253247;'>"
         f"<button type='button' data-action='zoom-in' style='width:30px;height:28px;border:1px solid #94a3b8;border-radius:7px;background:#fff;cursor:pointer;font-weight:700'>+</button>"
         f"<button type='button' data-action='zoom-out' style='width:30px;height:28px;border:1px solid #94a3b8;border-radius:7px;background:#fff;cursor:pointer;font-weight:700'>−</button>"
         f"<button type='button' data-action='reset' style='height:28px;border:1px solid #94a3b8;border-radius:7px;background:#fff;cursor:pointer'>100%</button>"
@@ -795,7 +795,7 @@ def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bo
                 content = f"<span style='display:inline-block;transform:rotate(-90deg);white-space:nowrap'>{html.escape(lines[0])}</span>"
             else:
                 content = "<br>".join(html.escape(line) for line in lines)
-            content_style = f"display:flex;align-items:center;justify-content:center;width:100%;height:100%;padding:1px;box-sizing:border-box;font:{font_size}px/{line_height}px Arial;text-align:center;overflow:hidden;color:#0f172a;"
+            content_style = f"display:flex;align-items:center;justify-content:center;width:100%;height:100%;padding:1px;box-sizing:border-box;font:{font_size}px/{line_height}px Arial;text-align:center;overflow:hidden;color:#253247;"
         else:
             content_style = "display:block;width:100%;height:100%;overflow:hidden;"
         hover_attrs = ""
@@ -811,11 +811,11 @@ def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bo
         road_color = colors["top_road_color"] if road["road_type"] == "top" else colors["bottom_road_color"]
         if road.get("road_type") == "exit":
             road_color = colors["exit_color"]
-        rect(road["x_min"], road["y_min"], road["x_max"], road["y_max"], road_color, "1px solid #60a5fa", road_label, f"{label}: {road['width_m']} м", short_label="проезд")
+        rect(road["x_min"], road["y_min"], road["x_max"], road["y_max"], road_color, "1px solid #C9D2E0", road_label, f"{label}: {road['width_m']} м", short_label="проезд")
     for aisle in aisles:
         y_max = max_y - model["settings"].get("top_road_width_m", 3.4)
         aisle_label = "проезд" if settings.get("show_aisle_labels", True) else ""
-        rect(aisle["x_min"], 0, aisle["x_max"], y_max, colors["aisle_color"], "1px solid #f59e0b", aisle_label, f"{aisle['row_from']} → {aisle['row_to']}: {aisle['aisle_width_m']} м", short_label="↕")
+        rect(aisle["x_min"], 0, aisle["x_max"], y_max, colors["aisle_color"], "1px solid #D5DAE2", aisle_label, f"{aisle['row_from']} → {aisle['row_to']}: {aisle['aisle_width_m']} м", short_label="↕")
     if detailed:
         for cell in cells:
             source_label = {"excel": "Excel", "manual_add": "добавлена вручную", "manual_update": "изменена вручную"}.get(str(cell.get("source", "excel")), str(cell.get("source", "excel")))
@@ -833,16 +833,16 @@ def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bo
             current_cell_key = f"{cell.get('row_number')}|{cell.get('cell_number')}|{cell.get('tier') or '1'}"
             if occupied > capacity:
                 color = "#fecaca"
-                border = "2px solid #dc2626"
+                border = "2px solid #DC5A5A"
             elif occupied >= capacity:
                 color = colors["deep_lane_full_color"] if cell.get("storage_type") == "deep_lane" else colors["occupied_cell_color"]
-                border = "2px solid #16a34a"
+                border = "2px solid #4F8F5B"
             elif occupied > 0:
                 color = colors["deep_lane_partial_color"] if cell.get("storage_type") == "deep_lane" else colors["occupied_cell_color"]
-                border = "2px solid #d97706"
+                border = "2px solid #82A878"
             else:
                 color = colors["deep_lane_cell_color"] if cell.get("storage_type") == "deep_lane" else colors["cell_color"]
-                border = "2px solid #d97706" if cell.get("storage_type") == "deep_lane" else "1px solid #64748b"
+                border = "1px solid #8FB39A" if cell.get("storage_type") == "deep_lane" else "1px solid #AAB4C3"
             cell_number_label = str(cell["cell_number"]) if settings.get("show_cell_labels", True) else ""
             occupancy_text = occupancy_label if settings.get("show_occupancy_labels", True) and occupied > 0 else ""
             if label_mode == "Короткие":
@@ -856,19 +856,19 @@ def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bo
                 short_lines = [occupancy_text] if occupancy_text else [cell_number_label]
             if current_cell_key == selected_cell_key:
                 color = colors["selected_cell_color"]
-                border = "3px solid #7c2d12"
+                border = "2px solid #E5532D"
             cell_attrs = f" data-edit-select='cell' data-cell-key='{html.escape(current_cell_key, quote=True)}' data-row-number='{html.escape(str(cell.get('row_number')), quote=True)}'" if edit_mode else ""
             rect(cell["x_min"], cell["y_min"], cell["x_max"], cell["y_max"], color, border, cell_number_label, title, short_label=occupancy_text or cell_number_label, label_lines=full_lines, short_lines=short_lines, hover_color=colors["hover_cell_color"], extra_attrs=cell_attrs)
             occupied_slots = int(min(round(occupied), len(cell.get("physical_slots", []))))
             for slot in cell.get("physical_slots", []):
                 slot_color = "rgba(34,197,94,0.45)" if slot.get("slot_index", 0) <= occupied_slots else "rgba(255,255,255,0.18)"
-                rect(slot["x_min"], slot["y_min"], slot["x_max"], slot["y_max"], slot_color, "1px dashed #92400e", "", f"Физическое место {slot['slot_index']} из {cell.get('deep_lane_width', 1)}")
+                rect(slot["x_min"], slot["y_min"], slot["x_max"], slot["y_max"], slot_color, "1px dashed #93A4B8", "", f"Физическое место {slot['slot_index']} из {cell.get('deep_lane_width', 1)}")
     else:
         for row in rows:
             row_label = f"ряд {row['row_number']} ({row['cells_count']})" if settings.get("show_row_labels", True) else ""
             row_color = colors["selected_cell_color"] if str(row.get("row_number", "")) == selected_row_number else colors["cell_color"]
             row_attrs = f" data-edit-select='row' data-row-number='{html.escape(str(row.get('row_number', '')), quote=True)}'" if edit_mode else ""
-            rect(row["x_min"], row["y_min"], row["x_max"], row["y_max"], row_color, "1px solid #64748b", row_label, short_label=str(row.get("row_number", "")), vertical=True, extra_attrs=row_attrs)
+            rect(row["x_min"], row["y_min"], row["x_max"], row["y_max"], row_color, "1px solid #AAB4C3", row_label, short_label=str(row.get("row_number", "")), vertical=True, extra_attrs=row_attrs)
     if settings.get("show_row_labels", True):
         row_position = str(settings.get("row_label_position", "авто"))
         for idx, row in enumerate(rows):
@@ -876,17 +876,27 @@ def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bo
                 continue
             row_label = str(row["row_number"])
             positions = ["top", "bottom"] if row_position == "сверху и снизу" else (["bottom"] if row_position == "снизу" else ["top"])
-            if row_position == "авто" and row.get("width_m", 1) * scale < 12:
-                positions = ["bottom"]
+            row_height = max(float(row.get("y_max", 0)) - float(row.get("y_min", 0)), 0.01)
+            row_width = max(float(row.get("x_max", 0)) - float(row.get("x_min", 0)), 0.01)
+            badge_height = min(0.55, max(row_height * 0.18, 0.24))
+            badge_margin_y = min(0.08, max(row_height * 0.03, 0.02))
+            badge_margin_x = min(0.06, max(row_width * 0.05, 0.01))
+            x_min = float(row["x_min"]) + badge_margin_x
+            x_max = float(row["x_max"]) - badge_margin_x
+            if x_max <= x_min:
+                x_min, x_max = float(row["x_min"]), float(row["x_max"])
+            label_color = colors["selected_cell_color"] if row_label == selected_row_number else "rgba(255,255,255,0.86)"
+            label_border = "2px solid #E5532D" if row_label == selected_row_number else "1px solid #AAB4C3"
+            row_attrs = f" data-edit-select='row' data-row-number='{html.escape(row_label, quote=True)}'" if edit_mode else ""
             for position in positions:
                 if position == "bottom":
-                    label_color = colors["selected_cell_color"] if row_label == selected_row_number else "#bfdbfe"
-                    row_attrs = f" data-edit-select='row' data-row-number='{html.escape(row_label, quote=True)}'" if edit_mode else ""
-                    rect(row["x_min"], row["y_min"] - 0.4, row["x_max"], row["y_min"], label_color, "1px solid #2563eb", row_label, f"Ряд {row_label}", short_label=row_label, vertical=True, extra_attrs=row_attrs)
+                    y_min = float(row["y_min"]) + badge_margin_y
+                    y_max = min(y_min + badge_height, float(row["y_max"]))
                 else:
-                    label_color = colors["selected_cell_color"] if row_label == selected_row_number else "#bfdbfe"
-                    row_attrs = f" data-edit-select='row' data-row-number='{html.escape(row_label, quote=True)}'" if edit_mode else ""
-                    rect(row["x_min"], row["y_max"], row["x_max"], row["y_max"] + 0.4, label_color, "1px solid #2563eb", row_label, f"Ряд {row_label}", short_label=row_label, vertical=True, extra_attrs=row_attrs)
+                    y_max = float(row["y_max"]) - badge_margin_y
+                    y_min = max(float(row["y_min"]), y_max - badge_height)
+                if y_max > y_min:
+                    rect(x_min, y_min, x_max, y_max, label_color, label_border, row_label, f"Ряд {row_label}", short_label=row_label, force_label=True, vertical=True, extra_attrs=row_attrs)
     parts.append("</div>")
     script = f"""
 <script>
