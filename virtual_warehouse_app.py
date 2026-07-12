@@ -90,6 +90,14 @@ from warehouse_zone_boundaries import (
     ensure_zone_boundary_settings,
     set_base_boundaries_from_current_rows,
 )
+from warehouse_zone_boundaries import (
+    ZONE_LABELS,
+    ZONE_ORDER,
+    apply_active_boundaries_to_model,
+    calculate_dynamic_zone_boundaries,
+    ensure_zone_boundary_settings,
+    set_base_boundaries_from_current_rows,
+)
 st.set_page_config(page_title="Симулятор сборки", layout="wide")
 
 APP_BUILD_LABEL = "virtual-excel-only-2026-07-04"
