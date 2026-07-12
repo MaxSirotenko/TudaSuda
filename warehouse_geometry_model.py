@@ -242,7 +242,7 @@ def _row_order_map(row_config: pd.DataFrame | None) -> dict[str, dict[str, Any]]
             "row_group": _display_value(row.get("row_group")),
             "side": _display_value(row.get("side")),
             "comment": _display_value(row.get("comment")),
-            "weight_zone": _display_value(row.get("weight_zone")) if _display_value(row.get("weight_zone")) in {"heavy", "medium", "light", "unassigned"} else "unassigned",
+            "weight_zone": _display_value(row.get("weight_zone")) if _display_value(row.get("weight_zone")) in {"heavy", "medium", "light", "fragile", "unassigned"} else "unassigned",
         }
     return result
 
@@ -485,7 +485,7 @@ def save_geometry_model(model: dict[str, Any]) -> None:
     GEOMETRY_MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
     GEOMETRY_MODEL_PATH.write_text(json.dumps(model, ensure_ascii=False, indent=2), encoding="utf-8")
     GEOMETRY_META_PATH.write_text(json.dumps({"model_type": model.get("model_type"), "model_id": model.get("model_id"), "created_at": model.get("created_at"), "source_file_name": model.get("source_file_name"), "source_sheet_name": model.get("source_sheet_name"), "source_file_hash": model.get("source_file_hash")}, ensure_ascii=False, indent=2), encoding="utf-8")
-    ROW_SETTINGS_PATH.write_text(json.dumps({"model_id": model.get("model_id"), "source_file_hash": model.get("source_file_hash"), "rows": model.get("row_settings", [])}, ensure_ascii=False, indent=2), encoding="utf-8")
+    ROW_SETTINGS_PATH.write_text(json.dumps({"model_id": model.get("model_id"), "source_file_hash": model.get("source_file_hash"), "rows": model.get("row_settings", []), "zone_boundary_settings": model.get("zone_boundary_settings", {})}, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def load_geometry_model() -> dict[str, Any] | None:

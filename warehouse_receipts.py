@@ -27,7 +27,7 @@ CHARACTERISTIC_NAME_ALIASES = ["характеристика", "характер
 BATCH_ALIASES = ["batch", "партия"]
 EXPIRY_DATE_ALIASES = ["expiry_date", "срок годности", "датасрокагодности", "годен до"]
 COMMENT_ALIASES = ["comment", "комментарий", "примечание"]
-WEIGHT_CLASS_ALIASES = ["weight_class", "weight_zone", "весоваякатегория", "весовая категория", "категориявеса", "зонаразмещения", "зона размещения"]
+WEIGHT_CLASS_ALIASES = ["weight_class", "weight_zone", "зона", "весоваякатегория", "весовая категория", "категориявеса", "зонаразмещения", "зона размещения"]
 
 RECEIPT_COLUMNS = [
     "receipt_id",
@@ -81,6 +81,8 @@ def _normalize_weight_class(value: Any) -> str:
         return "medium"
     if text in {"light", "легкое", "легкий"}:
         return "light"
+    if text in {"fragile", "хрупкое", "хрупкий"}:
+        return "fragile"
     return "unclassified"
 
 

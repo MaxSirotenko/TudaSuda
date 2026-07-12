@@ -20,9 +20,9 @@ ADDRESS_ALIASES = ["адрес", "ячейка", "адрес ячейки", "cel
 ROW_ALIASES = ["ряд", "row", "row_number"]
 CELL_ALIASES = ["ячейка", "cell_number", "номер ячейки"]
 TIER_ALIASES = ["ярус", "tier"]
-WEIGHT_CLASS_ALIASES = ["weight_class", "weight_zone", "весоваякатегория", "весовая категория", "категориявеса", "зонаразмещения", "зона размещения"]
-WEIGHT_CLASS_LABELS = {"heavy": "Тяжёлое", "medium": "Среднее", "light": "Лёгкое", "unclassified": "Не классифицировано"}
-WEIGHT_ZONE_LABELS = {"heavy": "Тяжёлое", "medium": "Среднее", "light": "Лёгкое", "unassigned": "Не назначено"}
+WEIGHT_CLASS_ALIASES = ["weight_class", "weight_zone", "зона", "весоваякатегория", "весовая категория", "категориявеса", "зонаразмещения", "зона размещения"]
+WEIGHT_CLASS_LABELS = {"heavy": "Тяжёлое", "medium": "Среднее", "light": "Лёгкое", "fragile": "Хрупкое", "unclassified": "Не классифицировано"}
+WEIGHT_ZONE_LABELS = {"heavy": "Тяжёлое", "medium": "Среднее", "light": "Лёгкое", "fragile": "Хрупкое", "unassigned": "Не назначено"}
 OPTIONAL_ALIASES = {
     "expiry_date": ["дата срока годности", "срок годности", "expiry", "expiry_date"],
     "batch": ["партия", "batch"],
@@ -65,6 +65,8 @@ def normalize_weight_class(value: Any) -> str:
         return "medium"
     if text in {"light", "легкое", "легкий"}:
         return "light"
+    if text in {"fragile", "хрупкое", "хрупкий"}:
+        return "fragile"
     return "unclassified"
 
 
@@ -606,12 +608,12 @@ def _row_zones(model: dict[str, Any]) -> dict[str, str]:
     zones = {}
     for row in model.get("rows", []):
         zone = _display_value(row.get("weight_zone"))
-        zones[_display_value(row.get("row_number"))] = zone if zone in {"heavy", "medium", "light"} else "unassigned"
+        zones[_display_value(row.get("row_number"))] = zone if zone in {"heavy", "medium", "light", "fragile"} else "unassigned"
     return zones
 
 
 def _zone_capacity(model: dict[str, Any], occupied: dict[str, float]) -> dict[str, float]:
-    free = {"heavy": 0.0, "medium": 0.0, "light": 0.0, "unassigned": 0.0}
+    free = {"heavy": 0.0, "medium": 0.0, "light": 0.0, "fragile": 0.0, "unassigned": 0.0}
     for cell in model.get("cells", []):
         zone = _display_value(cell.get("weight_zone")) or "unassigned"
         if zone not in free:
@@ -687,7 +689,7 @@ def calculate_basic_weight_placement(model: dict[str, Any], state: dict[str, Any
         if cell:
             zone = _display_value(cell.get("weight_zone")) or "unassigned"
             placement.update({"cell_key": key, "weight_class": weight_class, "weight_zone": zone, "placement_status": "placed", "placement_mode": "factual" if placement in factual else placement.get("placement_mode", "manual"), "unplaced_reason": ""})
-            if weight_class in {"heavy", "medium", "light"} and zone != weight_class:
+            if weight_class in {"heavy", "medium", "light", "fragile"} and zone != weight_class:
                 placement["zone_mismatch"] = True
                 placement["unplaced_reason"] = "zone_mismatch"
                 zone_mismatches.append({"sku_code": sku, "cell_key": key, "weight_class": weight_class, "weight_zone": zone})
@@ -757,6 +759,7 @@ def calculate_basic_weight_placement(model: dict[str, Any], state: dict[str, Any
         "Размещено heavy": round(sum(_safe_float(p.get("qty_pallets")) for p in placed if p.get("weight_zone") == "heavy"), 4),
         "Размещено medium": round(sum(_safe_float(p.get("qty_pallets")) for p in placed if p.get("weight_zone") == "medium"), 4),
         "Размещено light": round(sum(_safe_float(p.get("qty_pallets")) for p in placed if p.get("weight_zone") == "light"), 4),
+        "Размещено fragile": round(sum(_safe_float(p.get("qty_pallets")) for p in placed if p.get("weight_zone") == "fragile"), 4),
         "Свободная вместимость зон": _zone_capacity(model, occupied),
         "SKU без весовой категории": sorted([sku for sku, cls in sku_classes.items() if cls == "unclassified" and sku not in conflicts]),
         "Ряды без назначенной зоны": unassigned_rows,

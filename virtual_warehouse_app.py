@@ -77,6 +77,14 @@ from warehouse_receipts import (
     read_receipt_table,
     save_receipts_state,
 )
+from warehouse_zone_boundaries import (
+    ZONE_LABELS,
+    ZONE_ORDER,
+    apply_active_boundaries_to_model,
+    calculate_dynamic_zone_boundaries,
+    ensure_zone_boundary_settings,
+    set_base_boundaries_from_current_rows,
+)
 st.set_page_config(page_title="Симулятор сборки", layout="wide")
 
 APP_BUILD_LABEL = "virtual-excel-only-2026-07-04"
@@ -110,7 +118,7 @@ DEFAULT_RENDER_COLOR_SETTINGS = {
     "deep_lane_full_color": "#66BB6A",
 }
 
-WEIGHT_ZONE_LABELS = {"heavy": "Тяжёлое", "medium": "Среднее", "light": "Лёгкое", "unassigned": "Не назначено"}
+WEIGHT_ZONE_LABELS = {"heavy": "Тяжёлое", "medium": "Среднее", "light": "Лёгкое", "fragile": "Хрупкое", "unassigned": "Не назначено"}
 WEIGHT_ZONE_VALUES = list(WEIGHT_ZONE_LABELS)
 WEIGHT_ZONE_LABEL_TO_VALUE = {label: value for value, label in WEIGHT_ZONE_LABELS.items()}
 STORAGE_TYPE_LABELS = {"normal": "Обычная", "deep_lane": "Набивная"}
@@ -802,7 +810,10 @@ def render_inventory_placement(model: dict) -> dict:
             receipts_state, receipts_warning = load_receipts_state(model)
             if receipts_warning:
                 st.warning(receipts_warning)
+            model = apply_active_boundaries_to_model(model)
+            save_geometry_model(model)
             state, basic_diag = calculate_basic_weight_placement(model, state, receipts_state)
+            st.session_state["geometry_model"] = model
             st.session_state["placement_state"] = state
             st.success("Базовое размещение по весовым зонам выполнено.")
             st.dataframe(pd.DataFrame([{"Показатель": key, "Значение": value} for key, value in basic_diag.items() if key != "Неразмещённые позиции"]), use_container_width=True)
@@ -1013,7 +1024,19 @@ def render_receipts_section(model: dict) -> None:
                 st.success("Загруженные приходы очищены.")
                 st.rerun()
             if b3.button("Рассчитать размещение приходов", key="receipt_calculate_stub"):
-                st.info("Алгоритм размещения приходов ещё не реализован. Сейчас можно только загрузить приходы, проверить данные и сохранить их для следующего этапа.")
+                placement_state, placement_warning = load_placement_state(model)
+                if placement_warning:
+                    st.warning(placement_warning)
+                model = apply_active_boundaries_to_model(model)
+                save_geometry_model(model)
+                placement_state, basic_diag = calculate_basic_weight_placement(model, placement_state, state)
+                st.session_state["geometry_model"] = model
+                st.session_state["placement_state"] = placement_state
+                st.success("Размещение приходов рассчитано по активным границам зон.")
+                st.dataframe(pd.DataFrame([{"Показатель": key, "Значение": value} for key, value in basic_diag.items() if key != "Неразмещённые позиции"]), use_container_width=True)
+                if basic_diag.get("Неразмещённые позиции"):
+                    st.dataframe(pd.DataFrame(basic_diag["Неразмещённые позиции"]), use_container_width=True)
+                st.rerun()
 
     with diag_tab:
         st.subheader("Диагностика приходов")
@@ -1138,7 +1161,7 @@ def render_geometry_constructor_tab(saved_model: dict | None) -> None:
     row_config_display["cell_direction"] = row_config_display["cell_direction"].map({"bottom_to_top": "Снизу вверх", "top_to_bottom": "Сверху вниз"}).fillna(row_config_display["cell_direction"])
     if "weight_zone" not in row_config_display.columns:
         row_config_display["weight_zone"] = "unassigned"
-    row_config_display["weight_zone"] = row_config_display["weight_zone"].map({"heavy": "Тяжёлое", "medium": "Среднее", "light": "Лёгкое", "unassigned": "Не назначено"}).fillna("Не назначено")
+    row_config_display["weight_zone"] = row_config_display["weight_zone"].map({"heavy": "Тяжёлое", "medium": "Среднее", "light": "Лёгкое", "fragile": "Хрупкое", "unassigned": "Не назначено"}).fillna("Не назначено")
     row_config = st.data_editor(
         row_config_display,
         num_rows="dynamic",
@@ -1150,7 +1173,7 @@ def render_geometry_constructor_tab(saved_model: dict | None) -> None:
             "row_storage_type": st.column_config.SelectboxColumn("Тип ряда", options=["Обычный ряд", "Набивной ряд"]),
             "deep_lane_width": st.column_config.NumberColumn("Набивных паллетомест", min_value=1, max_value=7, step=1),
             "cell_direction": st.column_config.SelectboxColumn("Направление ячеек", options=["Снизу вверх", "Сверху вниз"]),
-            "weight_zone": st.column_config.SelectboxColumn("Весовая зона", options=["Тяжёлое", "Среднее", "Лёгкое", "Не назначено"]),
+            "weight_zone": st.column_config.SelectboxColumn("Весовая зона", options=["Тяжёлое", "Среднее", "Лёгкое", "Хрупкое", "Не назначено"]),
             "row_group": "Группа рядов",
             "side": "Сторона/зона",
             "comment": "Комментарий",
@@ -1160,7 +1183,7 @@ def render_geometry_constructor_tab(saved_model: dict | None) -> None:
     row_config["cell_direction"] = row_config["cell_direction"].map({"Снизу вверх": "bottom_to_top", "Сверху вниз": "top_to_bottom"}).fillna(row_config["cell_direction"])
     if "weight_zone" not in row_config.columns:
         row_config["weight_zone"] = "Не назначено"
-    row_config["weight_zone"] = row_config["weight_zone"].map({"Тяжёлое": "heavy", "Среднее": "medium", "Лёгкое": "light", "Не назначено": "unassigned"}).fillna("unassigned")
+    row_config["weight_zone"] = row_config["weight_zone"].map({"Тяжёлое": "heavy", "Среднее": "medium", "Лёгкое": "light", "Хрупкое": "fragile", "Не назначено": "unassigned"}).fillna("unassigned")
     st.session_state["geometry_row_config_data"] = row_config
 
     st.subheader("Набивные ряды")
@@ -1319,18 +1342,119 @@ def _model_aisle_config_dataframe(model: dict) -> pd.DataFrame:
 
 
 
+def _boundary_rows(boundaries: dict, zone: str) -> str:
+    boundary = (boundaries or {}).get(zone, {})
+    start = boundary.get("start_row") or "—"
+    end = boundary.get("end_row") or "—"
+    return f"{start}–{end}" if start != "—" or end != "—" else "—"
+
+
+def _boundary_table(model: dict, boundaries: dict) -> pd.DataFrame:
+    rows = []
+    for zone in ZONE_ORDER:
+        boundary = (boundaries or {}).get(zone, {})
+        rows.append({
+            "Зона": ZONE_LABELS.get(zone, zone),
+            "Начальный ряд": boundary.get("start_row", ""),
+            "Конечный ряд": boundary.get("end_row", ""),
+            "Количество рядов": boundary.get("row_count", 0),
+            "Вместимость": boundary.get("capacity", 0),
+        })
+    return pd.DataFrame(rows)
+
+
+def _calculated_boundary_table(model: dict, settings: dict) -> pd.DataFrame:
+    base = settings.get("base_zone_boundaries", {})
+    calculated = settings.get("calculated_zone_boundaries", {})
+    details = settings.get("calculated_zone_diagnostics", {}).get("details", {})
+    rows = []
+    for zone in ZONE_ORDER:
+        base_count = int((base.get(zone, {}) or {}).get("row_count", 0) or 0)
+        calc_count = int((calculated.get(zone, {}) or {}).get("row_count", 0) or 0)
+        detail = details.get(zone, {})
+        rows.append({
+            "Зона": ZONE_LABELS.get(zone, zone),
+            "Базовые границы": _boundary_rows(base, zone),
+            "Рассчитанные границы": _boundary_rows(calculated, zone),
+            "Сдвиг в рядах": calc_count - base_count,
+            "Потребность, паллет": detail.get("receipt_required_pallets", 0),
+            "Фактически занято, паллет": detail.get("factual_occupied_pallets", 0),
+            "Вместимость": detail.get("capacity", (calculated.get(zone, {}) or {}).get("capacity", 0)),
+            "Резерв, %": detail.get("reserve_percent", settings.get("zone_reserve_percent", 0)),
+            "Дефицит": detail.get("deficit", 0),
+            "Статус": detail.get("status", "—"),
+        })
+    return pd.DataFrame(rows)
+
+
+def render_zone_boundaries_editor(model: dict) -> dict:
+    st.subheader("Границы зон размещения")
+    st.caption("Базовые границы задаются вручную. Система может временно расширять и сужать зоны под состав прихода, сохраняя порядок зон и учитывая фактическую занятость склада.")
+    settings = ensure_zone_boundary_settings(model)
+    c1, c2, c3, c4, c5 = st.columns(5)
+    settings["zone_reserve_percent"] = c1.number_input("Резерв зоны, %", min_value=0.0, max_value=100.0, value=float(settings.get("zone_reserve_percent", 0) or 0), step=1.0, key="zone_reserve_percent")
+    minimum_rows = settings.setdefault("minimum_rows", {zone: 1 for zone in ZONE_ORDER})
+    minimum_rows["heavy"] = int(c2.number_input("Мин. рядов: тяжёлое", min_value=0, value=int(minimum_rows.get("heavy", 1)), step=1, key="min_rows_heavy"))
+    minimum_rows["medium"] = int(c3.number_input("Мин. рядов: среднее", min_value=0, value=int(minimum_rows.get("medium", 1)), step=1, key="min_rows_medium"))
+    minimum_rows["light"] = int(c4.number_input("Мин. рядов: лёгкое", min_value=0, value=int(minimum_rows.get("light", 1)), step=1, key="min_rows_light"))
+    minimum_rows["fragile"] = int(c5.number_input("Мин. рядов: хрупкое", min_value=0, value=int(minimum_rows.get("fragile", 1)), step=1, key="min_rows_fragile"))
+
+    left, right = st.columns(2)
+    with left:
+        st.markdown("**Базовые границы**")
+        st.dataframe(_boundary_table(model, settings.get("base_zone_boundaries", {})), use_container_width=True, hide_index=True)
+    with right:
+        st.markdown("**Расчёт под текущий приход**")
+        st.dataframe(_calculated_boundary_table(model, settings), use_container_width=True, hide_index=True)
+
+    b1, b2, b3 = st.columns(3)
+    if b1.button("Рассчитать границы под приход", key="calculate_zone_boundaries"):
+        receipts_state, receipts_warning = load_receipts_state(model)
+        if receipts_warning:
+            st.warning(receipts_warning)
+        placement_state, placement_warning = load_placement_state(model)
+        if placement_warning:
+            st.warning(placement_warning)
+        calculated, diagnostics = calculate_dynamic_zone_boundaries(model, receipts_state, placement_state)
+        settings["calculated_zone_boundaries"] = calculated
+        settings["calculated_zone_diagnostics"] = diagnostics
+        save_geometry_model(model)
+        st.session_state["geometry_model"] = model
+        st.success("Расчётные границы построены. Нажмите «Применить рассчитанные границы», чтобы использовать их при размещении.")
+        st.rerun()
+    if b2.button("Применить рассчитанные границы", key="apply_calculated_zone_boundaries", disabled=not bool(settings.get("calculated_zone_boundaries"))):
+        settings["active_zone_boundaries"] = settings.get("calculated_zone_boundaries", {})
+        model = apply_active_boundaries_to_model(model, settings["active_zone_boundaries"])
+        save_geometry_model(model)
+        st.session_state["geometry_model"] = model
+        st.success("Рассчитанные границы применены. Базовые границы не изменены.")
+        st.rerun()
+    if b3.button("Вернуть базовые границы", key="restore_base_zone_boundaries"):
+        settings["active_zone_boundaries"] = settings.get("base_zone_boundaries", {})
+        model = apply_active_boundaries_to_model(model, settings["active_zone_boundaries"])
+        save_geometry_model(model)
+        st.session_state["geometry_model"] = model
+        st.success("Активные границы возвращены к базовым.")
+        st.rerun()
+    active = settings.get("active_zone_boundaries", {})
+    if active:
+        st.caption("Активные границы: " + "; ".join(f"{ZONE_LABELS.get(zone, zone)} { _boundary_rows(active, zone) }" for zone in ZONE_ORDER))
+    return model
+
+
 def render_weight_zone_editor(model: dict) -> dict:
     st.subheader("Весовые зоны рядов")
-    st.caption("Назначьте рядам зоны «Тяжёлое», «Среднее» или «Лёгкое». При базовом размещении SKU будут использовать только соответствующую зону.")
-    zone_to_label = {"heavy": "Тяжёлое", "medium": "Среднее", "light": "Лёгкое", "unassigned": "Не назначено"}
+    st.caption("Назначьте рядам зоны «Тяжёлое», «Среднее», «Лёгкое» или «Хрупкое». При базовом размещении SKU будут использовать только соответствующую зону.")
+    zone_to_label = {**{zone: ZONE_LABELS[zone] for zone in ZONE_ORDER}, "unassigned": ZONE_LABELS["unassigned"]}
     label_to_zone = {value: key for key, value in zone_to_label.items()}
     rows_df = pd.DataFrame([
         {"row_number": row.get("row_number"), "weight_zone": zone_to_label.get(row.get("weight_zone", "unassigned"), "Не назначено")}
         for row in model.get("rows", [])
     ])
+    zone_options = [ZONE_LABELS[zone] for zone in ZONE_ORDER] + [ZONE_LABELS["unassigned"]]
     selected_rows = st.multiselect("Ряды для массового назначения", rows_df["row_number"].astype(str).tolist() if not rows_df.empty else [], key="weight_zone_bulk_rows")
     z1, z2 = st.columns([1, 2])
-    bulk_zone = z1.selectbox("Назначить зону", ["Тяжёлое", "Среднее", "Лёгкое", "Не назначено"], key="weight_zone_bulk_value")
+    bulk_zone = z1.selectbox("Назначить зону", zone_options, key="weight_zone_bulk_value")
     if z2.button("Применить зону к выбранным рядам", disabled=not selected_rows, key="weight_zone_bulk_apply"):
         rows_df.loc[rows_df["row_number"].astype(str).isin(selected_rows), "weight_zone"] = bulk_zone
     edited = st.data_editor(
@@ -1340,10 +1464,10 @@ def render_weight_zone_editor(model: dict) -> dict:
         key=f"weight_zone_editor_{model.get('model_id', 'model')}",
         column_config={
             "row_number": st.column_config.TextColumn("Номер ряда", disabled=True),
-            "weight_zone": st.column_config.SelectboxColumn("Текущая зона", options=["Тяжёлое", "Среднее", "Лёгкое", "Не назначено"]),
+            "weight_zone": st.column_config.SelectboxColumn("Текущая зона", options=zone_options),
         },
     )
-    if st.button("Сохранить весовые зоны рядов", key="weight_zone_save", type="primary"):
+    if st.button("Сохранить весовые зоны рядов как базовые границы", key="weight_zone_save", type="primary"):
         zone_by_row = {str(row["row_number"]): label_to_zone.get(row["weight_zone"], "unassigned") for _, row in edited.iterrows()}
         for row in model.get("rows", []):
             row["weight_zone"] = zone_by_row.get(str(row.get("row_number")), "unassigned")
@@ -1353,10 +1477,12 @@ def render_weight_zone_editor(model: dict) -> dict:
             cell["weight_zone"] = zone_by_row.get(str(cell.get("row_number")), "unassigned")
         for row_setting in model.get("row_settings", []):
             row_setting["weight_zone"] = zone_by_row.get(str(row_setting.get("row_number")), "unassigned")
+        set_base_boundaries_from_current_rows(model)
         save_geometry_model(model)
         st.session_state["geometry_model"] = model
-        st.success("Весовые зоны рядов сохранены вместе с моделью склада.")
+        st.success("Весовые зоны рядов сохранены как базовые границы модели склада.")
         st.rerun()
+    model = render_zone_boundaries_editor(model)
     return model
 
 def render_active_model_aisle_editor(model: dict) -> dict:
