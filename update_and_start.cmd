@@ -2,7 +2,8 @@
 setlocal EnableExtensions
 
 cd /d "%~dp0"
-set "UPDATE_LOG=%CD%\update_start.log"
+if not exist "%CD%\data\last_import" mkdir "%CD%\data\last_import" >nul 2>&1
+set "UPDATE_LOG=%CD%\data\last_import\update_start.log"
 
 echo ============================================================
 echo Updating TudaSuda from %CD%

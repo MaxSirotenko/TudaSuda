@@ -2,12 +2,18 @@
 setlocal EnableExtensions
 
 cd /d "%~dp0"
-set "UPDATE_LOG=%CD%\update_start.log"
+
+if not exist "%CD%\data\last_import" (
+    mkdir "%CD%\data\last_import" >nul 2>&1
+)
+
+set "UPDATE_LOG=%CD%\data\last_import\update_start.log"
 
 echo ============================================================
 echo Updating TudaSuda from %CD%
 echo Log file: %UPDATE_LOG%
 echo ============================================================
+
 >"%UPDATE_LOG%" echo ============================================================
 >>"%UPDATE_LOG%" echo Updating TudaSuda from %CD%
 >>"%UPDATE_LOG%" echo Log file: %UPDATE_LOG%
@@ -27,7 +33,11 @@ if errorlevel 1 (
 )
 
 set "GIT_DIRTY="
-for /f "usebackq delims=" %%S in (`git status --porcelain 2^>^>"%UPDATE_LOG%"`) do set "GIT_DIRTY=1"
+
+for /f "usebackq delims=" %%S in (`git status --porcelain 2^>^>"%UPDATE_LOG%"`) do (
+    set "GIT_DIRTY=1"
+)
+
 if defined GIT_DIRTY (
     call :log Local changes detected. Skipping update to avoid overwriting your work.
     git status --short >>"%UPDATE_LOG%" 2>&1
@@ -37,6 +47,7 @@ if defined GIT_DIRTY (
 
 call :log Fetching latest code metadata...
 git fetch --prune >>"%UPDATE_LOG%" 2>&1
+
 if errorlevel 1 (
     call :log git fetch failed. Starting local version; see %UPDATE_LOG% for details.
     call "%~dp0start.cmd"
@@ -45,6 +56,7 @@ if errorlevel 1 (
 
 call :log Pulling latest code with fast-forward only...
 git pull --ff-only >>"%UPDATE_LOG%" 2>&1
+
 if errorlevel 1 (
     echo.
     call :fail git pull --ff-only failed. Resolve divergent history or conflicts manually, then run update_start.cmd again. See %UPDATE_LOG%.
