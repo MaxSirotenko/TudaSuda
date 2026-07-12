@@ -67,8 +67,12 @@ from warehouse_inventory_placement import (
 )
 
 from warehouse_receipts import (
+    build_receipt_diagnostics,
+    calculate_receipt_zones,
     clear_receipts_state,
+    default_zone_classification_settings,
     detect_receipt_columns,
+    detect_zone_classification_columns,
     export_receipts_excel_bytes,
     get_receipt_sheet_names,
     load_receipts_state,
@@ -76,6 +80,15 @@ from warehouse_receipts import (
     normalize_receipt_table,
     read_receipt_table,
     save_receipts_state,
+    zone_classification_settings_hash,
+)
+from warehouse_zone_boundaries import (
+    ZONE_LABELS,
+    ZONE_ORDER,
+    apply_active_boundaries_to_model,
+    calculate_dynamic_zone_boundaries,
+    ensure_zone_boundary_settings,
+    set_base_boundaries_from_current_rows,
 )
 from warehouse_zone_boundaries import (
     ZONE_LABELS,
@@ -936,6 +949,12 @@ RECEIPT_TABLE_COLUMNS = {
     "qty_pallets": "Количество паллет",
     "qty_boxes": "Количество коробов",
     "expiry_date": "Срок годности",
+    "source_weight": "Вес",
+    "fragile_flag": "Признак хрупкости",
+    "source_zone": "Исходная зона из 1С",
+    "calculated_zone": "Рассчитанная зона",
+    "zone_calculation_reason": "Причина расчёта",
+    "zone_calculation_status": "Статус расчёта",
     "weight_class": "Зона размещения",
     "placement_status": "Статус размещения",
 }
@@ -947,8 +966,9 @@ def _receipt_dataframe(receipts: list[dict]) -> pd.DataFrame:
         return df
     columns = [column for column in RECEIPT_TABLE_COLUMNS if column in df.columns]
     result = df[columns].copy()
-    if "weight_class" in result.columns:
-        result["weight_class"] = result["weight_class"].map(RECEIPT_WEIGHT_CLASS_LABELS).fillna(result["weight_class"])
+    for zone_column in ["weight_class", "calculated_zone"]:
+        if zone_column in result.columns:
+            result[zone_column] = result[zone_column].map(RECEIPT_WEIGHT_CLASS_LABELS).fillna(result[zone_column])
     if "placement_status" in result.columns:
         result["placement_status"] = result["placement_status"].map(RECEIPT_STATUS_LABELS).fillna(result["placement_status"])
     return result.rename(columns=RECEIPT_TABLE_COLUMNS)
@@ -957,11 +977,44 @@ def _receipt_dataframe(receipts: list[dict]) -> pd.DataFrame:
 def _receipt_zone_summary(receipts: list[dict]) -> dict[str, int]:
     summary = {"heavy": 0, "medium": 0, "light": 0, "fragile": 0, "unclassified": 0}
     for receipt in receipts:
-        weight_class = str(receipt.get("weight_class") or "unclassified")
+        weight_class = str(receipt.get("calculated_zone") or receipt.get("weight_class") or "unclassified")
         if weight_class not in summary:
             weight_class = "unclassified"
         summary[weight_class] += 1
     return summary
+
+
+def _zone_calculation_dataframe(receipts: list[dict]) -> pd.DataFrame:
+    rows = []
+    for receipt in receipts:
+        rows.append({
+            "SKU": receipt.get("sku_code", ""),
+            "Номенклатура": receipt.get("sku_name", ""),
+            "Характеристика": receipt.get("characteristic_name", ""),
+            "Вес": receipt.get("source_weight", ""),
+            "Признак хрупкости": "Да" if receipt.get("fragile_flag") else "Нет",
+            "Исходная зона из 1С": receipt.get("source_zone", ""),
+            "Рассчитанная зона": RECEIPT_WEIGHT_CLASS_LABELS.get(receipt.get("calculated_zone", "unclassified"), receipt.get("calculated_zone", "")),
+            "Причина расчёта": receipt.get("zone_calculation_reason", ""),
+            "Статус": receipt.get("zone_calculation_status", ""),
+        })
+    return pd.DataFrame(rows)
+
+
+def _render_zone_classification_result(state: dict) -> None:
+    diag = state.get("zone_classification_diagnostics", {})
+    if diag:
+        c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
+        c1.metric("Всего SKU", diag.get("Всего SKU", 0))
+        c2.metric("Лёгких SKU", diag.get("Лёгких SKU", 0))
+        c3.metric("Средних SKU", diag.get("Средних SKU", 0))
+        c4.metric("Тяжёлых SKU", diag.get("Тяжёлых SKU", 0))
+        c5.metric("Хрупких SKU", diag.get("Хрупких SKU", 0))
+        c6.metric("Без категории", diag.get("SKU без рассчитанной категории", 0))
+        c7.metric("Конфликтов", diag.get("Конфликтов данных", 0))
+        st.metric("Несовпадений с исходной зоной 1С", diag.get("Несовпадений с исходной зоной 1С", 0))
+    if state.get("receipts"):
+        st.dataframe(_zone_calculation_dataframe(state.get("receipts", [])), use_container_width=True)
 
 
 def _render_receipt_placement_diagnostics(diag: dict | None) -> None:
@@ -1012,6 +1065,7 @@ def render_receipts_section(model: dict) -> None:
             c6, c7, c8, c9, c10 = st.columns(5)
             c11, c12, c13, c14, c15 = st.columns(5)
             c16 = st.columns(1)[0]
+            zone_detected = detect_zone_classification_columns(receipt_df)
             mapping = {
                 "sku_code": c1.selectbox("Код товара", columns, index=columns.index(detected["sku_code"]) if detected["sku_code"] in columns else 0, key="receipt_map_sku"),
                 "sku_name": c2.selectbox("Наименование", columns, index=columns.index(detected["sku_name"]) if detected["sku_name"] in columns else 0, key="receipt_map_name"),
@@ -1022,14 +1076,27 @@ def render_receipts_section(model: dict) -> None:
                 "receipt_number": c7.selectbox("Номер документа", columns, index=columns.index(detected["receipt_number"]) if detected["receipt_number"] in columns else 0, key="receipt_map_number"),
                 "receipt_document": c8.selectbox("Документ прихода", columns, index=columns.index(detected["receipt_document"]) if detected["receipt_document"] in columns else 0, key="receipt_map_document"),
                 "warehouse": c9.selectbox("Склад", columns, index=columns.index(detected["warehouse"]) if detected["warehouse"] in columns else 0, key="receipt_map_warehouse"),
-                "warehouse_zone": c10.selectbox("Зона склада", columns, index=columns.index(detected["warehouse_zone"]) if detected["warehouse_zone"] in columns else 0, key="receipt_map_zone"),
+                "warehouse_zone": c10.selectbox("Складская зона", columns, index=columns.index(detected["warehouse_zone"]) if detected["warehouse_zone"] in columns else 0, key="receipt_map_zone"),
                 "characteristic_code": c11.selectbox("Код характеристики", columns, index=columns.index(detected["characteristic_code"]) if detected["characteristic_code"] in columns else 0, key="receipt_map_char_code"),
                 "characteristic_name": c12.selectbox("Характеристика", columns, index=columns.index(detected["characteristic_name"]) if detected["characteristic_name"] in columns else 0, key="receipt_map_char_name"),
                 "batch": c13.selectbox("Партия", columns, index=columns.index(detected["batch"]) if detected["batch"] in columns else 0, key="receipt_map_batch"),
                 "expiry_date": c14.selectbox("Срок годности", columns, index=columns.index(detected["expiry_date"]) if detected["expiry_date"] in columns else 0, key="receipt_map_expiry"),
                 "comment": c15.selectbox("Комментарий", columns, index=columns.index(detected["comment"]) if detected["comment"] in columns else 0, key="receipt_map_comment"),
-                "weight_class": c16.selectbox("Весовая категория", columns, index=columns.index(detected["weight_class"]) if detected.get("weight_class") in columns else 0, key="receipt_map_weight_class"),
+                "weight_class": None,
             }
+            st.subheader("Правила определения зоны товара")
+            st.caption("Настройте весовые границы и источник признака хрупкости. Система рассчитает категорию каждого SKU перед размещением.")
+            zc1, zc2, zc3 = st.columns(3)
+            mapping["source_weight"] = zc1.selectbox("Колонка с весом товара", columns, index=columns.index(zone_detected["weight_column"]) if zone_detected.get("weight_column") in columns else 0, key="receipt_map_source_weight")
+            mapping["fragile_flag"] = zc2.selectbox("Колонка с признаком хрупкости", columns, index=columns.index(zone_detected["fragile_column"]) if zone_detected.get("fragile_column") in columns else 0, key="receipt_map_fragile_flag")
+            mapping["source_zone"] = zc3.selectbox("Колонка с исходной зоной из 1С", columns, index=columns.index(zone_detected["source_zone_column"]) if zone_detected.get("source_zone_column") in columns else 0, key="receipt_map_source_zone")
+            zw1, zw2 = st.columns(2)
+            max_light_weight = zw1.number_input("Максимальный вес лёгкого товара, кг", min_value=0.0, value=5.0, step=0.1, key="receipt_max_light_weight")
+            max_medium_weight = zw2.number_input("Максимальный вес среднего товара, кг", min_value=0.0, value=15.0, step=0.1, key="receipt_max_medium_weight")
+            zone_settings = default_zone_classification_settings()
+            zone_settings.update({"weight_column": mapping.get("source_weight"), "fragile_column": mapping.get("fragile_flag"), "source_zone_column": mapping.get("source_zone"), "max_light_weight_kg": max_light_weight, "max_medium_weight_kg": max_medium_weight})
+            if max_medium_weight <= max_light_weight:
+                st.error("Максимальный вес среднего товара должен быть строго больше максимального веса лёгкого товара.")
             normalized_receipts, receipt_diagnostics, receipt_messages = normalize_receipt_table_cached(receipt_df.to_json(orient="split", force_ascii=False), json.dumps(mapping, ensure_ascii=False))
             if receipt_messages:
                 st.dataframe(pd.DataFrame(receipt_messages), use_container_width=True)
@@ -1039,7 +1106,10 @@ def render_receipts_section(model: dict) -> None:
                 elif not replace_current and receipts:
                     st.error("Подтвердите замену текущих загруженных приходов или очистите их вручную.")
                 else:
-                    new_state = make_receipts_state(model, receipt_file.name, receipt_hash, normalized_receipts, receipt_diagnostics, mapping)
+                    if max_medium_weight <= max_light_weight:
+                        st.error("Исправьте границы веса перед загрузкой приходов.")
+                        return
+                    new_state = make_receipts_state(model, receipt_file.name, receipt_hash, normalized_receipts, receipt_diagnostics, mapping, zone_settings)
                     save_receipts_state(new_state)
                     st.success("Приходы загружены и сохранены. Все строки имеют статус ‘Не размещено’.")
                     st.rerun()
@@ -1049,6 +1119,59 @@ def render_receipts_section(model: dict) -> None:
             st.info("Загруженных приходов пока нет. Кнопка «Рассчитать размещение приходов» появится после загрузки Excel с приходами.")
         else:
             st.dataframe(_receipt_dataframe(receipts), use_container_width=True)
+            st.subheader("Правила определения зоны товара")
+            st.caption("Настройте весовые границы и источник признака хрупкости. Система рассчитает категорию каждого SKU перед размещением.")
+            stored_zone_settings = {**default_zone_classification_settings(), **state.get("zone_classification_settings", {})}
+            st.caption(
+                "Колонка веса: "
+                f"{stored_zone_settings.get('weight_column') or 'не выбрана'} · "
+                "признак хрупкости: "
+                f"{stored_zone_settings.get('fragile_column') or 'не выбран'} · "
+                "исходная зона 1С: "
+                f"{stored_zone_settings.get('source_zone_column') or 'не выбрана'}"
+            )
+            zw1, zw2 = st.columns(2)
+            current_light_limit = zw1.number_input(
+                "Максимальный вес лёгкого товара, кг",
+                min_value=0.0,
+                value=float(stored_zone_settings.get("max_light_weight_kg", 5.0) or 0.0),
+                step=0.1,
+                key="receipt_data_max_light_weight",
+            )
+            current_medium_limit = zw2.number_input(
+                "Максимальный вес среднего товара, кг",
+                min_value=0.0,
+                value=float(stored_zone_settings.get("max_medium_weight_kg", 15.0) or 0.0),
+                step=0.1,
+                key="receipt_data_max_medium_weight",
+            )
+            current_zone_settings = {
+                **stored_zone_settings,
+                "max_light_weight_kg": current_light_limit,
+                "max_medium_weight_kg": current_medium_limit,
+            }
+            current_settings_hash = zone_classification_settings_hash(current_zone_settings)
+            saved_settings_hash = stored_zone_settings.get("settings_hash") or state.get("zone_classification_diagnostics", {}).get("settings_hash")
+            if saved_settings_hash and saved_settings_hash != current_settings_hash:
+                st.warning("Границы веса изменились. Старый расчёт зон товаров устарел — нажмите «Рассчитать зоны товаров» повторно.")
+            if current_medium_limit <= current_light_limit:
+                st.error("Максимальный вес среднего товара должен быть строго больше максимального веса лёгкого товара.")
+            if st.button("Рассчитать зоны товаров", key="receipt_zone_calculate_button"):
+                if current_medium_limit <= current_light_limit:
+                    st.error("Исправьте границы веса перед расчётом зон товаров.")
+                else:
+                    updated_receipts, zone_diag = calculate_receipt_zones(receipts, current_zone_settings)
+                    current_zone_settings["settings_hash"] = zone_diag.get("settings_hash", current_settings_hash)
+                    current_zone_settings["calculated_at"] = pd.Timestamp.now(tz="UTC").isoformat()
+                    state["receipts"] = updated_receipts
+                    state["zone_classification_settings"] = current_zone_settings
+                    state["zone_classification_diagnostics"] = zone_diag
+                    state["diagnostics"] = build_receipt_diagnostics(updated_receipts, len(updated_receipts))
+                    save_receipts_state(state)
+                    st.success("Зоны товаров рассчитаны. Размещение будет использовать только рассчитанную зону, а исходная зона 1С останется для сравнения.")
+                    st.rerun()
+            _render_zone_classification_result(state)
+            receipts = state.get("receipts", [])
             zone_summary = _receipt_zone_summary(receipts)
             classified = len(receipts) - zone_summary.get("unclassified", 0)
             z1, z2, z3, z4, z5 = st.columns(5)
@@ -1058,9 +1181,9 @@ def render_receipts_section(model: dict) -> None:
             z4.metric("Среднее/лёгкое", zone_summary.get("medium", 0) + zone_summary.get("light", 0))
             z5.metric("Хрупкое", zone_summary.get("fragile", 0))
             if classified == 0:
-                st.error("В приходах не определена зона размещения. Для расчёта нужна колонка «Зона» / weight_class со значениями: Тяжёлое, Среднее, Лёгкое или Хрупкое. Без этой колонки алгоритм оставит строки неразмещёнными с причиной missing_weight_class.")
+                st.error("Зоны товаров ещё не рассчитаны или все SKU без категории. Настройте правила и нажмите «Рассчитать зоны товаров». Исходная зона 1С используется только для сравнения.")
             elif zone_summary.get("unclassified", 0):
-                st.warning("У части строк прихода нет зоны размещения. Эти строки не будут размещены автоматически.")
+                st.warning("У части строк прихода нет рассчитанной зоны. Эти строки не будут размещены автоматически и получат причину missing_calculated_zone.")
             st.caption("Чтобы приходы появились на карте, нажмите «Рассчитать размещение приходов». Расчёт запишет placements.json и обновит занятость ячеек на вкладке «Карта склада».")
             b1, b2, b3 = st.columns(3)
             b1.download_button("Скачать загруженные приходы", export_receipts_excel_bytes(state), file_name="receipts.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
@@ -1069,6 +1192,15 @@ def render_receipts_section(model: dict) -> None:
                 st.success("Загруженные приходы очищены.")
                 st.rerun()
             if b3.button("Рассчитать размещение приходов", key="receipt_calculate_stub", type="primary"):
+                if current_medium_limit <= current_light_limit:
+                    st.error("Исправьте границы веса и пересчитайте зоны товаров перед размещением.")
+                    return
+                if classified == 0:
+                    st.error("Сначала нажмите «Рассчитать зоны товаров». Размещение не использует исходную зону 1С как fallback.")
+                    return
+                if saved_settings_hash and saved_settings_hash != current_settings_hash:
+                    st.error("Расчёт зон товаров устарел после изменения границ веса. Пересчитайте зоны товаров перед размещением.")
+                    return
                 placement_state, placement_warning = load_placement_state(model)
                 if placement_warning:
                     st.warning(placement_warning)
@@ -2189,4 +2321,3 @@ def main() -> None:
 
 if __name__ == "__main__" or get_script_run_ctx(suppress_warning=True) is not None:
     main()
-

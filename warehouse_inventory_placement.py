@@ -586,7 +586,8 @@ def _sku_weight_classes(items: list[dict[str, Any]]) -> tuple[dict[str, str], di
         sku = _display_value(item.get("sku_code"))
         if not sku:
             continue
-        weight_class = normalize_weight_class(item.get("weight_class"))
+        weight_class_source = item.get("calculated_zone") if "calculated_zone" in item else item.get("weight_class")
+        weight_class = normalize_weight_class(weight_class_source)
         if weight_class != "unclassified":
             values.setdefault(sku, set()).add(weight_class)
     classes: dict[str, str] = {}
@@ -630,6 +631,12 @@ def _unplaced_record(item: dict[str, Any], qty: float, reason: str, source: str,
         "characteristic_code": _display_value(item.get("characteristic_code")),
         "characteristic_name": _display_value(item.get("characteristic_name")) or _display_value(item.get("characteristic")),
         "weight_class": weight_class,
+        "source_zone": _display_value(item.get("source_zone")),
+        "calculated_zone": _display_value(item.get("calculated_zone")) or weight_class,
+        "zone_calculation_reason": _display_value(item.get("zone_calculation_reason")),
+        "source_weight": _display_value(item.get("source_weight")),
+        "fragile_flag": bool(item.get("fragile_flag")),
+        "zone_calculation_status": _display_value(item.get("zone_calculation_status")),
         "cell_key": "",
         "row_number": "",
         "cell_number": "",
@@ -647,6 +654,12 @@ def _basic_placement_record(item: dict[str, Any], cell: dict[str, Any], qty: flo
     placement = _placement_record({**item, "weight_class": weight_class}, cell, qty, source, "estimated" if mode != "factual" else "exact", mode, "Базовое механическое размещение")
     placement.update({
         "weight_class": weight_class,
+        "source_zone": _display_value(item.get("source_zone")),
+        "calculated_zone": _display_value(item.get("calculated_zone")) or weight_class,
+        "zone_calculation_reason": _display_value(item.get("zone_calculation_reason")),
+        "source_weight": _display_value(item.get("source_weight")),
+        "fragile_flag": bool(item.get("fragile_flag")),
+        "zone_calculation_status": _display_value(item.get("zone_calculation_status")),
         "weight_zone": _display_value(cell.get("weight_zone")) or "unassigned",
         "placement_status": "placed" if not reason else "error",
         "placement_mode": mode,
@@ -708,7 +721,8 @@ def calculate_basic_weight_placement(model: dict[str, Any], state: dict[str, Any
             unplaced.append(_unplaced_record(item, total_qty, "conflicting_weight_class", source, weight_class))
             return
         if weight_class == "unclassified":
-            unplaced.append(_unplaced_record(item, total_qty, "missing_weight_class", source, weight_class))
+            reason = "missing_calculated_zone" if "calculated_zone" in item else "missing_weight_class"
+            unplaced.append(_unplaced_record(item, total_qty, reason, source, weight_class))
             return
         zone_cells = [cell for cell in ordered_cells if cell.get("weight_zone") == weight_class]
         if not zone_cells:

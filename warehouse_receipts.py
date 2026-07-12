@@ -27,7 +27,10 @@ CHARACTERISTIC_NAME_ALIASES = ["характеристика", "характер
 BATCH_ALIASES = ["batch", "партия"]
 EXPIRY_DATE_ALIASES = ["expiry_date", "срок годности", "датасрокагодности", "годен до"]
 COMMENT_ALIASES = ["comment", "комментарий", "примечание"]
-WEIGHT_CLASS_ALIASES = ["weight_class", "weight_zone", "зона", "весоваякатегория", "весовая категория", "категориявеса", "зонаразмещения", "зона размещения"]
+WEIGHT_CLASS_ALIASES = ["weight_class", "weight_zone", "весоваякатегория", "весовая категория", "категориявеса", "зонаразмещения", "зона размещения"]
+WEIGHT_ALIASES = ["weight_kg", "weight", "вес", "вескг", "вес, кг", "вес товара", "вес брутто", "масса"]
+FRAGILE_ALIASES = ["fragile", "is_fragile", "хрупкое", "хрупкий", "признакхрупкости", "признак хрупкости"]
+SOURCE_ZONE_ALIASES = ["source_zone", "зона", "зона 1с", "исходная зона", "исходная зона 1с"]
 
 RECEIPT_COLUMNS = [
     "receipt_id",
@@ -49,6 +52,12 @@ RECEIPT_COLUMNS = [
     "placement_mode",
     "comment",
     "weight_class",
+    "source_zone",
+    "calculated_zone",
+    "zone_calculation_reason",
+    "source_weight",
+    "fragile_flag",
+    "zone_calculation_status",
 ]
 
 
@@ -84,6 +93,106 @@ def _normalize_weight_class(value: Any) -> str:
     if text in {"fragile", "хрупкое", "хрупкий"}:
         return "fragile"
     return "unclassified"
+
+
+
+def _truthy_flag(value: Any) -> bool:
+    text = _clean_label(value).replace(" ", "")
+    return text in {"1", "true", "yes", "y", "да", "истина", "хрупкое", "хрупкий", "fragile"}
+
+
+def default_zone_classification_settings() -> dict[str, Any]:
+    return {
+        "weight_column": None,
+        "fragile_column": None,
+        "source_zone_column": None,
+        "max_light_weight_kg": 5.0,
+        "max_medium_weight_kg": 15.0,
+        "calculated_at": "",
+        "settings_hash": "",
+    }
+
+
+def zone_classification_settings_hash(settings: dict[str, Any]) -> str:
+    payload = {
+        "max_light_weight_kg": _safe_float(settings.get("max_light_weight_kg")),
+        "max_medium_weight_kg": _safe_float(settings.get("max_medium_weight_kg")),
+    }
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+def detect_zone_classification_columns(df: pd.DataFrame) -> dict[str, str | None]:
+    columns = [str(col) for col in df.columns]
+    return {
+        "weight_column": _find_column(columns, WEIGHT_ALIASES),
+        "fragile_column": _find_column(columns, FRAGILE_ALIASES),
+        "source_zone_column": _find_column(columns, SOURCE_ZONE_ALIASES),
+    }
+
+
+def _calculated_zone_for(weight: float | None, fragile: bool, light_limit: float, medium_limit: float) -> tuple[str, str]:
+    if fragile:
+        return "fragile", "Признак хрупкости"
+    if weight is None:
+        return "unclassified", "Вес отсутствует"
+    if weight <= light_limit:
+        return "light", "Вес входит в диапазон лёгкого"
+    if weight <= medium_limit:
+        return "medium", "Вес входит в диапазон среднего"
+    return "heavy", "Вес выше границы среднего"
+
+
+def calculate_receipt_zones(receipts: list[dict[str, Any]], settings: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    light_limit = _safe_float(settings.get("max_light_weight_kg"), 0.0)
+    medium_limit = _safe_float(settings.get("max_medium_weight_kg"), 0.0)
+    rows = [dict(item) for item in receipts]
+    by_sku: dict[str, dict[str, set[Any]]] = {}
+    for item in rows:
+        sku = _display_value(item.get("sku_code"))
+        if not sku:
+            continue
+        weight_text = _display_value(item.get("source_weight"))
+        fragile = bool(item.get("fragile_flag"))
+        by_sku.setdefault(sku, {"weights": set(), "fragile": set()})
+        by_sku[sku]["weights"].add(weight_text)
+        by_sku[sku]["fragile"].add(fragile)
+    conflicts = {sku for sku, values in by_sku.items() if len(values["weights"]) > 1 or len(values["fragile"]) > 1}
+    sku_result: dict[str, tuple[str, str, str]] = {}
+    for sku, values in by_sku.items():
+        if sku in conflicts:
+            sku_result[sku] = ("unclassified", "Конфликт данных SKU", "conflict")
+            continue
+        raw_weight = next(iter(values["weights"]), "")
+        weight = None if raw_weight == "" else _safe_float(raw_weight, None)
+        fragile = next(iter(values["fragile"]), False)
+        zone, reason = _calculated_zone_for(weight, fragile, light_limit, medium_limit)
+        status = "ok" if zone != "unclassified" else "error"
+        sku_result[sku] = (zone, reason, status)
+    mismatches = 0
+    for item in rows:
+        sku = _display_value(item.get("sku_code"))
+        zone, reason, status = sku_result.get(sku, ("unclassified", "Вес отсутствует", "error"))
+        source_zone = _normalize_weight_class(item.get("source_zone"))
+        if source_zone != "unclassified" and source_zone != zone:
+            mismatches += 1
+        item["calculated_zone"] = zone
+        item["weight_class"] = zone
+        item["zone_calculation_reason"] = reason
+        item["zone_calculation_status"] = status if source_zone in {"unclassified", zone} else "mismatch"
+    sku_zones = {sku: result[0] for sku, result in sku_result.items()}
+    diagnostics = {
+        "Всего SKU": len(sku_zones),
+        "Лёгких SKU": sum(1 for value in sku_zones.values() if value == "light"),
+        "Средних SKU": sum(1 for value in sku_zones.values() if value == "medium"),
+        "Тяжёлых SKU": sum(1 for value in sku_zones.values() if value == "heavy"),
+        "Хрупких SKU": sum(1 for value in sku_zones.values() if value == "fragile"),
+        "SKU без рассчитанной категории": sum(1 for value in sku_zones.values() if value == "unclassified"),
+        "Конфликтов данных": len(conflicts),
+        "Несовпадений с исходной зоной 1С": mismatches,
+        "conflicts": sorted(conflicts),
+        "settings_hash": zone_classification_settings_hash(settings),
+    }
+    return rows, diagnostics
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -148,6 +257,9 @@ def detect_receipt_columns(df: pd.DataFrame) -> dict[str, str | None]:
         "expiry_date": _find_column(columns, EXPIRY_DATE_ALIASES),
         "comment": _find_column(columns, COMMENT_ALIASES),
         "weight_class": _find_column(columns, WEIGHT_CLASS_ALIASES),
+        "source_zone": _find_column(columns, SOURCE_ZONE_ALIASES),
+        "source_weight": _find_column(columns, WEIGHT_ALIASES),
+        "fragile_flag": _find_column(columns, FRAGILE_ALIASES),
     }
 
 
@@ -183,7 +295,13 @@ def normalize_receipt_table(df: pd.DataFrame, mapping: dict[str, str | None]) ->
             "placement_status": "not_placed",
             "placement_mode": "not_calculated",
             "comment": _display_value(row.get(mapping.get("comment"))) if mapping.get("comment") else "",
-            "weight_class": _normalize_weight_class(row.get(mapping.get("weight_class"))) if mapping.get("weight_class") else "unclassified",
+            "weight_class": "unclassified",
+            "source_zone": _display_value(row.get(mapping.get("source_zone"))) if mapping.get("source_zone") else (_display_value(row.get(mapping.get("weight_class"))) if mapping.get("weight_class") else ""),
+            "calculated_zone": "unclassified",
+            "zone_calculation_reason": "Вес отсутствует",
+            "source_weight": _display_value(row.get(mapping.get("source_weight"))) if mapping.get("source_weight") else "",
+            "fragile_flag": _truthy_flag(row.get(mapping.get("fragile_flag"))) if mapping.get("fragile_flag") else False,
+            "zone_calculation_status": "not_calculated",
         }
         rows.append(receipt)
     result = pd.DataFrame(rows, columns=RECEIPT_COLUMNS)
@@ -240,10 +358,12 @@ def empty_receipts_state(model: dict[str, Any] | None = None) -> dict[str, Any]:
         "receipts": [],
         "diagnostics": build_receipt_diagnostics([], 0),
         "column_mapping": {},
+        "zone_classification_settings": default_zone_classification_settings(),
+        "zone_classification_diagnostics": {},
     }
 
 
-def make_receipts_state(model: dict[str, Any], source_file_name: str, source_file_hash: str, receipts_df: pd.DataFrame, diagnostics: dict[str, Any], column_mapping: dict[str, str | None]) -> dict[str, Any]:
+def make_receipts_state(model: dict[str, Any], source_file_name: str, source_file_hash: str, receipts_df: pd.DataFrame, diagnostics: dict[str, Any], column_mapping: dict[str, str | None], zone_classification_settings: dict[str, Any] | None = None) -> dict[str, Any]:
     now = _now_iso()
     return {
         "model_id": model.get("model_id"),
@@ -254,6 +374,8 @@ def make_receipts_state(model: dict[str, Any], source_file_name: str, source_fil
         "receipts": receipts_df.to_dict("records"),
         "diagnostics": diagnostics,
         "column_mapping": column_mapping,
+        "zone_classification_settings": zone_classification_settings or default_zone_classification_settings(),
+        "zone_classification_diagnostics": {},
     }
 
 
@@ -266,6 +388,8 @@ def load_receipts_state(model: dict[str, Any] | None = None) -> tuple[dict[str, 
         return empty_receipts_state(model), "Файл receipts.json повреждён и не был загружен."
     state.setdefault("receipts", [])
     state.setdefault("diagnostics", build_receipt_diagnostics(state.get("receipts", []), len(state.get("receipts", []))))
+    state.setdefault("zone_classification_settings", default_zone_classification_settings())
+    state.setdefault("zone_classification_diagnostics", {})
     state.setdefault("column_mapping", {})
     warning = None
     if model and state.get("model_id") and state.get("model_id") != model.get("model_id"):
