@@ -813,7 +813,7 @@ def render_inventory_placement(model: dict) -> dict:
             model = apply_active_boundaries_to_model(model)
             save_geometry_model(model)
             state, basic_diag = calculate_basic_weight_placement(model, state, receipts_state)
-            st.session_state["geometry_model"] = model
+            st.session_state["geometry_model"] = attach_placements_to_model(model, state)
             st.session_state["placement_state"] = state
             st.success("Базовое размещение по весовым зонам выполнено.")
             st.dataframe(pd.DataFrame([{"Показатель": key, "Значение": value} for key, value in basic_diag.items() if key != "Неразмещённые позиции"]), use_container_width=True)
@@ -1014,23 +1014,24 @@ def render_receipts_section(model: dict) -> None:
 
     with data_tab:
         if not receipts:
-            st.info("Загруженных приходов пока нет.")
+            st.info("Загруженных приходов пока нет. Кнопка «Рассчитать размещение приходов» появится после загрузки Excel с приходами.")
         else:
             st.dataframe(_receipt_dataframe(receipts), use_container_width=True)
+            st.caption("Чтобы приходы появились на карте, нажмите «Рассчитать размещение приходов». Расчёт запишет placements.json и обновит занятость ячеек на вкладке «Карта склада».")
             b1, b2, b3 = st.columns(3)
             b1.download_button("Скачать загруженные приходы", export_receipts_excel_bytes(state), file_name="receipts.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
             if b2.button("Очистить загруженные приходы", key="receipt_clear_button"):
                 clear_receipts_state()
                 st.success("Загруженные приходы очищены.")
                 st.rerun()
-            if b3.button("Рассчитать размещение приходов", key="receipt_calculate_stub"):
+            if b3.button("Рассчитать размещение приходов", key="receipt_calculate_stub", type="primary"):
                 placement_state, placement_warning = load_placement_state(model)
                 if placement_warning:
                     st.warning(placement_warning)
                 model = apply_active_boundaries_to_model(model)
                 save_geometry_model(model)
                 placement_state, basic_diag = calculate_basic_weight_placement(model, placement_state, state)
-                st.session_state["geometry_model"] = model
+                st.session_state["geometry_model"] = attach_placements_to_model(model, placement_state)
                 st.session_state["placement_state"] = placement_state
                 st.success("Размещение приходов рассчитано по активным границам зон.")
                 st.dataframe(pd.DataFrame([{"Показатель": key, "Значение": value} for key, value in basic_diag.items() if key != "Неразмещённые позиции"]), use_container_width=True)
@@ -1954,6 +1955,12 @@ def render_map_edit_panel(model: dict) -> dict:
 def render_geometry_map_view(model: dict) -> None:
     st.subheader("Карта склада")
     st.caption("Используйте кнопки масштаба, колесо мыши и перетаскивание для навигации по карте. Переключение вкладок не перестраивает склад и не сбрасывает ручные правки.")
+    placement_state, placement_warning = load_placement_state(model)
+    if placement_warning:
+        st.warning(placement_warning)
+    elif placement_state.get("placements"):
+        model = attach_placements_to_model(model, placement_state)
+        st.caption("На карте показана занятость из сохранённого placements.json, включая рассчитанные приходы.")
     _model_summary_metrics(model)
     model = render_map_edit_panel(model)
     control_left, control_right = st.columns([1, 2])
