@@ -919,6 +919,14 @@ RECEIPT_STATUS_LABELS = {
     "error": "Ошибка",
 }
 
+RECEIPT_WEIGHT_CLASS_LABELS = {
+    "heavy": "Тяжёлое",
+    "medium": "Среднее",
+    "light": "Лёгкое",
+    "fragile": "Хрупкое",
+    "unclassified": "Не классифицировано",
+}
+
 RECEIPT_TABLE_COLUMNS = {
     "receipt_date": "Дата прихода",
     "receipt_document": "Документ прихода",
@@ -928,6 +936,7 @@ RECEIPT_TABLE_COLUMNS = {
     "qty_pallets": "Количество паллет",
     "qty_boxes": "Количество коробов",
     "expiry_date": "Срок годности",
+    "weight_class": "Зона размещения",
     "placement_status": "Статус размещения",
 }
 
@@ -938,9 +947,32 @@ def _receipt_dataframe(receipts: list[dict]) -> pd.DataFrame:
         return df
     columns = [column for column in RECEIPT_TABLE_COLUMNS if column in df.columns]
     result = df[columns].copy()
+    if "weight_class" in result.columns:
+        result["weight_class"] = result["weight_class"].map(RECEIPT_WEIGHT_CLASS_LABELS).fillna(result["weight_class"])
     if "placement_status" in result.columns:
         result["placement_status"] = result["placement_status"].map(RECEIPT_STATUS_LABELS).fillna(result["placement_status"])
     return result.rename(columns=RECEIPT_TABLE_COLUMNS)
+
+
+def _receipt_zone_summary(receipts: list[dict]) -> dict[str, int]:
+    summary = {"heavy": 0, "medium": 0, "light": 0, "fragile": 0, "unclassified": 0}
+    for receipt in receipts:
+        weight_class = str(receipt.get("weight_class") or "unclassified")
+        if weight_class not in summary:
+            weight_class = "unclassified"
+        summary[weight_class] += 1
+    return summary
+
+
+def _render_receipt_placement_diagnostics(diag: dict | None) -> None:
+    if not diag:
+        return
+    st.subheader("Результат расчёта размещения приходов")
+    st.dataframe(pd.DataFrame([{"Показатель": key, "Значение": value} for key, value in diag.items() if key != "Неразмещённые позиции"]), use_container_width=True)
+    unplaced = diag.get("Неразмещённые позиции") or []
+    if unplaced:
+        st.warning("Часть приходов не размещена. Смотрите причину в колонке unplaced_reason.")
+        st.dataframe(pd.DataFrame(unplaced), use_container_width=True)
 
 
 def render_receipts_section(model: dict) -> None:
@@ -1017,6 +1049,18 @@ def render_receipts_section(model: dict) -> None:
             st.info("Загруженных приходов пока нет. Кнопка «Рассчитать размещение приходов» появится после загрузки Excel с приходами.")
         else:
             st.dataframe(_receipt_dataframe(receipts), use_container_width=True)
+            zone_summary = _receipt_zone_summary(receipts)
+            classified = len(receipts) - zone_summary.get("unclassified", 0)
+            z1, z2, z3, z4, z5 = st.columns(5)
+            z1.metric("С зоной", classified)
+            z2.metric("Без зоны", zone_summary.get("unclassified", 0))
+            z3.metric("Тяжёлое", zone_summary.get("heavy", 0))
+            z4.metric("Среднее/лёгкое", zone_summary.get("medium", 0) + zone_summary.get("light", 0))
+            z5.metric("Хрупкое", zone_summary.get("fragile", 0))
+            if classified == 0:
+                st.error("В приходах не определена зона размещения. Для расчёта нужна колонка «Зона» / weight_class со значениями: Тяжёлое, Среднее, Лёгкое или Хрупкое. Без этой колонки алгоритм оставит строки неразмещёнными с причиной missing_weight_class.")
+            elif zone_summary.get("unclassified", 0):
+                st.warning("У части строк прихода нет зоны размещения. Эти строки не будут размещены автоматически.")
             st.caption("Чтобы приходы появились на карте, нажмите «Рассчитать размещение приходов». Расчёт запишет placements.json и обновит занятость ячеек на вкладке «Карта склада».")
             b1, b2, b3 = st.columns(3)
             b1.download_button("Скачать загруженные приходы", export_receipts_excel_bytes(state), file_name="receipts.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
@@ -1033,11 +1077,11 @@ def render_receipts_section(model: dict) -> None:
                 placement_state, basic_diag = calculate_basic_weight_placement(model, placement_state, state)
                 st.session_state["geometry_model"] = attach_placements_to_model(model, placement_state)
                 st.session_state["placement_state"] = placement_state
-                st.success("Размещение приходов рассчитано по активным границам зон.")
-                st.dataframe(pd.DataFrame([{"Показатель": key, "Значение": value} for key, value in basic_diag.items() if key != "Неразмещённые позиции"]), use_container_width=True)
-                if basic_diag.get("Неразмещённые позиции"):
-                    st.dataframe(pd.DataFrame(basic_diag["Неразмещённые позиции"]), use_container_width=True)
-                st.rerun()
+                st.session_state["last_receipt_placement_diag"] = basic_diag
+                st.success("Размещение приходов рассчитано по активным границам зон. Если строки не попали на карту, смотрите таблицу причин ниже.")
+                _render_receipt_placement_diagnostics(basic_diag)
+            elif st.session_state.get("last_receipt_placement_diag"):
+                _render_receipt_placement_diagnostics(st.session_state.get("last_receipt_placement_diag"))
 
     with diag_tab:
         st.subheader("Диагностика приходов")
