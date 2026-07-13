@@ -1814,8 +1814,52 @@ def _save_map_edit_snapshot(model: dict) -> None:
 
 def _persist_map_edit(model: dict, message: str) -> None:
     save_geometry_model(model)
+    if RENDER_CACHE_PATH.exists():
+        RENDER_CACHE_PATH.unlink()
+    prepare_render_cache_cached.clear()
     st.session_state["geometry_model"] = model
     st.success(message)
+
+
+def _physical_slots_for_cell(cell: dict, capacity: int) -> list[dict]:
+    if capacity <= 1:
+        return []
+    x_min = float(cell.get("x_min", 0) or 0)
+    x_max = float(cell.get("x_max", x_min) or x_min)
+    y_min = float(cell.get("y_min", 0) or 0)
+    y_max = float(cell.get("y_max", y_min) or y_min)
+    slot_width = (x_max - x_min) / capacity if capacity else 0
+    return [
+        {
+            "slot_index": slot_index,
+            "x_min": x_min + (slot_index - 1) * slot_width,
+            "x_max": x_min + slot_index * slot_width,
+            "y_min": y_min,
+            "y_max": y_max,
+            "capacity_pallets": 1,
+        }
+        for slot_index in range(1, capacity + 1)
+    ]
+
+
+def _apply_row_storage_geometry(model: dict, row_number: str, storage_type: str, capacity: float) -> None:
+    logical_capacity = max(1, int(round(capacity))) if storage_type == "deep_lane" else 1
+    row_cells = [cell for cell in model.get("cells", []) if str(cell.get("row_number")) == str(row_number)]
+    for cell in row_cells:
+        cell["storage_type"] = storage_type
+        cell["deep_lane_width"] = logical_capacity
+        cell["capacity_pallets"] = logical_capacity
+        cell["physical_slots"] = _physical_slots_for_cell(cell, logical_capacity) if storage_type == "deep_lane" else []
+    for row in model.get("rows", []):
+        if str(row.get("row_number")) == str(row_number):
+            row["row_storage_type"] = storage_type
+            row["deep_lane_width"] = logical_capacity
+            row["capacity_pallets"] = logical_capacity * len(row_cells)
+            row["cells_count"] = len(row_cells)
+    for setting in model.get("row_settings", []):
+        if str(setting.get("row_number")) == str(row_number):
+            setting["row_storage_type"] = storage_type
+            setting["deep_lane_width"] = logical_capacity
 
 
 def _cell_options(model: dict) -> dict[str, str]:
@@ -2099,24 +2143,29 @@ def render_map_edit_panel(model: dict) -> dict:
         new_direction = select_internal("Направление", DIRECTION_LABELS, str(row.get("cell_direction", "bottom_to_top")), key="map_row_direction", container=r3)
         new_zone = select_internal("Весовая зона", WEIGHT_ZONE_LABELS, str(row.get("weight_zone", "unassigned")), key="map_row_zone", container=r4)
         new_storage = select_internal("Тип хранения ряда", ROW_STORAGE_TYPE_LABELS, str(row.get("row_storage_type", "normal")), key="map_row_storage")
-        row_capacity = st.number_input("Массовая вместимость ячеек ряда", min_value=0.0, value=float(row_cells[0].get("capacity_pallets", 1) if row_cells else 1), step=1.0, key="map_row_capacity")
+        row_capacity = st.number_input("Массовая вместимость ячеек ряда", min_value=1.0, value=float(row_cells[0].get("capacity_pallets", 1) if row_cells else 1), step=1.0, key="map_row_capacity")
+        target_capacity = max(1, int(round(row_capacity))) if new_storage == "deep_lane" else 1
         if st.button("Применить изменения ряда", key="map_row_apply"):
             if new_row_number != row_number and any(str(r.get("row_number")) == new_row_number for r in model.get("rows", [])):
                 st.error("Ряд с таким номером уже существует.")
-            elif any(_occupied_for_cell(model, _map_cell_key(c)) > row_capacity for c in row_cells):
+            elif any(_occupied_for_cell(model, _map_cell_key(c)) > target_capacity for c in row_cells):
                 st.error("Нельзя уменьшить вместимость ниже занятого количества паллет.")
             else:
                 _save_map_edit_snapshot(model)
                 for r in model.get("rows", []):
                     if str(r.get("row_number")) == row_number:
-                        r.update({"row_number": new_row_number, "row_order": new_order, "cell_direction": new_direction, "weight_zone": new_zone, "row_storage_type": new_storage, "capacity_pallets": row_capacity * len(row_cells)})
+                        r.update({"row_number": new_row_number, "row_order": new_order, "cell_direction": new_direction, "weight_zone": new_zone})
                 for c in row_cells:
                     old_key = _map_cell_key(c)
-                    c.update({"row_number": new_row_number, "row_order": new_order, "cell_direction": new_direction, "weight_zone": new_zone, "storage_type": new_storage, "capacity_pallets": row_capacity})
+                    c.update({"row_number": new_row_number, "row_order": new_order, "cell_direction": new_direction, "weight_zone": new_zone})
                     new_key = _map_cell_key(c)
                     for p in model.get("placements", []):
                         if p.get("cell_key") == old_key:
                             p.update({"cell_key": new_key, "row_number": new_row_number, "weight_zone": new_zone})
+                for setting in model.get("row_settings", []):
+                    if str(setting.get("row_number")) == row_number:
+                        setting.update({"row_number": new_row_number, "cell_direction": new_direction, "weight_zone": new_zone})
+                _apply_row_storage_geometry(model, str(new_row_number), new_storage, target_capacity)
                 _persist_map_edit(model, "Ряд обновлён.")
                 st.rerun()
         confirm_row = st.checkbox("Подтвердить удаление ряда", key="map_row_delete_confirm")
