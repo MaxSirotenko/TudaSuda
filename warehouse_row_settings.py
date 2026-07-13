@@ -92,6 +92,50 @@ def _physical_slots(cell: dict[str, Any], capacity: int) -> list[dict[str, Any]]
     return [{"slot_index": idx, "x_min": x_min + (idx - 1) * slot_width, "x_max": x_min + idx * slot_width, "y_min": y_min, "y_max": y_max, "capacity_pallets": 1} for idx in range(1, capacity + 1)]
 
 
+
+
+def _row_sort_key(row: dict[str, Any]) -> tuple[float, str]:
+    return (_float(row.get("row_order"), 10**9), _display(row.get("row_number")))
+
+
+def _cell_sort_key(cell: dict[str, Any]) -> tuple[float, str]:
+    return (_float(cell.get("y_min"), 10**9), _display(cell.get("cell_number")))
+
+
+def _aisle_width(aisle: dict[str, Any]) -> float:
+    width = _float(aisle.get("aisle_width_m"), 0.0)
+    if width <= 0:
+        width = _float(aisle.get("x_max"), 0.0) - _float(aisle.get("x_min"), 0.0)
+    return max(width, 0.0)
+
+
+def _relayout_rows_with_aisles(model: dict[str, Any], row_widths: dict[str, float]) -> None:
+    """Recalculate row X coordinates with the same x_cursor layout used by geometry build."""
+    ordered_rows = sorted(model.get("rows", []), key=_row_sort_key)
+    aisles_by_pair = {
+        (_display(aisle.get("row_from")), _display(aisle.get("row_to"))): aisle
+        for aisle in model.get("aisles", [])
+    }
+    relaid_aisles: list[dict[str, Any]] = []
+    x_cursor = 0.0
+    previous_row_number = ""
+    for row in ordered_rows:
+        row_number = _display(row.get("row_number"))
+        if previous_row_number:
+            aisle = aisles_by_pair.get((previous_row_number, row_number))
+            if aisle is not None:
+                width = _aisle_width(aisle)
+                aisle.update({"x_min": x_cursor, "x_max": x_cursor + width, "x_center": x_cursor + width / 2, "aisle_width_m": width})
+                relaid_aisles.append(aisle)
+                x_cursor += width
+        width = row_widths.get(row_number, max(_float(row.get("x_max")) - _float(row.get("x_min")), 0.0))
+        row.update({"x_min": x_cursor, "x_max": x_cursor + width, "x_center": x_cursor + width / 2, "width_m": width})
+        x_cursor += width
+        previous_row_number = row_number
+    if relaid_aisles or model.get("aisles"):
+        model["aisles"] = relaid_aisles
+
+
 def _refresh_navigation(model: dict[str, Any]) -> None:
     rows = {_display(row.get("row_number")): row for row in model.get("rows", [])}
     for aisle in model.get("aisles", []):
@@ -162,23 +206,38 @@ def _validate_edited_rows(model: dict[str, Any], edited_rows: list[dict[str, Any
 
 def sync_row_settings_to_model(model: dict[str, Any]) -> dict[str, Any]:
     rows_by_number = {_display(row.get("row_number")): row for row in model.get("rows", [])}
+    row_widths: dict[str, float] = {}
+    row_capacity: dict[str, int] = {}
+    row_base_width: dict[str, float] = {}
+    cells_by_row = {
+        row_number: sorted([cell for cell in model.get("cells", []) if _display(cell.get("row_number")) == row_number], key=_cell_sort_key)
+        for row_number in rows_by_number
+    }
     for row_number, row in rows_by_number.items():
-        row_cells = [cell for cell in model.get("cells", []) if _display(cell.get("row_number")) == row_number]
+        row_cells = cells_by_row.get(row_number, [])
         capacity = int(_float(row.get("deep_lane_width"), 1)) if row.get("row_storage_type") == "deep_lane" else 1
         base_width = _base_cell_width(model, row, row_cells)
-        row.setdefault("initial_weight_zone", row.get("weight_zone", "unassigned"))
         target_width = base_width * capacity
-        x_min = _float(row.get("x_min")) if row.get("x_min") is not None else (_float(row_cells[0].get("x_min")) if row_cells else 0.0)
-        x_max = x_min + target_width
-        row.update({"base_cell_width_m": base_width, "base_row_width_m": base_width, "x_min": x_min, "x_max": x_max, "x_center": (x_min + x_max) / 2, "width_m": target_width, "deep_lane_width": capacity, "capacity_pallets": capacity * len(row_cells), "cells_count": len(row_cells)})
+        row_capacity[row_number] = capacity
+        row_base_width[row_number] = base_width
+        row_widths[row_number] = target_width
+        row.setdefault("initial_weight_zone", row.get("weight_zone", "unassigned"))
+        row.update({"base_cell_width_m": base_width, "base_row_width_m": base_width, "deep_lane_width": capacity, "capacity_pallets": capacity * len(row_cells), "cells_count": len(row_cells)})
+
+    _relayout_rows_with_aisles(model, row_widths)
+
+    for row_number, row in rows_by_number.items():
+        capacity = row_capacity.get(row_number, 1)
+        base_width = row_base_width.get(row_number, 1.0)
+        x_min = _float(row.get("x_min"))
+        x_max = _float(row.get("x_max"), x_min)
         for cell_group_name in ["cells", "base_cells"]:
-            for cell in model.get(cell_group_name, []):
-                if _display(cell.get("row_number")) != row_number:
-                    continue
+            group_cells = sorted([cell for cell in model.get(cell_group_name, []) if _display(cell.get("row_number")) == row_number], key=_cell_sort_key)
+            for cell in group_cells:
                 for field in CELL_SYNC_FIELDS:
                     cell[field] = row.get(field, "")
                 cell.setdefault("initial_weight_zone", row.get("initial_weight_zone", row.get("weight_zone", "unassigned")))
-                cell.update({"storage_type": row.get("row_storage_type", "normal"), "deep_lane_width": capacity, "capacity_pallets": capacity, "base_cell_width_m": base_width, "base_row_width_m": base_width, "x_min": x_min, "x_max": x_max, "x_center": (x_min + x_max) / 2, "width_m": target_width})
+                cell.update({"storage_type": row.get("row_storage_type", "normal"), "deep_lane_width": capacity, "capacity_pallets": capacity, "base_cell_width_m": base_width, "base_row_width_m": base_width, "x_min": x_min, "x_max": x_max, "x_center": (x_min + x_max) / 2, "width_m": x_max - x_min})
                 cell["physical_slots"] = _physical_slots(cell, capacity) if row.get("row_storage_type") == "deep_lane" else []
     model["row_settings"] = [{field: row.get(field, "") for field in SYNC_FIELDS} for row in model.get("rows", [])]
     _refresh_navigation(model)
