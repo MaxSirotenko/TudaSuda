@@ -20,12 +20,18 @@ ADDRESS_ALIASES = ["адрес", "ячейка", "адрес ячейки", "cel
 ROW_ALIASES = ["ряд", "row", "row_number"]
 CELL_ALIASES = ["ячейка", "cell_number", "номер ячейки"]
 TIER_ALIASES = ["ярус", "tier"]
+WEIGHT_CLASS_ALIASES = ["weight_class", "weight_zone", "зона", "весоваякатегория", "весовая категория", "категориявеса", "зонаразмещения", "зона размещения"]
+WEIGHT_CLASS_LABELS = {"heavy": "Тяжёлое", "medium": "Среднее", "light": "Лёгкое", "fragile": "Хрупкое", "unclassified": "Не классифицировано"}
+WEIGHT_ZONE_LABELS = {"heavy": "Тяжёлое", "medium": "Среднее", "light": "Лёгкое", "fragile": "Хрупкое", "unassigned": "Не назначено"}
 OPTIONAL_ALIASES = {
     "expiry_date": ["дата срока годности", "срок годности", "expiry", "expiry_date"],
     "batch": ["партия", "batch"],
     "characteristic": ["характеристика", "characteristic"],
+    "characteristic_code": ["характеристика.код", "код характеристики", "characteristic_code"],
+    "characteristic_name": ["характеристика.наименование", "характеристика", "characteristic_name"],
     "weight": ["вес", "weight"],
     "volume": ["объём", "объем", "volume"],
+    "weight_class": WEIGHT_CLASS_ALIASES,
 }
 
 
@@ -48,6 +54,38 @@ def _display_value(value: Any) -> str:
     if isinstance(value, float) and value.is_integer():
         return str(int(value))
     return str(value).strip()
+
+
+def normalize_weight_class(value: Any) -> str:
+    text = _clean_label(value).replace("ё", "е")
+    text = text.replace(" ", "")
+    if text in {"heavy", "тяжелое", "тяжелый"}:
+        return "heavy"
+    if text in {"medium", "среднее", "средний"}:
+        return "medium"
+    if text in {"light", "легкое", "легкий"}:
+        return "light"
+    if text in {"fragile", "хрупкое", "хрупкий"}:
+        return "fragile"
+    return "unclassified"
+
+
+def make_sku_key(item: dict[str, Any]) -> str:
+    sku_code = _display_value(item.get("sku_code"))
+    sku_name = _display_value(item.get("sku_name") or item.get("item_name"))
+    characteristic_code = _display_value(item.get("characteristic_code"))
+    characteristic_name = _display_value(item.get("characteristic_name") or item.get("characteristic"))
+    if sku_code and characteristic_code:
+        return f"code:{sku_code}|char_code:{characteristic_code}"
+    if sku_code and characteristic_name:
+        return f"code:{sku_code}|char_name:{characteristic_name}"
+    if sku_name and characteristic_name:
+        return f"name:{sku_name}|char_name:{characteristic_name}"
+    if sku_name:
+        return f"name:{sku_name}"
+    if sku_code:
+        return f"code:{sku_code}"
+    return ""
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -162,6 +200,11 @@ def normalize_inventory_table(df: pd.DataFrame, mapping: dict[str, str | None]) 
             result.at[idx, "tier"] = "1"
     for key in OPTIONAL_ALIASES:
         result[key] = df[mapping[key]].map(_display_value) if mapping.get(key) else ""
+    result["weight_class"] = result["weight_class"].map(normalize_weight_class) if "weight_class" in result else "unclassified"
+    if "characteristic_code" not in result:
+        result["characteristic_code"] = ""
+    if "characteristic_name" not in result:
+        result["characteristic_name"] = result.get("characteristic", "")
     result = result[(result["sku_code"] != "") & (result["qty_pallets"] > 0)].copy()
     diagnostics.append({"level": "info", "message": f"Строк инвента после нормализации: {len(result)}."})
     return result, diagnostics
@@ -226,6 +269,7 @@ def _cell_map(model: dict[str, Any]) -> dict[str, dict[str, Any]]:
 def _placement_record(row: dict[str, Any], cell: dict[str, Any], qty_pallets: float, source: str, confidence: str, placement_mode: str, comment: str = "") -> dict[str, Any]:
     return {
         "placement_id": str(uuid.uuid4()),
+        "sku_key": _display_value(row.get("sku_key")) or make_sku_key(row),
         "sku_code": _display_value(row.get("sku_code")),
         "sku_name": _display_value(row.get("sku_name")),
         "item_name": _display_value(row.get("item_name")) or _display_value(row.get("sku_name")),
@@ -235,10 +279,16 @@ def _placement_record(row: dict[str, Any], cell: dict[str, Any], qty_pallets: fl
         "cell_key": cell_key(cell.get("row_number"), cell.get("cell_number"), cell.get("tier")),
         "qty_pallets": qty_pallets,
         "qty_boxes": _safe_float(row.get("qty_boxes")),
+        "characteristic_code": _display_value(row.get("characteristic_code")),
+        "characteristic_name": _display_value(row.get("characteristic_name")) or _display_value(row.get("characteristic")),
+        "weight_class": _display_value(row.get("weight_class")) or "unclassified",
+        "weight_zone": _display_value(cell.get("weight_zone")) or "unassigned",
         "occupied_capacity_pallets": qty_pallets,
         "source": source,
         "confidence": confidence,
         "placement_mode": placement_mode,
+        "placement_status": "placed",
+        "unplaced_reason": "",
         "comment": comment,
     }
 
@@ -254,13 +304,18 @@ def import_inventory(model: dict[str, Any], normalized_df: pd.DataFrame, allow_r
             state["placements"].append(placement)
         else:
             state["unplaced_inventory"].append({
+                "sku_key": _display_value(row.get("sku_key")) or make_sku_key(row),
                 "sku_code": _display_value(row.get("sku_code")),
                 "sku_name": _display_value(row.get("sku_name")),
                 "item_name": _display_value(row.get("item_name")) or _display_value(row.get("sku_name")),
                 "qty_pallets": _safe_float(row.get("qty_pallets")),
                 "qty_boxes": _safe_float(row.get("qty_boxes")),
+                "characteristic_code": _display_value(row.get("characteristic_code")),
+                "characteristic_name": _display_value(row.get("characteristic_name")) or _display_value(row.get("characteristic")),
+                "weight_class": _display_value(row.get("weight_class")) or "unclassified",
                 "reason": "В исходных данных нет адреса ячейки" if not row.get("row_number") or not row.get("cell_number") else "Ячейка не найдена в модели склада",
             })
+    state["source_unplaced_inventory"] = [dict(item) for item in state.get("unplaced_inventory", [])]
     _append_journal(state, "импорт инвента", qty_pallets=sum(item.get("qty_pallets", 0) for item in state["unplaced_inventory"]), source="inventory")
     diagnostics.append({"level": "info", "message": f"Размещено по адресам: {len(state['placements'])}; без ячейки: {len(state['unplaced_inventory'])}."})
     save_placement_state(state)
@@ -543,3 +598,273 @@ def export_placements_excel_bytes(model: dict[str, Any], state: dict[str, Any]) 
         pd.DataFrame(state.get("unplaced_inventory", [])).to_excel(writer, sheet_name="Не размещено", index=False)
         pd.DataFrame(state.get("journal", [])).to_excel(writer, sheet_name="Журнал", index=False)
     return buffer.getvalue()
+
+
+def _sku_weight_classes(items: list[dict[str, Any]]) -> tuple[dict[str, str], dict[str, list[str]]]:
+    values: dict[str, set[str]] = {}
+    for item in items:
+        sku_key = _display_value(item.get("sku_key")) or make_sku_key(item)
+        if not sku_key:
+            continue
+        weight_class_source = item.get("calculated_zone") if "calculated_zone" in item else item.get("weight_class")
+        weight_class = normalize_weight_class(weight_class_source)
+        if weight_class != "unclassified":
+            values.setdefault(sku_key, set()).add(weight_class)
+    classes: dict[str, str] = {}
+    conflicts: dict[str, list[str]] = {}
+    for sku, sku_values in values.items():
+        if len(sku_values) > 1:
+            conflicts[sku] = sorted(sku_values)
+            classes[sku] = "unclassified"
+        elif sku_values:
+            classes[sku] = next(iter(sku_values))
+    for item in items:
+        sku = _display_value(item.get("sku_key")) or make_sku_key(item)
+        if sku and sku not in classes:
+            classes[sku] = "unclassified"
+    return classes, conflicts
+
+
+def _row_zones(model: dict[str, Any]) -> dict[str, str]:
+    zones = {}
+    for row in model.get("rows", []):
+        zone = _display_value(row.get("weight_zone"))
+        zones[_display_value(row.get("row_number"))] = zone if zone in {"heavy", "medium", "light", "fragile"} else "unassigned"
+    return zones
+
+
+def _zone_capacity(model: dict[str, Any], occupied: dict[str, float]) -> dict[str, float]:
+    free = {"heavy": 0.0, "medium": 0.0, "light": 0.0, "fragile": 0.0, "unassigned": 0.0}
+    for cell in model.get("cells", []):
+        zone = _display_value(cell.get("weight_zone")) or "unassigned"
+        if zone not in free:
+            zone = "unassigned"
+        key = cell_key(cell.get("row_number"), cell.get("cell_number"), cell.get("tier"))
+        free[zone] += max(_safe_float(cell.get("capacity_pallets"), 1.0) - occupied.get(key, 0.0), 0.0)
+    return {key: round(value, 4) for key, value in free.items()}
+
+
+def _unplaced_record(item: dict[str, Any], qty: float, reason: str, source: str, weight_class: str, weight_zone: str = "") -> dict[str, Any]:
+    return {
+        "sku_key": _display_value(item.get("sku_key")) or make_sku_key(item),
+        "sku_code": _display_value(item.get("sku_code")),
+        "sku_name": _display_value(item.get("sku_name")),
+        "characteristic_code": _display_value(item.get("characteristic_code")),
+        "characteristic_name": _display_value(item.get("characteristic_name")) or _display_value(item.get("characteristic")),
+        "weight_class": weight_class,
+        "source_zone": _display_value(item.get("source_zone")),
+        "calculated_zone": _display_value(item.get("calculated_zone")) or weight_class,
+        "zone_calculation_reason": _display_value(item.get("zone_calculation_reason")),
+        "source_weight": _display_value(item.get("source_weight")),
+        "fragile_flag": bool(item.get("fragile_flag")),
+        "zone_calculation_status": _display_value(item.get("zone_calculation_status")),
+        "receipt_line_ids": [_display_value(item.get("receipt_line_id"))] if item.get("receipt_line_id") else [],
+        "receipt_numbers": [_display_value(item.get("receipt_number"))] if item.get("receipt_number") else [],
+        "cell_key": "",
+        "row_number": "",
+        "cell_number": "",
+        "weight_zone": weight_zone,
+        "qty_pallets": round(qty, 4),
+        "source": source,
+        "placement_status": "not_placed",
+        "placement_mode": "not_calculated",
+        "unplaced_reason": reason,
+        "reason": reason,
+    }
+
+
+def _basic_placement_record(item: dict[str, Any], cell: dict[str, Any], qty: float, source: str, mode: str, weight_class: str, reason: str = "") -> dict[str, Any]:
+    placement = _placement_record({**item, "weight_class": weight_class}, cell, qty, source, "estimated" if mode != "factual" else "exact", mode, "Базовое механическое размещение")
+    placement.update({
+        "sku_key": _display_value(item.get("sku_key")) or make_sku_key(item),
+        "weight_class": weight_class,
+        "source_zone": _display_value(item.get("source_zone")),
+        "calculated_zone": _display_value(item.get("calculated_zone")) or weight_class,
+        "zone_calculation_reason": _display_value(item.get("zone_calculation_reason")),
+        "source_weight": _display_value(item.get("source_weight")),
+        "fragile_flag": bool(item.get("fragile_flag")),
+        "zone_calculation_status": _display_value(item.get("zone_calculation_status")),
+        "receipt_line_ids": [_display_value(item.get("receipt_line_id"))] if item.get("receipt_line_id") else [],
+        "receipt_numbers": [_display_value(item.get("receipt_number"))] if item.get("receipt_number") else [],
+        "weight_zone": _display_value(cell.get("weight_zone")) or "unassigned",
+        "placement_status": "placed" if not reason else "error",
+        "placement_mode": mode,
+        "unplaced_reason": reason,
+    })
+    return placement
+
+
+def _same_item(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    return (_display_value(a.get("sku_key")) or make_sku_key(a)) == (_display_value(b.get("sku_key")) or make_sku_key(b))
+
+
+def calculate_basic_weight_placement(model: dict[str, Any], state: dict[str, Any], receipts_state: dict[str, Any] | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
+    receipts = [dict(item) for item in (receipts_state or {}).get("receipts", [])]
+    for item in receipts:
+        item.setdefault("source", "receipt")
+        item["sku_key"] = _display_value(item.get("sku_key")) or make_sku_key(item)
+    receipts = sorted(receipts, key=lambda item: (_display_value(item.get("receipt_date")), _display_value(item.get("receipt_number")), _number_key(item.get("source_row_number"))))
+    source_unplaced = [dict(item) for item in state.get("source_unplaced_inventory") or state.get("unplaced_inventory", [])]
+    for item in source_unplaced:
+        item.setdefault("source", "inventory_without_cell")
+        item["sku_key"] = _display_value(item.get("sku_key")) or make_sku_key(item)
+    factual = [dict(p) for p in state.get("placements", []) if p.get("placement_mode") == "factual" or p.get("source") == "inventory_with_cell"]
+    manual = [dict(p) for p in state.get("placements", []) if p.get("placement_mode") == "manual" or p.get("source") == "manual"]
+    all_items = factual + source_unplaced + receipts
+    sku_classes, conflicts = _sku_weight_classes(all_items)
+    row_zones = _row_zones(model)
+    unassigned_rows = [row for row, zone in row_zones.items() if zone == "unassigned"]
+    cells = _cell_map(model)
+    ordered_cells = sorted(model.get("cells", []), key=_cell_sort_key)
+    occupied: dict[str, float] = {}
+    sku_by_cell: dict[str, set[str]] = {}
+    placed: list[dict[str, Any]] = []
+    unplaced: list[dict[str, Any]] = []
+    zone_mismatches: list[dict[str, Any]] = []
+
+    for placement in factual + manual:
+        key = placement.get("cell_key") or cell_key(placement.get("row_number"), placement.get("cell_number"), placement.get("tier"))
+        cell = cells.get(key)
+        sku = _display_value(placement.get("sku_key")) or make_sku_key(placement)
+        placement["sku_key"] = sku
+        weight_class = sku_classes.get(sku, normalize_weight_class(placement.get("weight_class")))
+        qty = _safe_float(placement.get("qty_pallets"))
+        if cell:
+            zone = _display_value(cell.get("weight_zone")) or "unassigned"
+            placement.update({"cell_key": key, "weight_class": weight_class, "weight_zone": zone, "placement_status": "placed", "placement_mode": "factual" if placement in factual else placement.get("placement_mode", "manual"), "unplaced_reason": ""})
+            if weight_class in {"heavy", "medium", "light", "fragile"} and zone != weight_class:
+                placement["zone_mismatch"] = True
+                placement["unplaced_reason"] = "zone_mismatch"
+                zone_mismatches.append({"sku_key": sku, "sku_code": placement.get("sku_code", ""), "cell_key": key, "weight_class": weight_class, "weight_zone": zone})
+            occupied[key] = occupied.get(key, 0.0) + qty
+            sku_by_cell.setdefault(key, set()).add(sku)
+        placed.append(placement)
+
+    def merge_or_append(record: dict[str, Any]) -> None:
+        for existing in placed:
+            if existing.get("cell_key") == record.get("cell_key") and _same_item(existing, record) and existing.get("source") == record.get("source") and existing.get("placement_mode") == record.get("placement_mode"):
+                existing["qty_pallets"] = round(_safe_float(existing.get("qty_pallets")) + _safe_float(record.get("qty_pallets")), 4)
+                existing["occupied_capacity_pallets"] = round(_safe_float(existing.get("occupied_capacity_pallets")) + _safe_float(record.get("occupied_capacity_pallets")), 4)
+                for field in ["receipt_line_ids", "receipt_numbers"]:
+                    merged = list(existing.get(field) or [])
+                    for value in record.get(field) or []:
+                        if value and value not in merged:
+                            merged.append(value)
+                    existing[field] = merged
+                return
+        placed.append(record)
+
+    def candidate_cells_for_sku(zone_cells: list[dict[str, Any]], sku_key: str) -> list[dict[str, Any]]:
+        sku_cells = [cells[p.get("cell_key")] for p in placed if _display_value(p.get("sku_key")) == sku_key and p.get("cell_key") in cells and cells[p.get("cell_key")].get("weight_zone") in {p.get("weight_zone"), sku_classes.get(sku_key)}]
+        if not sku_cells:
+            return zone_cells
+        row_orders = [_safe_float(cell.get("row_order"), 10**9) for cell in sku_cells]
+        same_rows = {_display_value(cell.get("row_number")) for cell in sku_cells}
+        cell_positions = {(_display_value(cell.get("row_number")), _number_key(cell.get("cell_number"))[1]) for cell in sku_cells if _number_key(cell.get("cell_number"))[0] == 0}
+
+        def rank(cell: dict[str, Any]) -> tuple[float, float, Any, Any]:
+            row = _display_value(cell.get("row_number"))
+            cell_num_key = _number_key(cell.get("cell_number"))
+            cell_num = cell_num_key[1] if cell_num_key[0] == 0 else 10**9
+            if row in same_rows:
+                row_positions = [pos for sku_row, pos in cell_positions if sku_row == row]
+                min_cell_delta = min(abs(cell_num - pos) for pos in row_positions) if row_positions and cell_num != 10**9 else 10**9
+                priority = 0 if min_cell_delta == 1 else 1
+            else:
+                min_cell_delta = 10**9
+                priority = 2
+            min_row_delta = min(abs(_safe_float(cell.get("row_order"), 10**9) - row_order) for row_order in row_orders)
+            return (priority, min_cell_delta if priority < 2 else min_row_delta, *_cell_sort_key(cell))
+
+        return sorted(zone_cells, key=rank)
+
+    def place_item(item: dict[str, Any], source: str) -> None:
+        sku = _display_value(item.get("sku_key")) or make_sku_key(item)
+        item["sku_key"] = sku
+        total_qty = _safe_float(item.get("qty_pallets"))
+        weight_class = sku_classes.get(sku, "unclassified")
+        if total_qty <= 0:
+            unplaced.append(_unplaced_record(item, total_qty, "invalid_qty_pallets", source, weight_class))
+            return
+        if sku in conflicts:
+            unplaced.append(_unplaced_record(item, total_qty, "conflicting_weight_class", source, weight_class))
+            return
+        if weight_class == "unclassified":
+            reason = "missing_calculated_zone" if "calculated_zone" in item else "missing_weight_class"
+            unplaced.append(_unplaced_record(item, total_qty, reason, source, weight_class))
+            return
+        zone_cells = [cell for cell in ordered_cells if cell.get("weight_zone") == weight_class]
+        if not zone_cells:
+            unplaced.append(_unplaced_record(item, total_qty, "no_rows_for_zone", source, weight_class, weight_class))
+            return
+        remaining = total_qty
+        # first fill same SKU/characteristic partial cells in the same zone
+        same_cells = []
+        for cell in zone_cells:
+            key = cell_key(cell.get("row_number"), cell.get("cell_number"), cell.get("tier"))
+            if occupied.get(key, 0.0) <= 0:
+                continue
+            if any(_same_item(p, item) and p.get("weight_zone") == weight_class for p in placed if p.get("cell_key") == key):
+                same_cells.append(cell)
+        for cell in same_cells + candidate_cells_for_sku(zone_cells, sku):
+            if remaining <= 0:
+                break
+            key = cell_key(cell.get("row_number"), cell.get("cell_number"), cell.get("tier"))
+            capacity = _safe_float(cell.get("capacity_pallets"), 1.0)
+            used = occupied.get(key, 0.0)
+            if used >= capacity:
+                continue
+            existing_skus = sku_by_cell.get(key, set())
+            if existing_skus and sku not in existing_skus:
+                continue
+            if existing_skus and cell not in same_cells:
+                continue
+            qty = min(remaining, capacity - used)
+            if qty <= 0:
+                continue
+            record = _basic_placement_record(item, cell, qty, source, "calculated", weight_class)
+            merge_or_append(record)
+            occupied[key] = used + qty
+            sku_by_cell.setdefault(key, set()).add(sku)
+            remaining = round(remaining - qty, 4)
+        if remaining > 0:
+            unplaced.append(_unplaced_record(item, remaining, "insufficient_zone_capacity", source, weight_class, weight_class))
+
+    for item in source_unplaced:
+        place_item(item, "inventory_without_cell")
+    for item in receipts:
+        place_item(item, "receipt")
+
+    diagnostics = {
+        "Всего паллет": round(sum(_safe_float(p.get("qty_pallets")) for p in placed) + sum(_safe_float(u.get("qty_pallets")) for u in unplaced), 4),
+        "Размещено": round(sum(_safe_float(p.get("qty_pallets")) for p in placed), 4),
+        "Не размещено": round(sum(_safe_float(u.get("qty_pallets")) for u in unplaced), 4),
+        "Размещено heavy": round(sum(_safe_float(p.get("qty_pallets")) for p in placed if p.get("weight_zone") == "heavy"), 4),
+        "Размещено medium": round(sum(_safe_float(p.get("qty_pallets")) for p in placed if p.get("weight_zone") == "medium"), 4),
+        "Размещено light": round(sum(_safe_float(p.get("qty_pallets")) for p in placed if p.get("weight_zone") == "light"), 4),
+        "Размещено fragile": round(sum(_safe_float(p.get("qty_pallets")) for p in placed if p.get("weight_zone") == "fragile"), 4),
+        "Свободная вместимость зон": _zone_capacity(model, occupied),
+        "SKU без весовой категории": sorted([sku for sku, cls in sku_classes.items() if cls == "unclassified" and sku not in conflicts]),
+        "Ряды без назначенной зоны": unassigned_rows,
+        "Конфликты категорий SKU": conflicts,
+        "Фактические остатки с zone_mismatch": zone_mismatches,
+        "Неразмещённые позиции": unplaced,
+    }
+    state["placements"] = placed
+    state["unplaced_inventory"] = unplaced
+    state["basic_placement_diagnostics"] = diagnostics
+    state.setdefault("settings", {})["basic_weight_placement_enabled"] = True
+    _append_journal(state, "базовое размещение по весовым зонам", qty_pallets=diagnostics["Размещено"], source="basic_weight_placement")
+    save_placement_state(state)
+    return state, diagnostics
+
+
+def clear_calculated_placements(state: dict[str, Any]) -> dict[str, Any]:
+    state["placements"] = [p for p in state.get("placements", []) if p.get("placement_mode") in {"factual", "manual"}]
+    if "source_unplaced_inventory" in state:
+        state["unplaced_inventory"] = [dict(item) for item in state.get("source_unplaced_inventory", [])]
+    else:
+        state["unplaced_inventory"] = [u for u in state.get("unplaced_inventory", []) if u.get("source") not in {"receipt", "inventory_without_cell"}]
+    state.pop("basic_placement_diagnostics", None)
+    save_placement_state(state)
+    return state
