@@ -10,6 +10,8 @@ from typing import Any
 
 import pandas as pd
 
+from warehouse_placement_diagnostics import placement_reason_text
+
 PLACEMENTS_PATH = Path("data/last_import/placements.json")
 
 SKU_ALIASES = ["sku", "sku_code", "код", "код товара", "номенклатура код", "товар код"]
@@ -689,7 +691,7 @@ def _unplaced_record(item: dict[str, Any], qty: float, reason: str, source: str,
     }
 
 
-def _basic_placement_record(item: dict[str, Any], cell: dict[str, Any], qty: float, source: str, mode: str, weight_class: str, reason: str = "") -> dict[str, Any]:
+def _basic_placement_record(item: dict[str, Any], cell: dict[str, Any], qty: float, source: str, mode: str, weight_class: str, reason: str = "", reason_code: str = "fallback", quantity_before: float = 0.0) -> dict[str, Any]:
     placement = _placement_record({**item, "weight_class": weight_class}, cell, qty, source, "estimated" if mode != "factual" else "exact", mode, "Базовое механическое размещение")
     placement.update({
         "sku_key": _display_value(item.get("sku_key")) or make_sku_key(item),
@@ -706,6 +708,13 @@ def _basic_placement_record(item: dict[str, Any], cell: dict[str, Any], qty: flo
         "placement_status": "placed" if not reason else "error",
         "placement_mode": mode,
         "unplaced_reason": reason,
+        "placement_reason_code": reason_code,
+        "placement_reason_text": placement_reason_text(reason_code),
+        "placement_source": source,
+        "was_occupied_before": quantity_before > 0,
+        "quantity_before": round(quantity_before, 4),
+        "quantity_added": round(qty, 4),
+        "quantity_after": round(quantity_before + qty, 4),
     })
     return placement
 
@@ -747,7 +756,22 @@ def calculate_basic_weight_placement(model: dict[str, Any], state: dict[str, Any
         qty = _safe_float(placement.get("qty_pallets"))
         if cell:
             zone = _display_value(cell.get("weight_zone")) or "unassigned"
-            placement.update({"cell_key": key, "weight_class": weight_class, "weight_zone": zone, "placement_status": "placed", "placement_mode": "factual" if placement in factual else placement.get("placement_mode", "manual"), "unplaced_reason": ""})
+            before_qty = occupied.get(key, 0.0)
+            placement.update({
+                "cell_key": key,
+                "weight_class": weight_class,
+                "weight_zone": zone,
+                "placement_status": "placed",
+                "placement_mode": "factual" if placement in factual else placement.get("placement_mode", "manual"),
+                "unplaced_reason": "",
+                "placement_reason_code": placement.get("placement_reason_code") or "existing_stock",
+                "placement_reason_text": placement.get("placement_reason_text") or placement_reason_text("existing_stock"),
+                "placement_source": placement.get("placement_source") or placement.get("source") or "existing_stock",
+                "was_occupied_before": True,
+                "quantity_before": before_qty,
+                "quantity_added": 0.0,
+                "quantity_after": before_qty + qty,
+            })
             if weight_class in {"heavy", "medium", "light", "fragile"} and zone != weight_class:
                 placement["zone_mismatch"] = True
                 placement["unplaced_reason"] = "zone_mismatch"
@@ -761,6 +785,8 @@ def calculate_basic_weight_placement(model: dict[str, Any], state: dict[str, Any
             if existing.get("cell_key") == record.get("cell_key") and _same_item(existing, record) and existing.get("source") == record.get("source") and existing.get("placement_mode") == record.get("placement_mode"):
                 existing["qty_pallets"] = round(_safe_float(existing.get("qty_pallets")) + _safe_float(record.get("qty_pallets")), 4)
                 existing["occupied_capacity_pallets"] = round(_safe_float(existing.get("occupied_capacity_pallets")) + _safe_float(record.get("occupied_capacity_pallets")), 4)
+                existing["quantity_added"] = round(_safe_float(existing.get("quantity_added")) + _safe_float(record.get("quantity_added")), 4)
+                existing["quantity_after"] = round(_safe_float(existing.get("quantity_before")) + _safe_float(existing.get("quantity_added")), 4)
                 for field in ["receipt_line_ids", "receipt_numbers"]:
                     merged = list(existing.get(field) or [])
                     for value in record.get(field) or []:
@@ -838,7 +864,8 @@ def calculate_basic_weight_placement(model: dict[str, Any], state: dict[str, Any
             qty = min(remaining, capacity - used)
             if qty <= 0:
                 continue
-            record = _basic_placement_record(item, cell, qty, source, "calculated", weight_class)
+            reason_code = "same_sku_partial_cell" if used > 0 else ("fragile_priority" if weight_class == "fragile" else ("adjacent_to_same_sku" if any(_display_value(p.get("sku_key")) == sku for p in placed) else "matching_weight_zone"))
+            record = _basic_placement_record(item, cell, qty, source, "calculated", weight_class, reason_code=reason_code, quantity_before=used)
             merge_or_append(record)
             occupied[key] = used + qty
             sku_by_cell.setdefault(key, set()).add(sku)

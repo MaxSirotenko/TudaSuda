@@ -65,6 +65,14 @@ from warehouse_inventory_placement import (
     update_placement_qty,
     move_placement,
 )
+from warehouse_placement_diagnostics import (
+    PLACEMENT_CATEGORY_COLORS,
+    ZONE_LABELS_RU,
+    build_placement_diagnostics,
+    enrich_model_with_placement_diagnostics,
+    load_pre_placement_snapshot,
+    save_pre_placement_snapshot,
+)
 
 from warehouse_receipts import (
     build_receipt_diagnostics,
@@ -822,6 +830,7 @@ def render_inventory_placement(model: dict) -> dict:
                 st.warning(receipts_warning)
             model = apply_active_boundaries_to_model(model)
             save_geometry_model(model)
+            save_pre_placement_snapshot(model, state, receipts_state, trigger="basic_weight_placement")
             state, basic_diag = calculate_basic_weight_placement(model, state, receipts_state)
             st.session_state["geometry_model"] = attach_placements_to_model(model, state)
             st.session_state["placement_state"] = state
@@ -898,17 +907,7 @@ def render_inventory_placement(model: dict) -> dict:
                     st.rerun()
 
     with diag_tab:
-        diag = placement_diagnostics(model, state)
-        st.subheader("Диагностика размещения")
-        st.dataframe(pd.DataFrame([{"Показатель": key, "Значение": value} for key, value in diag.items()]), use_container_width=True)
-        st.download_button("Скачать размещение в Excel", export_placements_excel_bytes(model, state), file_name="placements.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        log_df = pd.DataFrame(state.get("journal", []))
-        st.subheader("Журнал размещения")
-        if log_df.empty:
-            st.info("Журнал размещения пока пуст.")
-        else:
-            st.dataframe(log_df, use_container_width=True)
-            st.download_button("Скачать журнал размещения", log_df.to_csv(index=False).encode("utf-8-sig"), file_name="placement_journal.csv", mime="text/csv")
+        render_placement_diagnostics_section(model, state)
         if st.button("Очистить журнал", key="placement_clear_journal"):
             state["journal"] = []
             save_placement_state(state)
@@ -920,6 +919,94 @@ def render_inventory_placement(model: dict) -> dict:
             st.rerun()
 
     return attach_placements_to_model(model, state)
+
+
+def _metric_grid(metrics: dict[str, object], columns: int = 5) -> None:
+    items = list(metrics.items())
+    for start in range(0, len(items), columns):
+        cols = st.columns(min(columns, len(items) - start))
+        for col, (label, value) in zip(cols, items[start:start + columns]):
+            col.metric(label, value)
+
+
+def render_placement_diagnostics_section(model: dict, state: dict) -> None:
+    st.subheader("Диагностика размещения")
+    st.caption("Раздел анализирует текущие warehouse_model.json, placements.json и receipts.json. Открытие диагностики не запускает размещение и не изменяет сохранённые файлы.")
+    receipts_state, receipts_warning = load_receipts_state(model)
+    if receipts_warning:
+        st.warning(receipts_warning)
+        receipts_state = {"receipts": []}
+    snapshot, snapshot_warning = load_pre_placement_snapshot(model)
+    if snapshot_warning:
+        st.info(snapshot_warning)
+    diagnostics = build_placement_diagnostics(model, state, receipts_state, snapshot)
+    if diagnostics.get("snapshot_warning"):
+        st.caption(diagnostics["snapshot_warning"])
+    _metric_grid(diagnostics["summary"], columns=4)
+
+    st.markdown("**Аналитика по весовым зонам**")
+    zone_df = pd.DataFrame(diagnostics["zone_rows"])
+    if zone_df.empty:
+        st.info("Нет данных по весовым зонам.")
+    else:
+        st.dataframe(zone_df, use_container_width=True, hide_index=True)
+
+    st.markdown("**Изменение весовых зон**")
+    zc1, zc2 = st.columns(2)
+    zc1.metric("Рядов с изменённой зоной", diagnostics["changed_rows_count"])
+    zc2.metric("Ячеек с изменённой зоной", diagnostics["changed_cells_count"])
+    changes_df = pd.DataFrame(diagnostics["zone_changes"])
+    if changes_df.empty:
+        st.info("Нет данных о рядах.")
+    else:
+        st.dataframe(changes_df, use_container_width=True, hide_index=True)
+
+    st.markdown("**Детальная таблица занятых ячеек**")
+    detail_df = pd.DataFrame(diagnostics["occupied_rows"])
+    if detail_df.empty:
+        st.info("Занятых ячеек нет.")
+    else:
+        f1, f2, f3 = st.columns(3)
+        row_filter = f1.multiselect("Ряд", sorted(detail_df["Ряд"].dropna().astype(str).unique()), key="diag_filter_row")
+        zone_filter = f2.multiselect("Весовая зона", sorted(detail_df["Весовая зона ячейки"].dropna().astype(str).unique()), key="diag_filter_zone")
+        category_filter = f3.multiselect("Категория SKU", sorted(detail_df["Категория SKU"].dropna().astype(str).unique()), key="diag_filter_category")
+        f4, f5, f6 = st.columns(3)
+        reason_filter = f4.multiselect("Причина", sorted(detail_df["Код причины размещения"].dropna().astype(str).unique()), key="diag_filter_reason")
+        status_filter = f5.multiselect("Статус", sorted(detail_df["Источник"].dropna().astype(str).unique()), key="diag_filter_source")
+        only_partial = f6.checkbox("Только частично заполненные", key="diag_filter_partial")
+        only_full = f6.checkbox("Только полностью заполненные", key="diag_filter_full")
+        filtered = detail_df.copy()
+        if row_filter:
+            filtered = filtered[filtered["Ряд"].astype(str).isin(row_filter)]
+        if zone_filter:
+            filtered = filtered[filtered["Весовая зона ячейки"].astype(str).isin(zone_filter)]
+        if category_filter:
+            filtered = filtered[filtered["Категория SKU"].astype(str).isin(category_filter)]
+        if reason_filter:
+            filtered = filtered[filtered["Код причины размещения"].astype(str).isin(reason_filter)]
+        if status_filter:
+            filtered = filtered[filtered["Источник"].astype(str).isin(status_filter)]
+        if only_partial:
+            filtered = filtered[(filtered["Стало после"] > 0) & (filtered["Стало после"] < filtered["Вместимость"])]
+        if only_full:
+            filtered = filtered[filtered["Стало после"] >= filtered["Вместимость"]]
+        st.dataframe(filtered, use_container_width=True, hide_index=True)
+
+    st.markdown("**Не размещено**")
+    unplaced_df = pd.DataFrame(diagnostics["unplaced_rows"])
+    if unplaced_df.empty:
+        st.success("Неразмещённых позиций нет.")
+    else:
+        st.dataframe(unplaced_df, use_container_width=True, hide_index=True)
+
+    st.download_button("Скачать размещение в Excel", export_placements_excel_bytes(model, state), file_name="placements.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    log_df = pd.DataFrame(state.get("journal", []))
+    st.subheader("Журнал размещения")
+    if log_df.empty:
+        st.info("Журнал размещения пока пуст.")
+    else:
+        st.dataframe(log_df, use_container_width=True)
+        st.download_button("Скачать журнал размещения", log_df.to_csv(index=False).encode("utf-8-sig"), file_name="placement_journal.csv", mime="text/csv")
 
 
 RECEIPT_STATUS_LABELS = {
@@ -1241,6 +1328,7 @@ def render_receipts_section(model: dict) -> None:
                     st.warning(placement_warning)
                 model = apply_active_boundaries_to_model(model)
                 save_geometry_model(model)
+                save_pre_placement_snapshot(model, placement_state, state, trigger="receipt_placement")
                 placement_state, basic_diag = calculate_basic_weight_placement(model, placement_state, state)
                 st.session_state["geometry_model"] = attach_placements_to_model(model, placement_state)
                 st.session_state["placement_state"] = placement_state
@@ -2336,9 +2424,18 @@ def render_geometry_map_view(model: dict) -> None:
         st.warning(placement_warning)
     elif placement_state.get("placements"):
         model = attach_placements_to_model(model, placement_state)
+        snapshot, _ = load_pre_placement_snapshot(model)
+        model = enrich_model_with_placement_diagnostics(model, placement_state, snapshot)
         st.caption("На карте показана занятость из сохранённого placements.json, включая рассчитанные приходы.")
     _model_summary_metrics(model)
     model = render_map_edit_panel(model)
+    st.markdown(
+        " · ".join(
+            f"<span style='display:inline-flex;align-items:center;gap:4px;margin-right:8px'><span style='display:inline-block;width:14px;height:14px;background:{color};border:1px solid #94A3B8'></span>{ZONE_LABELS_RU.get(zone, zone)}</span>"
+            for zone, color in PLACEMENT_CATEGORY_COLORS.items()
+        ) + "<span style='display:inline-flex;align-items:center;gap:4px;margin-right:8px'><span style='display:inline-block;width:14px;height:14px;background:#DCEBFF;border:1px solid #AAB4C3'></span>Свободно</span><span style='display:inline-flex;align-items:center;gap:4px'><span style='display:inline-block;width:14px;height:14px;background:#F3F4F6;border:2px dashed #6B7280'></span>Заблокировано</span>",
+        unsafe_allow_html=True,
+    )
     control_left, control_right = st.columns([1, 2])
     with control_left:
         detailed = st.toggle("Детальный режим", value=len(model.get("cells", [])) <= 1500, key="map_detailed_mode")

@@ -327,6 +327,7 @@ def build_geometry_model(
         deep_lane_width = int(meta.get("deep_lane_width", 1))
         cell_direction = meta.get("cell_direction", "bottom_to_top")
         weight_zone = meta.get("weight_zone", "unassigned")
+        initial_weight_zone = meta.get("initial_weight_zone", weight_zone)
         row_width_m = settings.cell_width_m * deep_lane_width
         row_order_value = meta.get("row_order") or len(rows) + 1
         row_x_min = x_cursor
@@ -374,6 +375,7 @@ def build_geometry_model(
                 "cell_direction": cell_direction,
                 "row_order": row_order_value,
                 "weight_zone": weight_zone,
+                "initial_weight_zone": initial_weight_zone,
                 "physical_slots": physical_slots,
             }
             cells.append(cell)
@@ -395,6 +397,7 @@ def build_geometry_model(
             "side": meta.get("side", ""),
             "comment": meta.get("comment", ""),
             "weight_zone": weight_zone,
+            "initial_weight_zone": initial_weight_zone,
             "x_min": row_x_min,
             "x_max": row_x_max,
             "y_min": 0.0,
@@ -464,6 +467,7 @@ def build_geometry_model(
                 "deep_lane_width": row.get("deep_lane_width", 1),
                 "cell_direction": row.get("cell_direction", "bottom_to_top"),
                 "weight_zone": row.get("weight_zone", "unassigned"),
+                "initial_weight_zone": row.get("initial_weight_zone", row.get("weight_zone", "unassigned")),
                 "updated_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
                 "comment": row.get("comment", ""),
             }
@@ -721,6 +725,14 @@ def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bo
         "deep_lane_partial_color": "#A5D6A7",
         "deep_lane_full_color": "#66BB6A",
     }
+    category_colors = {
+        "heavy": "#F4A6A6",
+        "medium": "#F7D486",
+        "light": "#BFE3B4",
+        "fragile": "#D8B4FE",
+        "unclassified": "#CBD5E1",
+        "unassigned": "#E5E7EB",
+    }
     settings.update(label_settings or {})
     colors = dict(default_colors)
     colors.update(settings.get("colors", {}))
@@ -830,15 +842,17 @@ def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bo
             placement_source = ", ".join(sorted({str(item.get("source", "")) for item in placements if item.get("source")})) or "—"
             confidence = ", ".join(sorted({str(item.get("confidence", "")) for item in placements if item.get("confidence")})) or "—"
             title = f"Код: {cell['code']}\nРяд: {cell['row_number']}\nЯчейка: {cell['cell_number']}\nЯрус: {cell['tier']}\nТип: {storage_label}\nВместимость: {capacity:g} паллет\nЗанято: {occupied:g}\nСвободно: {free:g}\nSKU: {sku_text}\nНаименование: {item_text}\nИсточник размещения: {placement_source}\nТочность: {confidence}\nФизических мест: {cell.get('deep_lane_width', 1)}\nОбъём: {cell.get('volume_m3', 0)} м³\nНаправление: {_direction_label(cell.get('cell_direction', 'bottom_to_top'))}\nX: {cell['x_center']:.2f}\nY: {cell['y_center']:.2f}\nИсточник ячейки: {source_label}"
+            if cell.get("placement_tooltip"):
+                title = str(cell.get("placement_tooltip"))
             current_cell_key = f"{cell.get('row_number')}|{cell.get('cell_number')}|{cell.get('tier') or '1'}"
             if occupied > capacity:
                 color = "#fecaca"
                 border = "2px solid #DC5A5A"
             elif occupied >= capacity:
-                color = colors["deep_lane_full_color"] if cell.get("storage_type") == "deep_lane" else colors["occupied_cell_color"]
+                color = category_colors.get(str(cell.get("placement_category", "")), colors["deep_lane_full_color"] if cell.get("storage_type") == "deep_lane" else colors["occupied_cell_color"])
                 border = "2px solid #4F8F5B"
             elif occupied > 0:
-                color = colors["deep_lane_partial_color"] if cell.get("storage_type") == "deep_lane" else colors["occupied_cell_color"]
+                color = category_colors.get(str(cell.get("placement_category", "")), colors["deep_lane_partial_color"] if cell.get("storage_type") == "deep_lane" else colors["occupied_cell_color"])
                 border = "2px solid #82A878"
             else:
                 color = colors["deep_lane_cell_color"] if cell.get("storage_type") == "deep_lane" else colors["cell_color"]

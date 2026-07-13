@@ -8,7 +8,7 @@ import pandas as pd
 VALID_DIRECTIONS = {"bottom_to_top", "top_to_bottom"}
 VALID_STORAGE_TYPES = {"normal", "deep_lane"}
 VALID_ZONES = {"heavy", "medium", "light", "fragile", "unassigned"}
-SYNC_FIELDS = ["row_number", "row_order", "cell_direction", "weight_zone", "row_storage_type", "deep_lane_width", "capacity_pallets", "row_group", "side", "comment", "base_cell_width_m", "base_row_width_m"]
+SYNC_FIELDS = ["row_number", "row_order", "cell_direction", "weight_zone", "initial_weight_zone", "row_storage_type", "deep_lane_width", "capacity_pallets", "row_group", "side", "comment", "base_cell_width_m", "base_row_width_m"]
 CELL_SYNC_FIELDS = ["row_order", "cell_direction", "weight_zone", "row_group", "side", "comment"]
 
 
@@ -166,6 +166,7 @@ def sync_row_settings_to_model(model: dict[str, Any]) -> dict[str, Any]:
         row_cells = [cell for cell in model.get("cells", []) if _display(cell.get("row_number")) == row_number]
         capacity = int(_float(row.get("deep_lane_width"), 1)) if row.get("row_storage_type") == "deep_lane" else 1
         base_width = _base_cell_width(model, row, row_cells)
+        row.setdefault("initial_weight_zone", row.get("weight_zone", "unassigned"))
         target_width = base_width * capacity
         x_min = _float(row.get("x_min")) if row.get("x_min") is not None else (_float(row_cells[0].get("x_min")) if row_cells else 0.0)
         x_max = x_min + target_width
@@ -176,6 +177,7 @@ def sync_row_settings_to_model(model: dict[str, Any]) -> dict[str, Any]:
                     continue
                 for field in CELL_SYNC_FIELDS:
                     cell[field] = row.get(field, "")
+                cell.setdefault("initial_weight_zone", row.get("initial_weight_zone", row.get("weight_zone", "unassigned")))
                 cell.update({"storage_type": row.get("row_storage_type", "normal"), "deep_lane_width": capacity, "capacity_pallets": capacity, "base_cell_width_m": base_width, "base_row_width_m": base_width, "x_min": x_min, "x_max": x_max, "x_center": (x_min + x_max) / 2, "width_m": target_width})
                 cell["physical_slots"] = _physical_slots(cell, capacity) if row.get("row_storage_type") == "deep_lane" else []
     model["row_settings"] = [{field: row.get(field, "") for field in SYNC_FIELDS} for row in model.get("rows", [])]
