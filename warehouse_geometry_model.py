@@ -792,7 +792,7 @@ def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bo
                 return lines, size
         return [], 0
 
-    def rect(x_min, y_min, x_max, y_max, color, border, label="", title="", short_label="", label_lines=None, short_lines=None, force_label=False, vertical=False, hover_color="", extra_attrs=""):
+    def rect(x_min, y_min, x_max, y_max, color, border, label="", title="", short_label="", label_lines=None, short_lines=None, force_label=False, vertical=False, hover_color="", extra_attrs="", extra_style=""):
         left = x_min * scale + 60
         top = height - (y_max * scale + y_offset)
         w = max(2, (x_max - x_min) * scale)
@@ -815,7 +815,7 @@ def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bo
             safe_hover = html.escape(str(hover_color), quote=True)
             safe_color = html.escape(str(color), quote=True)
             hover_attrs = f" onmouseenter=\"this.dataset.bg=this.style.background;this.style.background=\'{safe_hover}\'\" onmouseleave=\"this.style.background=this.dataset.bg||\'{safe_color}\'\""
-        parts.append(f"<div title='{html.escape(title or label)}'{hover_attrs}{extra_attrs} style='position:absolute;left:{left:.1f}px;top:{top:.1f}px;width:{w:.1f}px;height:{h:.1f}px;background:{color};border:{border};box-sizing:border-box;overflow:hidden;clip-path:inset(0);'><div style='{content_style}'>{content}</div></div>")
+        parts.append(f"<div title='{html.escape(title or label)}'{hover_attrs}{extra_attrs} style='position:absolute;left:{left:.1f}px;top:{top:.1f}px;width:{w:.1f}px;height:{h:.1f}px;background:{color};border:{border};box-sizing:border-box;overflow:hidden;clip-path:inset(0);{extra_style}'><div style='{content_style}'>{content}</div></div>")
 
     for road in roads:
         label = "верхний проезд" if road["road_type"] == "top" else "нижний проезд"
@@ -876,7 +876,7 @@ def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bo
             occupied_slots = int(min(round(occupied), len(cell.get("physical_slots", []))))
             for slot in cell.get("physical_slots", []):
                 slot_color = "rgba(34,197,94,0.45)" if slot.get("slot_index", 0) <= occupied_slots else "rgba(255,255,255,0.18)"
-                rect(slot["x_min"], slot["y_min"], slot["x_max"], slot["y_max"], slot_color, "1px dashed #93A4B8", "", f"Физическое место {slot['slot_index']} из {cell.get('deep_lane_width', 1)}")
+                rect(slot["x_min"], slot["y_min"], slot["x_max"], slot["y_max"], slot_color, "1px dashed #93A4B8", "", title, extra_style="pointer-events:none;")
     else:
         for row in rows:
             row_label = f"ряд {row['row_number']} ({row['cells_count']})" if settings.get("show_row_labels", True) else ""

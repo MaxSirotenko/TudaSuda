@@ -343,9 +343,8 @@ def _cell_sort_key(cell: dict[str, Any], model: dict[str, Any] | None = None) ->
     direction = get_row_direction(model or {"cells": [cell]}, cell.get("row_number"))
     cell_num = _number_key(cell.get("cell_number"))
     if cell_num[0] == 0:
-        return (row_order, -cell_num[1] if direction == "top_to_bottom" else cell_num[1], 0)
-    y_center = _safe_float(cell.get("y_center"))
-    return (row_order, -y_center if direction == "top_to_bottom" else y_center, 1)
+        return (row_order, cell_num[1], 0)
+    return (row_order, _safe_float(cell.get("y_center")), 1)
 
 
 def _occupied_by_cell(state: dict[str, Any]) -> dict[str, float]:

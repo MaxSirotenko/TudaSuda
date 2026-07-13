@@ -94,3 +94,97 @@ def test_old_placements_without_diagnostic_fields_and_no_initial_zone_do_not_cra
     diagnostics = build_placement_diagnostics(model, state, {"receipts": []}, None)
     assert diagnostics["occupied_rows"][0]["Код причины размещения"] == "fallback"
     assert any(row["Статус изменения"] == "Нет данных об исходной зоне" for row in diagnostics["zone_changes"])
+
+
+def _order_cell(row, cell, *, direction="top_to_bottom", row_order=1, capacity=1):
+    return {
+        "code": f"{row}-{cell}",
+        "row_number": str(row),
+        "cell_number": str(cell),
+        "tier": "1",
+        "row_order": row_order,
+        "cell_direction": direction,
+        "weight_zone": "heavy",
+        "storage_type": "normal",
+        "capacity_pallets": capacity,
+        "deep_lane_width": capacity,
+        "x_min": float(row_order),
+        "x_max": float(row_order) + 0.8,
+        "x_center": float(row_order) + 0.4,
+        "y_min": float(cell - 1),
+        "y_max": float(cell),
+        "y_center": float(cell) - 0.5,
+        "physical_slots": [],
+    }
+
+
+def _order_model(direction="top_to_bottom"):
+    cells = [_order_cell(10, idx, direction=direction, row_order=1) for idx in (1, 2, 3)]
+    return {
+        "model_id": f"order-{direction}",
+        "settings": {"cell_width_m": 0.8, "cell_length_m": 1.0},
+        "rows": [{"row_number": "10", "row_order": 1, "cell_direction": direction, "weight_zone": "heavy", "cells_count": 3, "x_min": 0, "x_max": 0.8, "y_min": 0, "y_max": 3}],
+        "cells": cells,
+        "aisles": [],
+        "roads": [],
+        "navigation_nodes": [],
+        "navigation_edges": [],
+    }
+
+
+def _placed_receipt_cells(state):
+    return [p["cell_number"] for p in state["placements"] if p.get("source") == "receipt" and p.get("placement_mode") == "calculated"]
+
+
+def test_basic_placement_orders_cells_by_number_for_both_row_directions(tmp_path, monkeypatch):
+    monkeypatch.setattr(placement_module, "PLACEMENTS_PATH", tmp_path / "placements.json")
+    for direction in ("top_to_bottom", "bottom_to_top"):
+        model = _order_model(direction)
+        state = empty_placement_state(model)
+        new_state, _ = calculate_basic_weight_placement(model, state, {"receipts": [_receipt("sku-order", "R1", "L1", 3, "heavy")]})
+        assert _placed_receipt_cells(new_state) == ["1", "2", "3"]
+
+
+def test_cell_sort_keeps_row_order_before_cell_number():
+    model = {
+        "rows": [
+            {"row_number": "10", "row_order": 2, "cell_direction": "top_to_bottom"},
+            {"row_number": "20", "row_order": 1, "cell_direction": "bottom_to_top"},
+        ],
+        "cells": [_order_cell(10, 1, row_order=2), _order_cell(20, 1, direction="bottom_to_top", row_order=1)],
+    }
+    ordered = sorted(model["cells"], key=lambda cell: placement_module._cell_sort_key(cell, model))
+    assert [cell["row_number"] for cell in ordered] == ["20", "10"]
+
+
+def test_same_sku_partial_cell_still_has_priority_over_cell_order(tmp_path, monkeypatch):
+    monkeypatch.setattr(placement_module, "PLACEMENTS_PATH", tmp_path / "placements.json")
+    model = _order_model("top_to_bottom")
+    state = empty_placement_state(model)
+    state["placements"] = [{
+        "cell_key": "10|3|1",
+        "row_number": "10",
+        "cell_number": "3",
+        "tier": "1",
+        "sku_key": "sku-order",
+        "sku_name": "Товар",
+        "qty_pallets": 0.5,
+        "occupied_capacity_pallets": 0.5,
+        "source": "inventory_with_cell",
+        "placement_mode": "factual",
+        "weight_class": "heavy",
+    }]
+    new_state, _ = calculate_basic_weight_placement(model, state, {"receipts": [_receipt("sku-order", "R1", "L1", 0.5, "heavy")]})
+    receipt_placements = [p for p in new_state["placements"] if p.get("source") == "receipt"]
+    assert receipt_placements[0]["cell_number"] == "3"
+    assert receipt_placements[0]["placement_reason_code"] == "same_sku_partial_cell"
+
+
+def test_deep_lane_physical_slots_do_not_override_logical_cell_tooltip():
+    model = _model()
+    state = {"placements": [{"cell_key": "2|1|1", "row_number": "2", "cell_number": "1", "tier": "1", "sku_key": "fragile-sku", "sku_name": "Стекло", "qty_pallets": 4, "occupied_capacity_pallets": 4, "source": "receipt", "receipt_numbers": ["R1"], "receipt_line_ids": ["L1"], "weight_class": "fragile", "calculated_zone": "fragile", "placement_reason_code": "fragile_priority", "placement_reason_text": "Хрупкий товар размещён в зоне хрупкого товара."}], "unplaced_inventory": []}
+    enriched = enrich_model_with_placement_diagnostics(model, state, None)
+    html = build_geometry_html(enriched, scale=10, detailed=True, label_settings={})
+    assert "pointer-events:none;" in html
+    assert "Хрупкий товар размещён" in html
+    assert "Физическое место" not in html
