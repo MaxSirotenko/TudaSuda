@@ -1842,24 +1842,96 @@ def _physical_slots_for_cell(cell: dict, capacity: int) -> list[dict]:
     ]
 
 
-def _apply_row_storage_geometry(model: dict, row_number: str, storage_type: str, capacity: float) -> None:
+def _base_cell_width_m(model: dict, row: dict | None, row_cells: list[dict]) -> float:
+    settings_width = float((model.get("settings") or {}).get("cell_width_m") or 0)
+    if row and row.get("base_cell_width_m"):
+        return float(row.get("base_cell_width_m") or settings_width or 1)
+    for cell in row_cells:
+        if cell.get("base_cell_width_m"):
+            return float(cell.get("base_cell_width_m") or settings_width or 1)
+    if settings_width > 0:
+        return settings_width
+    if row_cells:
+        first = row_cells[0]
+        current_width = float(first.get("x_max", 0) or 0) - float(first.get("x_min", 0) or 0)
+        current_lane_width = int(float(first.get("deep_lane_width", 1) or 1)) if first.get("storage_type") == "deep_lane" else 1
+        return current_width / max(current_lane_width, 1) if current_width > 0 else 1.0
+    return 1.0
+
+
+def _row_intersects_another(model: dict, row_number: str, x_min: float, x_max: float, y_min: float, y_max: float) -> bool:
+    for other in model.get("rows", []):
+        if str(other.get("row_number")) == str(row_number):
+            continue
+        overlap_x = x_min < float(other.get("x_max", 0) or 0) and x_max > float(other.get("x_min", 0) or 0)
+        overlap_y = y_min < float(other.get("y_max", 0) or 0) and y_max > float(other.get("y_min", 0) or 0)
+        if overlap_x and overlap_y:
+            return True
+    return False
+
+
+def _refresh_linear_geometry_after_row_resize(model: dict) -> None:
+    row_by_number = {str(row.get("row_number")): row for row in model.get("rows", [])}
+    for aisle in model.get("aisles", []):
+        row_from = row_by_number.get(str(aisle.get("row_from")))
+        row_to = row_by_number.get(str(aisle.get("row_to")))
+        if row_from and row_to:
+            aisle["x_min"] = float(row_from.get("x_max", 0) or 0)
+            aisle["x_max"] = float(row_to.get("x_min", aisle.get("x_min", 0)) or 0)
+            aisle["aisle_width_m"] = max(float(aisle.get("x_max", 0) or 0) - float(aisle.get("x_min", 0) or 0), 0.0)
+    total_width = max([float(row.get("x_max", 0) or 0) for row in model.get("rows", [])] + [0.0])
+    for road in model.get("roads", []):
+        road["x_max"] = total_width
+    for node in model.get("navigation_nodes", []):
+        row = row_by_number.get(str(node.get("row_number")))
+        if row:
+            node["x"] = float(row.get("x_center", 0) or 0)
+        elif node.get("node_id") in {"road:bottom", "road:top"}:
+            node["x"] = total_width / 2 if total_width else 0.0
+
+
+def _apply_row_storage_geometry(model: dict, row_number: str, storage_type: str, capacity: float) -> tuple[bool, str]:
     logical_capacity = max(1, int(round(capacity))) if storage_type == "deep_lane" else 1
     row_cells = [cell for cell in model.get("cells", []) if str(cell.get("row_number")) == str(row_number)]
+    row = next((item for item in model.get("rows", []) if str(item.get("row_number")) == str(row_number)), None)
+    base_cell_width = _base_cell_width_m(model, row, row_cells)
+    target_width = base_cell_width * logical_capacity
+    row_x_min = float((row or row_cells[0]).get("x_min", 0) or 0) if (row or row_cells) else 0.0
+    row_x_max = row_x_min + target_width
+    row_y_min = float((row or {}).get("y_min", 0) or 0)
+    row_y_max = float((row or {}).get("y_max", 0) or 0)
+    if _row_intersects_another(model, row_number, row_x_min, row_x_max, row_y_min, row_y_max):
+        return False, "Недостаточно места для расширения набивного ряда. Переместите соседние ряды или увеличьте расстояние между ними."
     for cell in row_cells:
+        cell["base_cell_width_m"] = base_cell_width
+        cell["x_min"] = row_x_min
+        cell["x_max"] = row_x_max
+        cell["x_center"] = (row_x_min + row_x_max) / 2
+        cell["width_m"] = target_width
         cell["storage_type"] = storage_type
         cell["deep_lane_width"] = logical_capacity
         cell["capacity_pallets"] = logical_capacity
+        cell["volume_m3"] = round(float(cell.get("length_m", 0) or 0) * base_cell_width * logical_capacity * float((model.get("settings") or {}).get("pallet_height_m", 1.7) or 1.7), 4)
         cell["physical_slots"] = _physical_slots_for_cell(cell, logical_capacity) if storage_type == "deep_lane" else []
-    for row in model.get("rows", []):
-        if str(row.get("row_number")) == str(row_number):
-            row["row_storage_type"] = storage_type
-            row["deep_lane_width"] = logical_capacity
-            row["capacity_pallets"] = logical_capacity * len(row_cells)
-            row["cells_count"] = len(row_cells)
+    if row:
+        row["base_cell_width_m"] = base_cell_width
+        row["base_row_width_m"] = base_cell_width
+        row["x_min"] = row_x_min
+        row["x_max"] = row_x_max
+        row["x_center"] = (row_x_min + row_x_max) / 2
+        row["width_m"] = target_width
+        row["row_storage_type"] = storage_type
+        row["deep_lane_width"] = logical_capacity
+        row["capacity_pallets"] = logical_capacity * len(row_cells)
+        row["cells_count"] = len(row_cells)
     for setting in model.get("row_settings", []):
         if str(setting.get("row_number")) == str(row_number):
             setting["row_storage_type"] = storage_type
             setting["deep_lane_width"] = logical_capacity
+            setting["base_cell_width_m"] = base_cell_width
+            setting["base_row_width_m"] = base_cell_width
+    _refresh_linear_geometry_after_row_resize(model)
+    return True, "Геометрия ряда обновлена."
 
 
 def _cell_options(model: dict) -> dict[str, str]:
@@ -2151,6 +2223,7 @@ def render_map_edit_panel(model: dict) -> dict:
             elif any(_occupied_for_cell(model, _map_cell_key(c)) > target_capacity for c in row_cells):
                 st.error("Нельзя уменьшить вместимость ниже занятого количества паллет.")
             else:
+                before_change = copy.deepcopy(model)
                 _save_map_edit_snapshot(model)
                 for r in model.get("rows", []):
                     if str(r.get("row_number")) == row_number:
@@ -2165,7 +2238,12 @@ def render_map_edit_panel(model: dict) -> dict:
                 for setting in model.get("row_settings", []):
                     if str(setting.get("row_number")) == row_number:
                         setting.update({"row_number": new_row_number, "cell_direction": new_direction, "weight_zone": new_zone})
-                _apply_row_storage_geometry(model, str(new_row_number), new_storage, target_capacity)
+                ok, geometry_msg = _apply_row_storage_geometry(model, str(new_row_number), new_storage, target_capacity)
+                if not ok:
+                    model.clear()
+                    model.update(before_change)
+                    st.error(geometry_msg)
+                    return model
                 _persist_map_edit(model, "Ряд обновлён.")
                 st.rerun()
         confirm_row = st.checkbox("Подтвердить удаление ряда", key="map_row_delete_confirm")
