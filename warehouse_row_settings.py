@@ -1,0 +1,210 @@
+from __future__ import annotations
+
+import copy
+from typing import Any
+
+import pandas as pd
+
+VALID_DIRECTIONS = {"bottom_to_top", "top_to_bottom"}
+VALID_STORAGE_TYPES = {"normal", "deep_lane"}
+VALID_ZONES = {"heavy", "medium", "light", "fragile", "unassigned"}
+SYNC_FIELDS = ["row_number", "row_order", "cell_direction", "weight_zone", "row_storage_type", "deep_lane_width", "capacity_pallets", "row_group", "side", "comment", "base_cell_width_m", "base_row_width_m"]
+CELL_SYNC_FIELDS = ["row_order", "cell_direction", "weight_zone", "row_group", "side", "comment"]
+
+
+def _display(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None or str(value).strip() == "":
+            return default
+        return float(str(value).replace(",", "."))
+    except (TypeError, ValueError):
+        return default
+
+
+def _cell_key(cell: dict[str, Any]) -> str:
+    return f"{_display(cell.get('row_number'))}|{_display(cell.get('cell_number'))}|{_display(cell.get('tier')) or '1'}"
+
+
+def _row_fallback(model: dict[str, Any], row_number: str, field: str, default: Any = "") -> Any:
+    for row in model.get("row_settings", []):
+        if _display(row.get("row_number")) == row_number and row.get(field) not in {None, ""}:
+            return row.get(field)
+    for cell in model.get("cells", []):
+        if _display(cell.get("row_number")) == row_number and cell.get(field) not in {None, ""}:
+            return cell.get(field)
+    return default
+
+
+def build_row_settings_draft(model: dict[str, Any]) -> pd.DataFrame:
+    rows = []
+    for row in sorted(model.get("rows", []), key=lambda item: _float(item.get("row_order"), 10**9)):
+        row_number = _display(row.get("row_number"))
+        row_cells = [cell for cell in model.get("cells", []) if _display(cell.get("row_number")) == row_number]
+        storage = row.get("row_storage_type") or _row_fallback(model, row_number, "row_storage_type", "normal")
+        deep_width = int(_float(row.get("deep_lane_width") or _row_fallback(model, row_number, "deep_lane_width", 1), 1))
+        cell_capacity = deep_width if storage == "deep_lane" else 1
+        rows.append({
+            "row_number": row_number,
+            "row_order": _float(row.get("row_order") or _row_fallback(model, row_number, "row_order", len(rows) + 1), len(rows) + 1),
+            "cell_direction": row.get("cell_direction") or _row_fallback(model, row_number, "cell_direction", "bottom_to_top"),
+            "weight_zone": row.get("weight_zone") or _row_fallback(model, row_number, "weight_zone", "unassigned"),
+            "row_storage_type": storage,
+            "cell_capacity_pallets": cell_capacity,
+            "cells_count": len(row_cells) or int(_float(row.get("cells_count"), 0)),
+            "row_capacity_pallets": (len(row_cells) or int(_float(row.get("cells_count"), 0))) * cell_capacity,
+            "row_group": row.get("row_group") or _row_fallback(model, row_number, "row_group", ""),
+            "side": row.get("side") or _row_fallback(model, row_number, "side", ""),
+            "comment": row.get("comment") or _row_fallback(model, row_number, "comment", ""),
+        })
+    return pd.DataFrame(rows)
+
+
+def _base_cell_width(model: dict[str, Any], row: dict[str, Any], cells: list[dict[str, Any]]) -> float:
+    settings_width = _float((model.get("settings") or {}).get("cell_width_m"), 0.0)
+    if row.get("base_cell_width_m"):
+        return _float(row.get("base_cell_width_m"), settings_width or 1.0)
+    for cell in cells:
+        if cell.get("base_cell_width_m"):
+            return _float(cell.get("base_cell_width_m"), settings_width or 1.0)
+    if settings_width > 0:
+        return settings_width
+    if cells:
+        width = _float(cells[0].get("x_max")) - _float(cells[0].get("x_min"))
+        lane = int(_float(cells[0].get("deep_lane_width"), 1)) if cells[0].get("storage_type") == "deep_lane" else 1
+        return width / max(lane, 1) if width > 0 else 1.0
+    return 1.0
+
+
+def _physical_slots(cell: dict[str, Any], capacity: int) -> list[dict[str, Any]]:
+    if capacity <= 1:
+        return []
+    x_min = _float(cell.get("x_min"))
+    x_max = _float(cell.get("x_max"), x_min)
+    y_min = _float(cell.get("y_min"))
+    y_max = _float(cell.get("y_max"), y_min)
+    slot_width = (x_max - x_min) / capacity
+    return [{"slot_index": idx, "x_min": x_min + (idx - 1) * slot_width, "x_max": x_min + idx * slot_width, "y_min": y_min, "y_max": y_max, "capacity_pallets": 1} for idx in range(1, capacity + 1)]
+
+
+def _refresh_navigation(model: dict[str, Any]) -> None:
+    rows = {_display(row.get("row_number")): row for row in model.get("rows", [])}
+    for aisle in model.get("aisles", []):
+        row_from = rows.get(_display(aisle.get("row_from")))
+        row_to = rows.get(_display(aisle.get("row_to")))
+        if row_from and row_to:
+            aisle["x_min"] = _float(row_from.get("x_max"))
+            aisle["x_max"] = _float(row_to.get("x_min"))
+            aisle["aisle_width_m"] = max(_float(aisle.get("x_max")) - _float(aisle.get("x_min")), 0.0)
+    total_width = max([_float(row.get("x_max")) for row in model.get("rows", [])] + [0.0])
+    for road in model.get("roads", []):
+        road["x_max"] = total_width
+    for node in model.get("navigation_nodes", []):
+        row = rows.get(_display(node.get("row_number")))
+        if row:
+            node["x"] = _float(row.get("x_center"))
+        elif node.get("node_id") in {"road:bottom", "road:top"}:
+            node["x"] = total_width / 2 if total_width else 0.0
+
+
+def _has_intersection(model: dict[str, Any], row_number: str, x_min: float, x_max: float, y_min: float, y_max: float) -> bool:
+    for row in model.get("rows", []):
+        if _display(row.get("row_number")) == row_number:
+            continue
+        overlap_x = x_min < _float(row.get("x_max")) and x_max > _float(row.get("x_min"))
+        overlap_y = y_min < _float(row.get("y_max")) and y_max > _float(row.get("y_min"))
+        if overlap_x and overlap_y:
+            return True
+    return False
+
+
+def _occupied_by_cell(model: dict[str, Any]) -> dict[str, float]:
+    occupied: dict[str, float] = {}
+    for placement in model.get("placements", []):
+        key = _display(placement.get("cell_key"))
+        occupied[key] = occupied.get(key, 0.0) + _float(placement.get("occupied_capacity_pallets", placement.get("qty_pallets", 0)))
+    return occupied
+
+
+def _validate_edited_rows(model: dict[str, Any], edited_rows: list[dict[str, Any]]) -> list[str]:
+    errors: list[str] = []
+    model_rows = {_display(row.get("row_number")) for row in model.get("rows", [])}
+    seen = set()
+    occupied = _occupied_by_cell(model)
+    cells = model.get("cells", [])
+    for edited in edited_rows:
+        row_number = _display(edited.get("row_number"))
+        if not row_number or row_number not in model_rows:
+            errors.append(f"Ошибка: ряд {row_number or '—'} не найден в модели.")
+            continue
+        if row_number in seen:
+            errors.append(f"Ошибка: ряд {row_number}: дублирующая строка настроек.")
+        seen.add(row_number)
+        if edited.get("cell_direction") not in VALID_DIRECTIONS:
+            errors.append(f"Ошибка: ряд {row_number}: некорректное направление.")
+        if edited.get("row_storage_type") not in VALID_STORAGE_TYPES:
+            errors.append(f"Ошибка: ряд {row_number}: некорректный тип ряда.")
+        if edited.get("weight_zone", "unassigned") not in VALID_ZONES:
+            errors.append(f"Ошибка: ряд {row_number}: некорректная весовая зона.")
+        capacity = int(_float(edited.get("cell_capacity_pallets"), 1)) if edited.get("row_storage_type") == "deep_lane" else 1
+        if capacity < 1:
+            errors.append(f"Ошибка: ряд {row_number}: вместимость должна быть не меньше 1.")
+        for cell in cells:
+            if _display(cell.get("row_number")) == row_number and occupied.get(_cell_key(cell), 0.0) > capacity:
+                errors.append(f"Ошибка: ряд {row_number}, ячейка {_cell_key(cell)}: занято {occupied[_cell_key(cell)]:g}, новая вместимость {capacity:g}.")
+    return errors
+
+
+def sync_row_settings_to_model(model: dict[str, Any]) -> dict[str, Any]:
+    rows_by_number = {_display(row.get("row_number")): row for row in model.get("rows", [])}
+    for row_number, row in rows_by_number.items():
+        row_cells = [cell for cell in model.get("cells", []) if _display(cell.get("row_number")) == row_number]
+        capacity = int(_float(row.get("deep_lane_width"), 1)) if row.get("row_storage_type") == "deep_lane" else 1
+        base_width = _base_cell_width(model, row, row_cells)
+        target_width = base_width * capacity
+        x_min = _float(row.get("x_min")) if row.get("x_min") is not None else (_float(row_cells[0].get("x_min")) if row_cells else 0.0)
+        x_max = x_min + target_width
+        row.update({"base_cell_width_m": base_width, "base_row_width_m": base_width, "x_min": x_min, "x_max": x_max, "x_center": (x_min + x_max) / 2, "width_m": target_width, "deep_lane_width": capacity, "capacity_pallets": capacity * len(row_cells), "cells_count": len(row_cells)})
+        for cell_group_name in ["cells", "base_cells"]:
+            for cell in model.get(cell_group_name, []):
+                if _display(cell.get("row_number")) != row_number:
+                    continue
+                for field in CELL_SYNC_FIELDS:
+                    cell[field] = row.get(field, "")
+                cell.update({"storage_type": row.get("row_storage_type", "normal"), "deep_lane_width": capacity, "capacity_pallets": capacity, "base_cell_width_m": base_width, "base_row_width_m": base_width, "x_min": x_min, "x_max": x_max, "x_center": (x_min + x_max) / 2, "width_m": target_width})
+                cell["physical_slots"] = _physical_slots(cell, capacity) if row.get("row_storage_type") == "deep_lane" else []
+    model["row_settings"] = [{field: row.get(field, "") for field in SYNC_FIELDS} for row in model.get("rows", [])]
+    _refresh_navigation(model)
+    return model
+
+
+def apply_row_settings_transaction(model: dict[str, Any], edited_rows: list[dict[str, Any]]) -> tuple[dict[str, Any], list[str]]:
+    original = copy.deepcopy(model)
+    errors = _validate_edited_rows(model, edited_rows)
+    if errors:
+        return original, errors
+    changed: list[str] = []
+    edited_by_number = {_display(row.get("row_number")): row for row in edited_rows}
+    candidate = copy.deepcopy(model)
+    rows_by_number = {_display(row.get("row_number")): row for row in candidate.get("rows", [])}
+    for row_number, edited in edited_by_number.items():
+        row = rows_by_number[row_number]
+        old = {field: row.get(field) for field in ["row_order", "cell_direction", "weight_zone", "row_storage_type", "deep_lane_width", "row_group", "side", "comment"]}
+        storage = edited.get("row_storage_type", "normal")
+        capacity = int(_float(edited.get("cell_capacity_pallets"), 1)) if storage == "deep_lane" else 1
+        row.update({"row_order": _float(edited.get("row_order"), row.get("row_order", 0)), "cell_direction": edited.get("cell_direction", "bottom_to_top"), "weight_zone": edited.get("weight_zone", "unassigned"), "row_storage_type": storage, "deep_lane_width": capacity, "row_group": _display(edited.get("row_group")), "side": _display(edited.get("side")), "comment": _display(edited.get("comment"))})
+        new = {field: row.get(field) for field in old}
+        diff = [f"{field}: {old[field]} → {new[field]}" for field in old if old[field] != new[field]]
+        if diff:
+            changed.append(f"Ряд {row_number}: " + "; ".join(diff))
+    sync_row_settings_to_model(candidate)
+    for row in candidate.get("rows", []):
+        row_number = _display(row.get("row_number"))
+        if _has_intersection(candidate, row_number, _float(row.get("x_min")), _float(row.get("x_max")), _float(row.get("y_min")), _float(row.get("y_max"))):
+            return original, ["Ошибка: недостаточно места для расширения набивного ряда. Переместите соседние ряды или увеличьте расстояние между ними."]
+    return candidate, changed or ["Изменений нет."]
