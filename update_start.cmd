@@ -13,7 +13,6 @@ echo ============================================================
 echo Updating TudaSuda from %CD%
 echo Log file: %UPDATE_LOG%
 echo ============================================================
-
 >"%UPDATE_LOG%" echo ============================================================
 >>"%UPDATE_LOG%" echo Updating TudaSuda from %CD%
 >>"%UPDATE_LOG%" echo Log file: %UPDATE_LOG%
@@ -47,7 +46,6 @@ if defined GIT_DIRTY (
 
 call :log Fetching latest code metadata...
 git fetch --prune >>"%UPDATE_LOG%" 2>&1
-
 if errorlevel 1 (
     call :log git fetch failed. Starting local version; see %UPDATE_LOG% for details.
     call "%~dp0start.cmd"

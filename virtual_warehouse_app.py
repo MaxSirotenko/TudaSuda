@@ -934,6 +934,9 @@ RECEIPT_WEIGHT_CLASS_LABELS = {
 
 RECEIPT_TABLE_COLUMNS = {
     "receipt_date": "Дата прихода",
+    "receipt_number": "Номер приходного ордера",
+    "receipt_line_id": "Строка прихода",
+    "sku_key": "Ключ SKU",
     "receipt_document": "Документ прихода",
     "sku_code": "Код товара",
     "sku_name": "Наименование",
@@ -977,9 +980,18 @@ def _receipt_zone_summary(receipts: list[dict]) -> dict[str, int]:
 
 
 def _zone_calculation_dataframe(receipts: list[dict]) -> pd.DataFrame:
+    receipt_count_by_sku = {}
+    for receipt in receipts:
+        sku_key = receipt.get("sku_key", "")
+        if sku_key:
+            receipt_count_by_sku.setdefault(sku_key, set()).add(receipt.get("receipt_number", ""))
     rows = []
     for receipt in receipts:
+        sku_key = receipt.get("sku_key", "")
         rows.append({
+            "Номер приходного ордера": receipt.get("receipt_number", ""),
+            "receipt_line_id": receipt.get("receipt_line_id", ""),
+            "sku_key": sku_key,
             "SKU": receipt.get("sku_code", ""),
             "Номенклатура": receipt.get("sku_name", ""),
             "Характеристика": receipt.get("characteristic_name", ""),
@@ -987,6 +999,8 @@ def _zone_calculation_dataframe(receipts: list[dict]) -> pd.DataFrame:
             "Признак хрупкости": "Да" if receipt.get("fragile_flag") else "Нет",
             "Исходная зона из 1С": receipt.get("source_zone", ""),
             "Рассчитанная зона": RECEIPT_WEIGHT_CLASS_LABELS.get(receipt.get("calculated_zone", "unclassified"), receipt.get("calculated_zone", "")),
+            "Количество паллет": receipt.get("qty_pallets", ""),
+            "Приходов с этим SKU": len(receipt_count_by_sku.get(sku_key, set())),
             "Причина расчёта": receipt.get("zone_calculation_reason", ""),
             "Статус": receipt.get("zone_calculation_status", ""),
         })

@@ -34,6 +34,9 @@ SOURCE_ZONE_ALIASES = ["source_zone", "зона", "зона 1с", "исходн�
 
 RECEIPT_COLUMNS = [
     "receipt_id",
+    "receipt_line_id",
+    "source_row_number",
+    "sku_key",
     "receipt_date",
     "receipt_number",
     "receipt_document",
@@ -101,6 +104,32 @@ def _truthy_flag(value: Any) -> bool:
     return text in {"1", "true", "yes", "y", "да", "истина", "хрупкое", "хрупкий", "fragile"}
 
 
+def make_sku_key(item: dict[str, Any]) -> str:
+    sku_code = _display_value(item.get("sku_code"))
+    sku_name = _display_value(item.get("sku_name"))
+    characteristic_code = _display_value(item.get("characteristic_code"))
+    characteristic_name = _display_value(item.get("characteristic_name") or item.get("characteristic"))
+    if sku_code and characteristic_code:
+        return f"code:{sku_code}|char_code:{characteristic_code}"
+    if sku_code and characteristic_name:
+        return f"code:{sku_code}|char_name:{characteristic_name}"
+    if sku_name and characteristic_name:
+        return f"name:{sku_name}|char_name:{characteristic_name}"
+    if sku_name:
+        return f"name:{sku_name}"
+    if sku_code:
+        return f"code:{sku_code}"
+    return ""
+
+
+def make_receipt_line_id(item: dict[str, Any]) -> str:
+    receipt_number = _display_value(item.get("receipt_number")) or "без_ордера"
+    source_row = _display_value(item.get("source_row_number")) or _display_value(item.get("row_index")) or "0"
+    sku_key = _display_value(item.get("sku_key")) or make_sku_key(item) or "без_sku"
+    safe = re.sub(r"[^0-9A-Za-zА-Яа-я_.-]+", "_", f"{receipt_number}|{source_row}|{sku_key}")
+    return safe.strip("_")
+
+
 def default_zone_classification_settings() -> dict[str, Any]:
     return {
         "weight_column": None,
@@ -142,36 +171,62 @@ def _calculated_zone_for(weight: float | None, fragile: bool, light_limit: float
     return "heavy", "Вес выше границы среднего"
 
 
+def _median(values: list[float]) -> float:
+    ordered = sorted(values)
+    count = len(ordered)
+    middle = count // 2
+    if count % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2
+
+
+def _weight_conflict(values: list[float]) -> tuple[bool, float | None]:
+    if not values:
+        return False, None
+    median = _median(values)
+    tolerance = max(0.05, abs(median) * 0.02)
+    return any(abs(value - median) > tolerance for value in values), median
+
+
 def calculate_receipt_zones(receipts: list[dict[str, Any]], settings: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     light_limit = _safe_float(settings.get("max_light_weight_kg"), 0.0)
     medium_limit = _safe_float(settings.get("max_medium_weight_kg"), 0.0)
     rows = [dict(item) for item in receipts]
-    by_sku: dict[str, dict[str, set[Any]]] = {}
+    by_sku: dict[str, dict[str, Any]] = {}
     for item in rows:
-        sku = _display_value(item.get("sku_code"))
-        if not sku:
+        sku_key = _display_value(item.get("sku_key")) or make_sku_key(item)
+        item["sku_key"] = sku_key
+        item["receipt_line_id"] = _display_value(item.get("receipt_line_id")) or make_receipt_line_id(item)
+        if not sku_key:
             continue
         weight_text = _display_value(item.get("source_weight"))
+        weight = None if weight_text == "" else _safe_float(weight_text, None)
         fragile = bool(item.get("fragile_flag"))
-        by_sku.setdefault(sku, {"weights": set(), "fragile": set()})
-        by_sku[sku]["weights"].add(weight_text)
-        by_sku[sku]["fragile"].add(fragile)
-    conflicts = {sku for sku, values in by_sku.items() if len(values["weights"]) > 1 or len(values["fragile"]) > 1}
+        bucket = by_sku.setdefault(sku_key, {"weights": [], "fragile": set(), "receipts": set(), "rows": 0, "qty_pallets": 0.0})
+        if weight is not None:
+            bucket["weights"].append(weight)
+        bucket["fragile"].add(fragile)
+        if item.get("receipt_number"):
+            bucket["receipts"].add(_display_value(item.get("receipt_number")))
+        bucket["rows"] += 1
+        bucket["qty_pallets"] += _safe_float(item.get("qty_pallets"))
+    conflicts: set[str] = set()
     sku_result: dict[str, tuple[str, str, str]] = {}
-    for sku, values in by_sku.items():
-        if sku in conflicts:
-            sku_result[sku] = ("unclassified", "Конфликт данных SKU", "conflict")
+    for sku_key, values in by_sku.items():
+        has_weight_conflict, median_weight = _weight_conflict(values["weights"])
+        has_fragile_conflict = len(values["fragile"]) > 1
+        if has_weight_conflict or has_fragile_conflict:
+            conflicts.add(sku_key)
+            sku_result[sku_key] = ("unclassified", "Конфликт данных SKU", "conflict")
             continue
-        raw_weight = next(iter(values["weights"]), "")
-        weight = None if raw_weight == "" else _safe_float(raw_weight, None)
         fragile = next(iter(values["fragile"]), False)
-        zone, reason = _calculated_zone_for(weight, fragile, light_limit, medium_limit)
+        zone, reason = _calculated_zone_for(median_weight, fragile, light_limit, medium_limit)
         status = "ok" if zone != "unclassified" else "error"
-        sku_result[sku] = (zone, reason, status)
+        sku_result[sku_key] = (zone, reason, status)
     mismatches = 0
     for item in rows:
-        sku = _display_value(item.get("sku_code"))
-        zone, reason, status = sku_result.get(sku, ("unclassified", "Вес отсутствует", "error"))
+        sku_key = _display_value(item.get("sku_key")) or make_sku_key(item)
+        zone, reason, status = sku_result.get(sku_key, ("unclassified", "Вес отсутствует", "error"))
         source_zone = _normalize_weight_class(item.get("source_zone"))
         if source_zone != "unclassified" and source_zone != zone:
             mismatches += 1
@@ -179,8 +234,12 @@ def calculate_receipt_zones(receipts: list[dict[str, Any]], settings: dict[str, 
         item["weight_class"] = zone
         item["zone_calculation_reason"] = reason
         item["zone_calculation_status"] = status if source_zone in {"unclassified", zone} else "mismatch"
-    sku_zones = {sku: result[0] for sku, result in sku_result.items()}
+    sku_zones = {sku_key: result[0] for sku_key, result in sku_result.items()}
+    multi_receipt_sku = sorted([sku_key for sku_key, values in by_sku.items() if len(values["receipts"]) > 1])
+    repeated_rows = sum(max(int(values["rows"]) - 1, 0) for values in by_sku.values())
     diagnostics = {
+        "Количество приходных ордеров": len({item.get("receipt_number") for item in rows if item.get("receipt_number")}),
+        "Количество строк прихода": len(rows),
         "Всего SKU": len(sku_zones),
         "Лёгких SKU": sum(1 for value in sku_zones.values() if value == "light"),
         "Средних SKU": sum(1 for value in sku_zones.values() if value == "medium"),
@@ -188,8 +247,12 @@ def calculate_receipt_zones(receipts: list[dict[str, Any]], settings: dict[str, 
         "Хрупких SKU": sum(1 for value in sku_zones.values() if value == "fragile"),
         "SKU без рассчитанной категории": sum(1 for value in sku_zones.values() if value == "unclassified"),
         "Конфликтов данных": len(conflicts),
+        "SKU в нескольких приходах": len(multi_receipt_sku),
+        "Повторных строк одинакового SKU": repeated_rows,
+        "Паллет по SKU": {sku_key: round(values["qty_pallets"], 4) for sku_key, values in by_sku.items()},
         "Несовпадений с исходной зоной 1С": mismatches,
         "conflicts": sorted(conflicts),
+        "multi_receipt_sku": multi_receipt_sku,
         "settings_hash": zone_classification_settings_hash(settings),
     }
     return rows, diagnostics
@@ -275,9 +338,13 @@ def normalize_receipt_table(df: pd.DataFrame, mapping: dict[str, str | None]) ->
         return pd.DataFrame(columns=RECEIPT_COLUMNS), build_receipt_diagnostics([], len(df), messages), messages
 
     rows: list[dict[str, Any]] = []
-    for _, row in df.iterrows():
+    for source_index, (_, row) in enumerate(df.iterrows(), start=1):
+        source_row_number = source_index
         receipt = {
             "receipt_id": str(uuid.uuid4()),
+            "receipt_line_id": "",
+            "source_row_number": source_row_number,
+            "sku_key": "",
             "receipt_date": _display_value(row.get(mapping.get("receipt_date"))) if mapping.get("receipt_date") else "",
             "receipt_number": _display_value(row.get(mapping.get("receipt_number"))) if mapping.get("receipt_number") else "",
             "receipt_document": _display_value(row.get(mapping.get("receipt_document"))) if mapping.get("receipt_document") else "",
@@ -303,6 +370,8 @@ def normalize_receipt_table(df: pd.DataFrame, mapping: dict[str, str | None]) ->
             "fragile_flag": _truthy_flag(row.get(mapping.get("fragile_flag"))) if mapping.get("fragile_flag") else False,
             "zone_calculation_status": "not_calculated",
         }
+        receipt["sku_key"] = make_sku_key(receipt)
+        receipt["receipt_line_id"] = make_receipt_line_id(receipt)
         rows.append(receipt)
     result = pd.DataFrame(rows, columns=RECEIPT_COLUMNS)
     diagnostics = build_receipt_diagnostics(rows, len(df), messages)
@@ -311,6 +380,17 @@ def normalize_receipt_table(df: pd.DataFrame, mapping: dict[str, str | None]) ->
 
 def build_receipt_diagnostics(receipts: list[dict[str, Any]], source_rows: int, messages: list[dict[str, str]] | None = None) -> dict[str, Any]:
     messages = list(messages or [])
+    sku_keys = [_display_value(item.get("sku_key")) or make_sku_key(item) for item in receipts]
+    receipt_numbers_by_sku: dict[str, set[str]] = {}
+    rows_by_sku: dict[str, int] = {}
+    pallets_by_sku: dict[str, float] = {}
+    for item, sku_key in zip(receipts, sku_keys):
+        if not sku_key:
+            continue
+        rows_by_sku[sku_key] = rows_by_sku.get(sku_key, 0) + 1
+        pallets_by_sku[sku_key] = pallets_by_sku.get(sku_key, 0.0) + _safe_float(item.get("qty_pallets"))
+        if item.get("receipt_number"):
+            receipt_numbers_by_sku.setdefault(sku_key, set()).add(_display_value(item.get("receipt_number")))
     dates = [item.get("receipt_date", "") for item in receipts if item.get("receipt_date")]
     expiry = [item for item in receipts if item.get("expiry_date")]
     no_qty = [item for item in receipts if _safe_float(item.get("qty_pallets")) == 0 and _safe_float(item.get("qty_boxes")) == 0 and _safe_float(item.get("qty_units")) == 0]
@@ -327,7 +407,12 @@ def build_receipt_diagnostics(receipts: list[dict[str, Any]], source_rows: int, 
             messages.append({"level": "warning", "message": f"SKU {item.get('sku_code') or '—'}: не заполнено количество."})
     return {
         "Всего строк в файле": source_rows,
-        "Всего SKU": len({item.get("sku_code") for item in receipts if item.get("sku_code")}),
+        "Количество приходных ордеров": len({item.get("receipt_number") for item in receipts if item.get("receipt_number")}),
+        "Количество строк прихода": len(receipts),
+        "Всего SKU": len({sku_key for sku_key in sku_keys if sku_key}),
+        "SKU в нескольких приходах": sum(1 for receipt_numbers in receipt_numbers_by_sku.values() if len(receipt_numbers) > 1),
+        "Повторных строк одинакового SKU": sum(max(count - 1, 0) for count in rows_by_sku.values()),
+        "Паллет по SKU": {sku_key: round(qty, 4) for sku_key, qty in pallets_by_sku.items()},
         "Всего паллет": sum(_safe_float(item.get("qty_pallets")) for item in receipts),
         "Всего коробов": sum(_safe_float(item.get("qty_boxes")) for item in receipts),
         "Строк без кода товара": sum(1 for item in receipts if not item.get("sku_code")),
@@ -387,6 +472,10 @@ def load_receipts_state(model: dict[str, Any] | None = None) -> tuple[dict[str, 
     except json.JSONDecodeError:
         return empty_receipts_state(model), "Файл receipts.json повреждён и не был загружен."
     state.setdefault("receipts", [])
+    for index, receipt in enumerate(state["receipts"], start=1):
+        receipt.setdefault("source_row_number", index)
+        receipt.setdefault("sku_key", make_sku_key(receipt))
+        receipt.setdefault("receipt_line_id", make_receipt_line_id(receipt))
     state.setdefault("diagnostics", build_receipt_diagnostics(state.get("receipts", []), len(state.get("receipts", []))))
     state.setdefault("zone_classification_settings", default_zone_classification_settings())
     state.setdefault("zone_classification_diagnostics", {})
