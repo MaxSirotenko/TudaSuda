@@ -117,6 +117,20 @@ def _find_column(columns: list[str], aliases: list[str]) -> str | None:
     return None
 
 
+def get_row_direction(model: dict[str, Any], row_number: Any) -> str:
+    row_text = _display_value(row_number)
+    for row in model.get("rows", []):
+        if _display_value(row.get("row_number")) == row_text and row.get("cell_direction"):
+            return _display_value(row.get("cell_direction"))
+    for row_setting in model.get("row_settings", []):
+        if _display_value(row_setting.get("row_number")) == row_text and row_setting.get("cell_direction"):
+            return _display_value(row_setting.get("cell_direction"))
+    for cell in model.get("cells", []):
+        if _display_value(cell.get("row_number")) == row_text and cell.get("cell_direction"):
+            return _display_value(cell.get("cell_direction"))
+    return "bottom_to_top"
+
+
 def cell_key(row_number: Any, cell_number: Any, tier: Any) -> str:
     return f"{_display_value(row_number)}|{_display_value(cell_number)}|{_display_value(tier) or '1'}"
 
@@ -322,12 +336,14 @@ def import_inventory(model: dict[str, Any], normalized_df: pd.DataFrame, allow_r
     return state, diagnostics
 
 
-def _cell_sort_key(cell: dict[str, Any]) -> tuple[Any, Any]:
+def _cell_sort_key(cell: dict[str, Any], model: dict[str, Any] | None = None) -> tuple[Any, Any]:
     row_order = cell.get("row_order", 10**9)
+    direction = get_row_direction(model or {"cells": [cell]}, cell.get("row_number"))
     cell_num = _number_key(cell.get("cell_number"))
-    if cell.get("cell_direction") == "top_to_bottom":
-        return (row_order, (0, -cell_num[1]) if cell_num[0] == 0 else cell_num)
-    return (row_order, cell_num)
+    if cell_num[0] == 0:
+        return (row_order, -cell_num[1] if direction == "top_to_bottom" else cell_num[1], 0)
+    y_center = _safe_float(cell.get("y_center"))
+    return (row_order, -y_center if direction == "top_to_bottom" else y_center, 1)
 
 
 def _occupied_by_cell(state: dict[str, Any]) -> dict[str, float]:
@@ -344,7 +360,7 @@ def auto_place_unplaced(model: dict[str, Any], state: dict[str, Any], allow_mixe
     sku_by_cell: dict[str, set[str]] = {}
     for placement in state.get("placements", []):
         sku_by_cell.setdefault(placement.get("cell_key", ""), set()).add(placement.get("sku_code", ""))
-    cells = sorted(model.get("cells", []), key=_cell_sort_key)
+    cells = sorted(model.get("cells", []), key=lambda cell: _cell_sort_key(cell, model))
     remaining_unplaced = []
     for item in sorted(state.get("unplaced_inventory", []), key=lambda x: _safe_float(x.get("qty_pallets")), reverse=True):
         remaining = _safe_float(item.get("qty_pallets"))
@@ -715,7 +731,7 @@ def calculate_basic_weight_placement(model: dict[str, Any], state: dict[str, Any
     row_zones = _row_zones(model)
     unassigned_rows = [row for row, zone in row_zones.items() if zone == "unassigned"]
     cells = _cell_map(model)
-    ordered_cells = sorted(model.get("cells", []), key=_cell_sort_key)
+    ordered_cells = sorted(model.get("cells", []), key=lambda cell: _cell_sort_key(cell, model))
     occupied: dict[str, float] = {}
     sku_by_cell: dict[str, set[str]] = {}
     placed: list[dict[str, Any]] = []
@@ -774,7 +790,7 @@ def calculate_basic_weight_placement(model: dict[str, Any], state: dict[str, Any
                 min_cell_delta = 10**9
                 priority = 2
             min_row_delta = min(abs(_safe_float(cell.get("row_order"), 10**9) - row_order) for row_order in row_orders)
-            return (priority, min_cell_delta if priority < 2 else min_row_delta, *_cell_sort_key(cell))
+            return (priority, min_cell_delta if priority < 2 else min_row_delta, *_cell_sort_key(cell, model))
 
         return sorted(zone_cells, key=rank)
 

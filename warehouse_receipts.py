@@ -58,7 +58,10 @@ RECEIPT_COLUMNS = [
     "source_zone",
     "calculated_zone",
     "zone_calculation_reason",
+    "source_weight_raw",
     "source_weight",
+    "weight_parse_status",
+    "weight_parse_reason",
     "fragile_flag",
     "zone_calculation_status",
 ]
@@ -104,6 +107,23 @@ def _truthy_flag(value: Any) -> bool:
     return text in {"1", "true", "yes", "y", "да", "истина", "хрупкое", "хрупкий", "fragile"}
 
 
+def parse_weight_value(value: Any) -> tuple[str, float | None, str, str]:
+    raw = "" if value is None or pd.isna(value) else str(value)
+    text = raw.strip()
+    if not text:
+        return raw, None, "empty", "Пустое значение веса"
+    normalized = text.replace("\u00a0", "").replace(" ", "").lower()
+    normalized = normalized.replace("кг", "").replace("kg", "").replace(",", ".")
+    normalized = re.sub(r"[^0-9.+-]", "", normalized)
+    try:
+        weight = float(normalized)
+    except ValueError:
+        return raw, None, "error", "Ошибка преобразования веса"
+    if weight <= 0:
+        return raw, weight, "error", "Вес меньше или равен 0"
+    return raw, weight, "ok", ""
+
+
 def make_sku_key(item: dict[str, Any]) -> str:
     sku_code = _display_value(item.get("sku_code"))
     sku_name = _display_value(item.get("sku_name"))
@@ -144,6 +164,9 @@ def default_zone_classification_settings() -> dict[str, Any]:
 
 def zone_classification_settings_hash(settings: dict[str, Any]) -> str:
     payload = {
+        "weight_column": _display_value(settings.get("weight_column")),
+        "fragile_column": _display_value(settings.get("fragile_column")),
+        "source_zone_column": _display_value(settings.get("source_zone_column")),
         "max_light_weight_kg": _safe_float(settings.get("max_light_weight_kg")),
         "max_medium_weight_kg": _safe_float(settings.get("max_medium_weight_kg")),
     }
@@ -199,11 +222,10 @@ def calculate_receipt_zones(receipts: list[dict[str, Any]], settings: dict[str, 
         item["receipt_line_id"] = _display_value(item.get("receipt_line_id")) or make_receipt_line_id(item)
         if not sku_key:
             continue
-        weight_text = _display_value(item.get("source_weight"))
-        weight = None if weight_text == "" else _safe_float(weight_text, None)
+        weight = _safe_float(item.get("source_weight"), None) if item.get("weight_parse_status") == "ok" else None
         fragile = bool(item.get("fragile_flag"))
         bucket = by_sku.setdefault(sku_key, {"weights": [], "fragile": set(), "receipts": set(), "rows": 0, "qty_pallets": 0.0})
-        if weight is not None:
+        if weight is not None and weight > 0:
             bucket["weights"].append(weight)
         bucket["fragile"].add(fragile)
         if item.get("receipt_number"):
@@ -340,6 +362,7 @@ def normalize_receipt_table(df: pd.DataFrame, mapping: dict[str, str | None]) ->
     rows: list[dict[str, Any]] = []
     for source_index, (_, row) in enumerate(df.iterrows(), start=1):
         source_row_number = source_index
+        weight_raw, parsed_weight, weight_status, weight_reason = parse_weight_value(row.get(mapping.get("source_weight"))) if mapping.get("source_weight") else ("", None, "empty", "Колонка веса не выбрана")
         receipt = {
             "receipt_id": str(uuid.uuid4()),
             "receipt_line_id": "",
@@ -366,7 +389,10 @@ def normalize_receipt_table(df: pd.DataFrame, mapping: dict[str, str | None]) ->
             "source_zone": _display_value(row.get(mapping.get("source_zone"))) if mapping.get("source_zone") else (_display_value(row.get(mapping.get("weight_class"))) if mapping.get("weight_class") else ""),
             "calculated_zone": "unclassified",
             "zone_calculation_reason": "Вес отсутствует",
-            "source_weight": _display_value(row.get(mapping.get("source_weight"))) if mapping.get("source_weight") else "",
+            "source_weight_raw": weight_raw,
+            "source_weight": parsed_weight if parsed_weight is not None else "",
+            "weight_parse_status": weight_status,
+            "weight_parse_reason": weight_reason,
             "fragile_flag": _truthy_flag(row.get(mapping.get("fragile_flag"))) if mapping.get("fragile_flag") else False,
             "zone_calculation_status": "not_calculated",
         }
@@ -384,11 +410,16 @@ def build_receipt_diagnostics(receipts: list[dict[str, Any]], source_rows: int, 
     receipt_numbers_by_sku: dict[str, set[str]] = {}
     rows_by_sku: dict[str, int] = {}
     pallets_by_sku: dict[str, float] = {}
+    sku_valid_weight: dict[str, bool] = {}
+    sku_weight_conflicts = set()
     for item, sku_key in zip(receipts, sku_keys):
         if not sku_key:
             continue
         rows_by_sku[sku_key] = rows_by_sku.get(sku_key, 0) + 1
         pallets_by_sku[sku_key] = pallets_by_sku.get(sku_key, 0.0) + _safe_float(item.get("qty_pallets"))
+        sku_valid_weight[sku_key] = sku_valid_weight.get(sku_key, False) or item.get("weight_parse_status") == "ok"
+        if item.get("zone_calculation_reason") == "Конфликт данных SKU":
+            sku_weight_conflicts.add(sku_key)
         if item.get("receipt_number"):
             receipt_numbers_by_sku.setdefault(sku_key, set()).add(_display_value(item.get("receipt_number")))
     dates = [item.get("receipt_date", "") for item in receipts if item.get("receipt_date")]
@@ -413,6 +444,12 @@ def build_receipt_diagnostics(receipts: list[dict[str, Any]], source_rows: int, 
         "SKU в нескольких приходах": sum(1 for receipt_numbers in receipt_numbers_by_sku.values() if len(receipt_numbers) > 1),
         "Повторных строк одинакового SKU": sum(max(count - 1, 0) for count in rows_by_sku.values()),
         "Паллет по SKU": {sku_key: round(qty, 4) for sku_key, qty in pallets_by_sku.items()},
+        "Строк с исходным весом": sum(1 for item in receipts if _display_value(item.get("source_weight_raw"))),
+        "Вес успешно преобразован": sum(1 for item in receipts if item.get("weight_parse_status") == "ok"),
+        "Пустых значений веса": sum(1 for item in receipts if item.get("weight_parse_status") == "empty"),
+        "Ошибок преобразования веса": sum(1 for item in receipts if item.get("weight_parse_status") == "error"),
+        "SKU без любого валидного веса": sum(1 for value in sku_valid_weight.values() if not value),
+        "SKU с конфликтом веса": len(sku_weight_conflicts),
         "Всего паллет": sum(_safe_float(item.get("qty_pallets")) for item in receipts),
         "Всего коробов": sum(_safe_float(item.get("qty_boxes")) for item in receipts),
         "Строк без кода товара": sum(1 for item in receipts if not item.get("sku_code")),
@@ -476,6 +513,14 @@ def load_receipts_state(model: dict[str, Any] | None = None) -> tuple[dict[str, 
         receipt.setdefault("source_row_number", index)
         receipt.setdefault("sku_key", make_sku_key(receipt))
         receipt.setdefault("receipt_line_id", make_receipt_line_id(receipt))
+        if "source_weight_raw" not in receipt:
+            receipt["source_weight_raw"] = _display_value(receipt.get("source_weight"))
+        if "weight_parse_status" not in receipt:
+            raw, parsed, status, reason = parse_weight_value(receipt.get("source_weight"))
+            receipt["source_weight_raw"] = raw
+            receipt["source_weight"] = parsed if parsed is not None else ""
+            receipt["weight_parse_status"] = status
+            receipt["weight_parse_reason"] = reason
     state.setdefault("diagnostics", build_receipt_diagnostics(state.get("receipts", []), len(state.get("receipts", []))))
     state.setdefault("zone_classification_settings", default_zone_classification_settings())
     state.setdefault("zone_classification_diagnostics", {})

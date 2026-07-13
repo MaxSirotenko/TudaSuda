@@ -949,6 +949,9 @@ RECEIPT_TABLE_COLUMNS = {
     "source_zone": "Исходная зона из 1С",
     "calculated_zone": "Рассчитанная зона",
     "zone_calculation_reason": "Причина расчёта",
+    "source_weight_raw": "Исходный вес",
+    "weight_parse_status": "Статус веса",
+    "weight_parse_reason": "Причина ошибки веса",
     "zone_calculation_status": "Статус расчёта",
     "weight_class": "Зона размещения",
     "placement_status": "Статус размещения",
@@ -996,6 +999,9 @@ def _zone_calculation_dataframe(receipts: list[dict]) -> pd.DataFrame:
             "Номенклатура": receipt.get("sku_name", ""),
             "Характеристика": receipt.get("characteristic_name", ""),
             "Вес": receipt.get("source_weight", ""),
+            "Исходное значение веса": receipt.get("source_weight_raw", ""),
+            "Статус преобразования веса": receipt.get("weight_parse_status", ""),
+            "Причина ошибки веса": receipt.get("weight_parse_reason", ""),
             "Признак хрупкости": "Да" if receipt.get("fragile_flag") else "Нет",
             "Исходная зона из 1С": receipt.get("source_zone", ""),
             "Рассчитанная зона": RECEIPT_WEIGHT_CLASS_LABELS.get(receipt.get("calculated_zone", "unclassified"), receipt.get("calculated_zone", "")),
@@ -1021,6 +1027,24 @@ def _render_zone_classification_result(state: dict) -> None:
         st.metric("Несовпадений с исходной зоной 1С", diag.get("Несовпадений с исходной зоной 1С", 0))
     if state.get("receipts"):
         st.dataframe(_zone_calculation_dataframe(state.get("receipts", [])), use_container_width=True)
+        bad_weight_rows = [
+            {
+                "Номер приходного ордера": receipt.get("receipt_number", ""),
+                "receipt_line_id": receipt.get("receipt_line_id", ""),
+                "sku_key": receipt.get("sku_key", ""),
+                "Номенклатура": receipt.get("sku_name", ""),
+                "Характеристика": receipt.get("characteristic_name", ""),
+                "Исходное значение веса": receipt.get("source_weight_raw", ""),
+                "Нормализованное значение": receipt.get("source_weight", ""),
+                "Причина ошибки": receipt.get("weight_parse_reason", ""),
+                "Номер строки Excel": receipt.get("source_row_number", ""),
+            }
+            for receipt in state.get("receipts", [])
+            if receipt.get("weight_parse_status") != "ok"
+        ]
+        if bad_weight_rows:
+            st.warning("Есть строки, где вес не удалось преобразовать.")
+            st.dataframe(pd.DataFrame(bad_weight_rows), use_container_width=True)
 
 
 def _render_receipt_placement_diagnostics(diag: dict | None) -> None:
@@ -2235,6 +2259,9 @@ def render_map_edit_panel(model: dict) -> dict:
                     for p in model.get("placements", []):
                         if p.get("cell_key") == old_key:
                             p.update({"cell_key": new_key, "row_number": new_row_number, "weight_zone": new_zone})
+                for base_cell in model.get("base_cells", []):
+                    if str(base_cell.get("row_number")) == row_number:
+                        base_cell.update({"row_number": new_row_number, "row_order": new_order, "cell_direction": new_direction, "weight_zone": new_zone})
                 for setting in model.get("row_settings", []):
                     if str(setting.get("row_number")) == row_number:
                         setting.update({"row_number": new_row_number, "cell_direction": new_direction, "weight_zone": new_zone})
