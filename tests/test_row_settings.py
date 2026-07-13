@@ -177,3 +177,78 @@ def test_deep_lane_width_five_moves_following_rows_and_preserves_directions():
     assert row_152["cell_direction"] == "top_to_bottom"
     assert row_153["cell_direction"] == "top_to_bottom"
     assert all(cell["cell_direction"] == "top_to_bottom" for cell in updated["cells"] if cell["row_number"] in {"152", "153"})
+
+
+def _direction_model():
+    rows = []
+    cells = []
+    for idx, row_number in enumerate((152, 155, 157)):
+        x_min = idx * 4.2
+        x_max = x_min + 0.8
+        rows.append({
+            "row_number": str(row_number),
+            "row_order": idx + 1,
+            "cell_direction": "bottom_to_top",
+            "weight_zone": "unassigned",
+            "row_storage_type": "normal",
+            "deep_lane_width": 1,
+            "x_min": x_min,
+            "x_max": x_max,
+            "y_min": 0,
+            "y_max": 3.6,
+        })
+        for cell_number in (1, 2, 3):
+            cell = _cell(row_number, cell_number, x_min=x_min, x_max=x_max)
+            cell["length_m"] = 1.2
+            cell["y_min"] = (cell_number - 1) * 1.2
+            cell["y_max"] = cell_number * 1.2
+            cell["y_center"] = cell["y_min"] + 0.6
+            cells.append(cell)
+    return {
+        "model_type": "excel_rows_cells_aisles_geometry",
+        "model_id": "direction-test",
+        "settings": {"cell_width_m": 0.8, "cell_length_m": 1.2},
+        "rows": rows,
+        "cells": cells,
+        "base_cells": copy.deepcopy(cells),
+        "row_settings": [],
+        "aisles": [
+            {"row_from": "152", "row_to": "155", "aisle_width_m": 3.4, "x_min": 0.8, "x_max": 4.2},
+            {"row_from": "155", "row_to": "157", "aisle_width_m": 3.4, "x_min": 5.0, "x_max": 8.4},
+        ],
+        "roads": [],
+        "navigation_nodes": [],
+        "placements": [],
+    }
+
+
+def _row_cell_centers(model, row_number, group="cells"):
+    row_cells = [cell for cell in model[group] if cell["row_number"] == str(row_number)]
+    return {cell["cell_number"]: cell["y_center"] for cell in row_cells}
+
+
+def test_cell_direction_recalculates_vertical_coordinates_for_target_rows():
+    model = _direction_model()
+    edited = _edited(model)
+    for row in edited:
+        row["cell_direction"] = "top_to_bottom"
+    top, messages = apply_row_settings_transaction(model, edited)
+    assert not any(message.startswith("Ошибка:") for message in messages)
+    for row_number in (152, 155, 157):
+        centers = _row_cell_centers(top, row_number)
+        base_centers = _row_cell_centers(top, row_number, "base_cells")
+        assert centers["1"] > centers["3"]
+        assert base_centers["1"] > base_centers["3"]
+
+    repeated, messages = apply_row_settings_transaction(top, build_row_settings_draft(top).to_dict(orient="records"))
+    for row_number in (152, 155, 157):
+        assert _row_cell_centers(repeated, row_number) == _row_cell_centers(top, row_number)
+
+    edited_back = build_row_settings_draft(repeated).to_dict(orient="records")
+    for row in edited_back:
+        if row["row_number"] == "157":
+            row["cell_direction"] = "bottom_to_top"
+    bottom, messages = apply_row_settings_transaction(repeated, edited_back)
+    centers_157 = _row_cell_centers(bottom, 157)
+    assert centers_157["1"] < centers_157["3"]
+    assert next(row for row in bottom["rows"] if row["row_number"] == "155")["cell_direction"] == "top_to_bottom"

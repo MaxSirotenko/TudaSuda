@@ -102,6 +102,42 @@ def _cell_sort_key(cell: dict[str, Any]) -> tuple[float, str]:
     return (_float(cell.get("y_min"), 10**9), _display(cell.get("cell_number")))
 
 
+
+
+def _cell_number_sort_key(cell: dict[str, Any]) -> tuple[float, str]:
+    return (_float(cell.get("cell_number"), 10**9), _display(cell.get("cell_number")))
+
+
+def _cell_length(model: dict[str, Any], cells: list[dict[str, Any]]) -> float:
+    settings_length = _float((model.get("settings") or {}).get("cell_length_m"), 0.0)
+    for cell in cells:
+        length = _float(cell.get("length_m"), 0.0)
+        if length > 0:
+            return length
+        diff = _float(cell.get("y_max"), 0.0) - _float(cell.get("y_min"), 0.0)
+        if diff > 0:
+            return diff
+    return settings_length or 1.0
+
+
+def _apply_row_y_layout(model: dict[str, Any], row: dict[str, Any], cells: list[dict[str, Any]]) -> None:
+    ordered_cells = sorted(cells, key=_cell_number_sort_key)
+    if not ordered_cells:
+        row["y_min"] = 0.0
+        row["y_max"] = 0.0
+        return
+    length = _cell_length(model, ordered_cells)
+    direction = row.get("cell_direction", "bottom_to_top")
+    count = len(ordered_cells)
+    for idx, cell in enumerate(ordered_cells):
+        position_from_bottom = count - 1 - idx if direction == "top_to_bottom" else idx
+        y_min = position_from_bottom * length
+        y_max = y_min + length
+        cell.update({"y_min": y_min, "y_max": y_max, "y_center": (y_min + y_max) / 2, "length_m": length})
+    row["y_min"] = 0.0
+    row["y_max"] = count * length
+
+
 def _aisle_width(aisle: dict[str, Any]) -> float:
     width = _float(aisle.get("aisle_width_m"), 0.0)
     if width <= 0:
@@ -232,8 +268,9 @@ def sync_row_settings_to_model(model: dict[str, Any]) -> dict[str, Any]:
         x_min = _float(row.get("x_min"))
         x_max = _float(row.get("x_max"), x_min)
         for cell_group_name in ["cells", "base_cells"]:
-            group_cells = sorted([cell for cell in model.get(cell_group_name, []) if _display(cell.get("row_number")) == row_number], key=_cell_sort_key)
-            for cell in group_cells:
+            group_cells = [cell for cell in model.get(cell_group_name, []) if _display(cell.get("row_number")) == row_number]
+            _apply_row_y_layout(model, row, group_cells)
+            for cell in sorted(group_cells, key=_cell_number_sort_key):
                 for field in CELL_SYNC_FIELDS:
                     cell[field] = row.get(field, "")
                 cell.setdefault("initial_weight_zone", row.get("initial_weight_zone", row.get("weight_zone", "unassigned")))
