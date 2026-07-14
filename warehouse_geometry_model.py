@@ -170,6 +170,7 @@ def default_row_config(df: pd.DataFrame) -> pd.DataFrame:
             "row_group": [""] * len(rows),
             "side": [""] * len(rows),
             "comment": [""] * len(rows),
+            "weight_zone": ["unassigned"] * len(rows),
         }
     )
 
@@ -241,6 +242,7 @@ def _row_order_map(row_config: pd.DataFrame | None) -> dict[str, dict[str, Any]]
             "row_group": _display_value(row.get("row_group")),
             "side": _display_value(row.get("side")),
             "comment": _display_value(row.get("comment")),
+            "weight_zone": _display_value(row.get("weight_zone")) if _display_value(row.get("weight_zone")) in {"heavy", "medium", "light", "fragile", "unassigned"} else "unassigned",
         }
     return result
 
@@ -324,6 +326,8 @@ def build_geometry_model(
         storage_type = meta.get("row_storage_type", "normal")
         deep_lane_width = int(meta.get("deep_lane_width", 1))
         cell_direction = meta.get("cell_direction", "bottom_to_top")
+        weight_zone = meta.get("weight_zone", "unassigned")
+        initial_weight_zone = meta.get("initial_weight_zone", weight_zone)
         row_width_m = settings.cell_width_m * deep_lane_width
         row_order_value = meta.get("row_order") or len(rows) + 1
         row_x_min = x_cursor
@@ -370,6 +374,8 @@ def build_geometry_model(
                 "volume_m3": round(volume_m3, 4),
                 "cell_direction": cell_direction,
                 "row_order": row_order_value,
+                "weight_zone": weight_zone,
+                "initial_weight_zone": initial_weight_zone,
                 "physical_slots": physical_slots,
             }
             cells.append(cell)
@@ -390,6 +396,8 @@ def build_geometry_model(
             "row_group": meta.get("row_group", ""),
             "side": meta.get("side", ""),
             "comment": meta.get("comment", ""),
+            "weight_zone": weight_zone,
+            "initial_weight_zone": initial_weight_zone,
             "x_min": row_x_min,
             "x_max": row_x_max,
             "y_min": 0.0,
@@ -458,6 +466,8 @@ def build_geometry_model(
                 "row_storage_type": row.get("row_storage_type", "normal"),
                 "deep_lane_width": row.get("deep_lane_width", 1),
                 "cell_direction": row.get("cell_direction", "bottom_to_top"),
+                "weight_zone": row.get("weight_zone", "unassigned"),
+                "initial_weight_zone": row.get("initial_weight_zone", row.get("weight_zone", "unassigned")),
                 "updated_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
                 "comment": row.get("comment", ""),
             }
@@ -479,7 +489,7 @@ def save_geometry_model(model: dict[str, Any]) -> None:
     GEOMETRY_MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
     GEOMETRY_MODEL_PATH.write_text(json.dumps(model, ensure_ascii=False, indent=2), encoding="utf-8")
     GEOMETRY_META_PATH.write_text(json.dumps({"model_type": model.get("model_type"), "model_id": model.get("model_id"), "created_at": model.get("created_at"), "source_file_name": model.get("source_file_name"), "source_sheet_name": model.get("source_sheet_name"), "source_file_hash": model.get("source_file_hash")}, ensure_ascii=False, indent=2), encoding="utf-8")
-    ROW_SETTINGS_PATH.write_text(json.dumps({"model_id": model.get("model_id"), "source_file_hash": model.get("source_file_hash"), "rows": model.get("row_settings", [])}, ensure_ascii=False, indent=2), encoding="utf-8")
+    ROW_SETTINGS_PATH.write_text(json.dumps({"model_id": model.get("model_id"), "source_file_hash": model.get("source_file_hash"), "rows": model.get("row_settings", []), "zone_boundary_settings": model.get("zone_boundary_settings", {})}, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def load_geometry_model() -> dict[str, Any] | None:
@@ -595,6 +605,7 @@ def _row_config_from_model(model: dict[str, Any]) -> pd.DataFrame:
             "row_group": row.get("row_group", ""),
             "side": row.get("side", ""),
             "comment": row.get("comment", ""),
+            "weight_zone": row.get("weight_zone", "unassigned"),
         }
         for row in model.get("rows", [])
     ])
@@ -628,12 +639,19 @@ def settings_from_model(model: dict[str, Any]) -> GeometrySettings:
     )
 
 
-def rebuild_geometry_from_cells(model: dict[str, Any], cells: list[dict[str, Any]], keep_base_cells: bool = True) -> dict[str, Any]:
+def rebuild_geometry_from_cells(
+    model: dict[str, Any],
+    cells: list[dict[str, Any]],
+    keep_base_cells: bool = True,
+    settings: GeometrySettings | None = None,
+    row_config: pd.DataFrame | None = None,
+    aisle_config: pd.DataFrame | None = None,
+) -> dict[str, Any]:
     rebuilt, _ = build_geometry_model(
         _cells_to_df(cells),
-        settings_from_model(model),
-        _row_config_from_model(model),
-        _aisle_config_from_model(model),
+        settings or settings_from_model(model),
+        row_config if row_config is not None else _row_config_from_model(model),
+        aisle_config if aisle_config is not None else _aisle_config_from_model(model),
         source_file_name=model.get("source_file_name", ""),
         source_sheet_name=model.get("source_sheet_name", ""),
         source_file_hash=model.get("source_file_hash", ""),
@@ -676,6 +694,8 @@ def export_current_model_excel_bytes(model: dict[str, Any]) -> bytes:
 
 
 def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bool = True, label_settings: dict[str, Any] | None = None) -> str:
+    label_settings = label_settings or {}
+    scale = float(scale) * float(label_settings.get("visual_cell_scale", 1.2) or 1.0)
     rows = model.get("rows", [])
     cells = model.get("cells", [])
     aisles = model.get("aisles", [])
@@ -707,11 +727,44 @@ def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bo
         "deep_lane_partial_color": "#A5D6A7",
         "deep_lane_full_color": "#66BB6A",
     }
-    settings.update(label_settings or {})
+    category_colors = {
+        "heavy": "#F4A6A6",
+        "medium": "#F7D486",
+        "light": "#BFE3B4",
+        "fragile": "#D8B4FE",
+        "unclassified": "#CBD5E1",
+        "unassigned": "#E5E7EB",
+    }
+    settings.update(label_settings)
     colors = dict(default_colors)
     colors.update(settings.get("colors", {}))
     label_mode = str(settings.get("label_mode", "Авто"))
-    parts = [f"<div style='position:relative;width:{width}px;height:{height}px;background:#f8fafc;border:1px solid #cbd5e1;overflow:auto'>"]
+    edit_mode = bool(settings.get("edit_mode", False))
+    selected_cell_key = str(settings.get("selected_cell_key", ""))
+    selected_row_number = str(settings.get("selected_row_number", ""))
+    edit_tool = str(settings.get("edit_tool", "Выбор"))
+    snap_enabled = bool(settings.get("snap_enabled", True))
+    snap_step = float(settings.get("snap_step", 0.1) or 0.1)
+    model_id = re.sub(r"[^a-zA-Z0-9_-]", "_", str(model.get("model_id") or "warehouse"))
+    root_id = f"warehouse-map-{model_id}"
+    canvas_id = f"warehouse-map-canvas-{model_id}"
+    zoom_label_id = f"warehouse-map-zoom-{model_id}"
+    storage_key = f"warehouse-map-view:{model_id}"
+    parts = [
+        f"<div id='{root_id}' data-storage-key='{html.escape(storage_key, quote=True)}' "
+        f"style='position:relative;width:100%;height:calc(100vh - 4px);min-height:720px;background:#F7F8FA;border:1px solid #D7DEE8;overflow:hidden;touch-action:none;user-select:none;'>"
+        f"<div style='position:absolute;z-index:20;left:10px;top:10px;display:flex;gap:6px;align-items:center;"
+        f"padding:6px 8px;background:rgba(255,255,255,0.92);border:1px solid #cbd5e1;border-radius:10px;"
+        f"box-shadow:0 4px 14px rgba(15,23,42,0.12);font:13px Arial;color:#253247;'>"
+        f"<button type='button' data-action='zoom-in' style='width:30px;height:28px;border:1px solid #94a3b8;border-radius:7px;background:#fff;cursor:pointer;font-weight:700'>+</button>"
+        f"<button type='button' data-action='zoom-out' style='width:30px;height:28px;border:1px solid #94a3b8;border-radius:7px;background:#fff;cursor:pointer;font-weight:700'>−</button>"
+        f"<button type='button' data-action='reset' style='height:28px;border:1px solid #94a3b8;border-radius:7px;background:#fff;cursor:pointer'>100%</button>"
+        f"<button type='button' data-action='fit' style='height:28px;border:1px solid #94a3b8;border-radius:7px;background:#fff;cursor:pointer'>Весь склад</button>"
+        f"<span id='{zoom_label_id}' style='min-width:48px;text-align:right;font-weight:700'>100%</span>"
+        f"</div>"
+        f"<div id='{canvas_id}' style='position:absolute;left:0;top:0;width:{width}px;height:{height}px;"
+        f"transform-origin:0 0;will-change:transform;cursor:grab;'>"
+    ]
 
     def label_font_size(label_lines, w, h) -> int:
         lines = [str(line) for line in label_lines if str(line)]
@@ -741,7 +794,7 @@ def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bo
                 return lines, size
         return [], 0
 
-    def rect(x_min, y_min, x_max, y_max, color, border, label="", title="", short_label="", label_lines=None, short_lines=None, force_label=False, vertical=False, hover_color=""):
+    def rect(x_min, y_min, x_max, y_max, color, border, label="", title="", short_label="", label_lines=None, short_lines=None, force_label=False, vertical=False, hover_color="", extra_attrs="", extra_style=""):
         left = x_min * scale + 60
         top = height - (y_max * scale + y_offset)
         w = max(2, (x_max - x_min) * scale)
@@ -756,7 +809,7 @@ def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bo
                 content = f"<span style='display:inline-block;transform:rotate(-90deg);white-space:nowrap'>{html.escape(lines[0])}</span>"
             else:
                 content = "<br>".join(html.escape(line) for line in lines)
-            content_style = f"display:flex;align-items:center;justify-content:center;width:100%;height:100%;padding:1px;box-sizing:border-box;font:{font_size}px/{line_height}px Arial;text-align:center;overflow:hidden;color:#0f172a;"
+            content_style = f"display:flex;align-items:center;justify-content:center;width:100%;height:100%;padding:1px;box-sizing:border-box;font:{font_size}px/{line_height}px Arial;text-align:center;overflow:hidden;color:#253247;"
         else:
             content_style = "display:block;width:100%;height:100%;overflow:hidden;"
         hover_attrs = ""
@@ -764,7 +817,71 @@ def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bo
             safe_hover = html.escape(str(hover_color), quote=True)
             safe_color = html.escape(str(color), quote=True)
             hover_attrs = f" onmouseenter=\"this.dataset.bg=this.style.background;this.style.background=\'{safe_hover}\'\" onmouseleave=\"this.style.background=this.dataset.bg||\'{safe_color}\'\""
-        parts.append(f"<div title='{html.escape(title or label)}'{hover_attrs} style='position:absolute;left:{left:.1f}px;top:{top:.1f}px;width:{w:.1f}px;height:{h:.1f}px;background:{color};border:{border};box-sizing:border-box;overflow:hidden;clip-path:inset(0);'><div style='{content_style}'>{content}</div></div>")
+        parts.append(f"<div title='{html.escape(title or label)}'{hover_attrs}{extra_attrs} style='position:absolute;left:{left:.1f}px;top:{top:.1f}px;width:{w:.1f}px;height:{h:.1f}px;background:{color};border:{border};box-sizing:border-box;overflow:hidden;clip-path:inset(0);{extra_style}'><div style='{content_style}'>{content}</div></div>")
+
+    def _placement_display_name(placement: dict[str, Any]) -> str:
+        return str(placement.get("sku_name") or placement.get("item_name") or placement.get("sku_code") or "").strip()
+
+    def _cell_sku_label(placements: list[dict[str, Any]]) -> str:
+        unique: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for placement in placements:
+            name = _placement_display_name(placement)
+            if not name:
+                continue
+            key = str(placement.get("sku_key") or placement.get("sku_code") or name).strip()
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append((key, name))
+        if not unique:
+            return ""
+        first_name = unique[0][1]
+        return f"{first_name} +{len(unique) - 1}" if len(unique) > 1 else first_name
+
+    def _ellipsis(text: str, max_chars: int) -> str:
+        text = " ".join(str(text).split())
+        if max_chars <= 1:
+            return "…" if text else ""
+        if len(text) <= max_chars:
+            return text
+        suffix_match = re.search(r"\s\+\d+$", text)
+        if suffix_match:
+            suffix = suffix_match.group(0)
+            if max_chars <= len(suffix) + 2:
+                return "…" + suffix
+            head_limit = max_chars - len(suffix) - 1
+            return text[:head_limit].rstrip() + "…" + suffix
+        return text[: max_chars - 1].rstrip() + "…"
+
+    def cell_label_overlay(cell: dict[str, Any], occupied: float, placements: list[dict[str, Any]]) -> None:
+        if not settings.get("show_cell_labels", True):
+            return
+        left = cell["x_min"] * scale + 60
+        top = height - (cell["y_max"] * scale + y_offset)
+        w = max(2, (cell["x_max"] - cell["x_min"]) * scale)
+        h = max(2, (cell["y_max"] - cell["y_min"]) * scale)
+        number = str(cell.get("cell_number", ""))
+        lines = [number] if number else []
+        if occupied > 0:
+            name = _cell_sku_label(placements)
+            if name:
+                max_chars = max(4, int((w - 6) / 5.6))
+                lines.append(_ellipsis(name, max_chars))
+        if not lines:
+            return
+        longest = max(len(line) for line in lines)
+        width_size = int((w - 6) / max(longest * 0.55, 1))
+        height_size = int((h - 4) / max(len(lines) * 1.1, 1))
+        font_size = max(7, min(12, width_size, height_size))
+        line_height = max(font_size + 1, int(font_size * 1.15))
+        safe_lines = "<br>".join(html.escape(line) for line in lines)
+        parts.append(
+            f"<div aria-hidden='true' style='position:absolute;left:{left:.1f}px;top:{top:.1f}px;width:{w:.1f}px;height:{h:.1f}px;"
+            f"display:flex;align-items:center;justify-content:center;padding:2px;box-sizing:border-box;overflow:hidden;"
+            f"font:600 {font_size}px/{line_height}px Arial;text-align:center;color:#1f2937;text-shadow:0 1px 1px rgba(255,255,255,0.72);"
+            f"white-space:normal;pointer-events:none;z-index:8;'><div style='max-width:100%;overflow:hidden;text-overflow:ellipsis;'>{safe_lines}</div></div>"
+        )
 
     for road in roads:
         label = "верхний проезд" if road["road_type"] == "top" else "нижний проезд"
@@ -772,11 +889,11 @@ def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bo
         road_color = colors["top_road_color"] if road["road_type"] == "top" else colors["bottom_road_color"]
         if road.get("road_type") == "exit":
             road_color = colors["exit_color"]
-        rect(road["x_min"], road["y_min"], road["x_max"], road["y_max"], road_color, "1px solid #60a5fa", road_label, f"{label}: {road['width_m']} м", short_label="проезд")
+        rect(road["x_min"], road["y_min"], road["x_max"], road["y_max"], road_color, "1px solid #C9D2E0", road_label, f"{label}: {road['width_m']} м", short_label="проезд")
     for aisle in aisles:
         y_max = max_y - model["settings"].get("top_road_width_m", 3.4)
         aisle_label = "проезд" if settings.get("show_aisle_labels", True) else ""
-        rect(aisle["x_min"], 0, aisle["x_max"], y_max, colors["aisle_color"], "1px solid #f59e0b", aisle_label, f"{aisle['row_from']} → {aisle['row_to']}: {aisle['aisle_width_m']} м", short_label="↕")
+        rect(aisle["x_min"], 0, aisle["x_max"], y_max, colors["aisle_color"], "1px solid #D5DAE2", aisle_label, f"{aisle['row_from']} → {aisle['row_to']}: {aisle['aisle_width_m']} м", short_label="↕")
     if detailed:
         for cell in cells:
             source_label = {"excel": "Excel", "manual_add": "добавлена вручную", "manual_update": "изменена вручную"}.get(str(cell.get("source", "excel")), str(cell.get("source", "excel")))
@@ -791,38 +908,37 @@ def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bo
             placement_source = ", ".join(sorted({str(item.get("source", "")) for item in placements if item.get("source")})) or "—"
             confidence = ", ".join(sorted({str(item.get("confidence", "")) for item in placements if item.get("confidence")})) or "—"
             title = f"Код: {cell['code']}\nРяд: {cell['row_number']}\nЯчейка: {cell['cell_number']}\nЯрус: {cell['tier']}\nТип: {storage_label}\nВместимость: {capacity:g} паллет\nЗанято: {occupied:g}\nСвободно: {free:g}\nSKU: {sku_text}\nНаименование: {item_text}\nИсточник размещения: {placement_source}\nТочность: {confidence}\nФизических мест: {cell.get('deep_lane_width', 1)}\nОбъём: {cell.get('volume_m3', 0)} м³\nНаправление: {_direction_label(cell.get('cell_direction', 'bottom_to_top'))}\nX: {cell['x_center']:.2f}\nY: {cell['y_center']:.2f}\nИсточник ячейки: {source_label}"
+            if cell.get("placement_tooltip"):
+                title = str(cell.get("placement_tooltip"))
+            current_cell_key = f"{cell.get('row_number')}|{cell.get('cell_number')}|{cell.get('tier') or '1'}"
             if occupied > capacity:
                 color = "#fecaca"
-                border = "2px solid #dc2626"
+                border = "2px solid #DC5A5A"
             elif occupied >= capacity:
-                color = colors["deep_lane_full_color"] if cell.get("storage_type") == "deep_lane" else colors["occupied_cell_color"]
-                border = "2px solid #16a34a"
+                color = category_colors.get(str(cell.get("placement_category", "")), colors["deep_lane_full_color"] if cell.get("storage_type") == "deep_lane" else colors["occupied_cell_color"])
+                border = "2px solid #4F8F5B"
             elif occupied > 0:
-                color = colors["deep_lane_partial_color"] if cell.get("storage_type") == "deep_lane" else colors["occupied_cell_color"]
-                border = "2px solid #d97706"
+                color = category_colors.get(str(cell.get("placement_category", "")), colors["deep_lane_partial_color"] if cell.get("storage_type") == "deep_lane" else colors["occupied_cell_color"])
+                border = "2px solid #82A878"
             else:
                 color = colors["deep_lane_cell_color"] if cell.get("storage_type") == "deep_lane" else colors["cell_color"]
-                border = "2px solid #d97706" if cell.get("storage_type") == "deep_lane" else "1px solid #64748b"
-            cell_number_label = str(cell["cell_number"]) if settings.get("show_cell_labels", True) else ""
-            occupancy_text = occupancy_label if settings.get("show_occupancy_labels", True) and occupied > 0 else ""
-            if label_mode == "Короткие":
-                full_lines = [occupancy_text or cell_number_label]
-                short_lines = [occupancy_text or cell_number_label]
-            elif label_mode == "Только при наведении":
-                full_lines = []
-                short_lines = []
-            else:
-                full_lines = [cell_number_label, occupancy_text] if occupancy_text else [cell_number_label]
-                short_lines = [occupancy_text] if occupancy_text else [cell_number_label]
-            rect(cell["x_min"], cell["y_min"], cell["x_max"], cell["y_max"], color, border, cell_number_label, title, short_label=occupancy_text or cell_number_label, label_lines=full_lines, short_lines=short_lines, hover_color=colors["hover_cell_color"])
+                border = "1px solid #8FB39A" if cell.get("storage_type") == "deep_lane" else "1px solid #AAB4C3"
+            if current_cell_key == selected_cell_key:
+                color = colors["selected_cell_color"]
+                border = "2px solid #E5532D"
+            cell_attrs = f" data-edit-select='cell' data-cell-key='{html.escape(current_cell_key, quote=True)}' data-row-number='{html.escape(str(cell.get('row_number')), quote=True)}'" if edit_mode else ""
+            rect(cell["x_min"], cell["y_min"], cell["x_max"], cell["y_max"], color, border, "", title, hover_color=colors["hover_cell_color"], extra_attrs=cell_attrs)
             occupied_slots = int(min(round(occupied), len(cell.get("physical_slots", []))))
             for slot in cell.get("physical_slots", []):
                 slot_color = "rgba(34,197,94,0.45)" if slot.get("slot_index", 0) <= occupied_slots else "rgba(255,255,255,0.18)"
-                rect(slot["x_min"], slot["y_min"], slot["x_max"], slot["y_max"], slot_color, "1px dashed #92400e", "", f"Физическое место {slot['slot_index']} из {cell.get('deep_lane_width', 1)}")
+                rect(slot["x_min"], slot["y_min"], slot["x_max"], slot["y_max"], slot_color, "1px dashed #93A4B8", "", title, extra_style="pointer-events:none;")
+            cell_label_overlay(cell, occupied, placements)
     else:
         for row in rows:
             row_label = f"ряд {row['row_number']} ({row['cells_count']})" if settings.get("show_row_labels", True) else ""
-            rect(row["x_min"], row["y_min"], row["x_max"], row["y_max"], colors["cell_color"], "1px solid #64748b", row_label, short_label=str(row.get("row_number", "")), vertical=True)
+            row_color = colors["selected_cell_color"] if str(row.get("row_number", "")) == selected_row_number else colors["cell_color"]
+            row_attrs = f" data-edit-select='row' data-row-number='{html.escape(str(row.get('row_number', '')), quote=True)}'" if edit_mode else ""
+            rect(row["x_min"], row["y_min"], row["x_max"], row["y_max"], row_color, "1px solid #AAB4C3", row_label, short_label=str(row.get("row_number", "")), vertical=True, extra_attrs=row_attrs)
     if settings.get("show_row_labels", True):
         row_position = str(settings.get("row_label_position", "авто"))
         for idx, row in enumerate(rows):
@@ -830,12 +946,245 @@ def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bo
                 continue
             row_label = str(row["row_number"])
             positions = ["top", "bottom"] if row_position == "сверху и снизу" else (["bottom"] if row_position == "снизу" else ["top"])
-            if row_position == "авто" and row.get("width_m", 1) * scale < 12:
-                positions = ["bottom"]
+            row_height = max(float(row.get("y_max", 0)) - float(row.get("y_min", 0)), 0.01)
+            row_width = max(float(row.get("x_max", 0)) - float(row.get("x_min", 0)), 0.01)
+            badge_height = min(0.55, max(row_height * 0.18, 0.24))
+            badge_margin_y = min(0.08, max(row_height * 0.03, 0.02))
+            badge_margin_x = min(0.06, max(row_width * 0.05, 0.01))
+            x_min = float(row["x_min"]) + badge_margin_x
+            x_max = float(row["x_max"]) - badge_margin_x
+            if x_max <= x_min:
+                x_min, x_max = float(row["x_min"]), float(row["x_max"])
+            label_color = colors["selected_cell_color"] if row_label == selected_row_number else "rgba(255,255,255,0.86)"
+            label_border = "2px solid #E5532D" if row_label == selected_row_number else "1px solid #AAB4C3"
+            row_attrs = f" data-edit-select='row' data-row-number='{html.escape(row_label, quote=True)}'" if edit_mode else ""
             for position in positions:
                 if position == "bottom":
-                    rect(row["x_min"], row["y_min"] - 0.4, row["x_max"], row["y_min"], "#bfdbfe", "1px solid #2563eb", row_label, f"Ряд {row_label}", short_label=row_label, vertical=True)
+                    y_min = float(row["y_min"]) + badge_margin_y
+                    y_max = min(y_min + badge_height, float(row["y_max"]))
                 else:
-                    rect(row["x_min"], row["y_max"], row["x_max"], row["y_max"] + 0.4, "#bfdbfe", "1px solid #2563eb", row_label, f"Ряд {row_label}", short_label=row_label, vertical=True)
+                    y_max = float(row["y_max"]) - badge_margin_y
+                    y_min = max(float(row["y_min"]), y_max - badge_height)
+                if y_max > y_min:
+                    rect(x_min, y_min, x_max, y_max, label_color, label_border, row_label, f"Ряд {row_label}", short_label=row_label, force_label=True, vertical=True, extra_attrs=row_attrs)
     parts.append("</div>")
+    script = f"""
+<script>
+(function() {{
+  const root = document.getElementById({json.dumps(root_id)});
+  const canvas = document.getElementById({json.dumps(canvas_id)});
+  const zoomLabel = document.getElementById({json.dumps(zoom_label_id)});
+  if (!root || !canvas || root.dataset.navReady === '1') return;
+  root.dataset.navReady = '1';
+  const minScale = 0.25;
+  const maxScale = 8;
+  const buttonFactor = 1.2;
+  const storageKey = root.dataset.storageKey || {json.dumps(storage_key)};
+  const editTool = {json.dumps(edit_tool)};
+  const snapEnabled = {json.dumps(snap_enabled)};
+  const snapStep = {json.dumps(snap_step)};
+  let spacePressed = false;
+  const base = {{ scale: 1, x: 0, y: 0 }};
+  const view = {{ scale: 1, x: 0, y: 0 }};
+
+  function clamp(value, min, max) {{ return Math.max(min, Math.min(max, value)); }}
+  function viewportSize() {{
+    return {{ width: Math.max(root.clientWidth, 1), height: Math.max(root.clientHeight, 1) }};
+  }}
+  function canvasSize() {{
+    return {{ width: Math.max(canvas.offsetWidth, 1), height: Math.max(canvas.offsetHeight, 1) }};
+  }}
+  function saveView() {{
+    try {{ localStorage.setItem(storageKey, JSON.stringify(view)); }} catch (err) {{}}
+  }}
+  function applyView(shouldSave = true) {{
+    view.scale = clamp(view.scale, minScale, maxScale);
+    canvas.style.transform = `translate(${{view.x}}px, ${{view.y}}px) scale(${{view.scale}})`;
+    if (zoomLabel) zoomLabel.textContent = `${{Math.round(view.scale * 100)}}%`;
+    if (shouldSave) saveView();
+  }}
+  function centerAt(scale) {{
+    const vp = viewportSize();
+    const cs = canvasSize();
+    view.scale = clamp(scale, minScale, maxScale);
+    view.x = (vp.width - cs.width * view.scale) / 2;
+    view.y = (vp.height - cs.height * view.scale) / 2;
+    applyView();
+  }}
+  function fitAll() {{
+    const vp = viewportSize();
+    const cs = canvasSize();
+    const padding = 24;
+    const sx = (vp.width - padding * 2) / cs.width;
+    const sy = (vp.height - padding * 2) / cs.height;
+    const nextScale = clamp(Math.min(sx, sy), minScale, maxScale);
+    view.scale = nextScale;
+    view.x = (vp.width - cs.width * nextScale) / 2;
+    view.y = (vp.height - cs.height * nextScale) / 2;
+    applyView();
+  }}
+  function reset100() {{ centerAt(base.scale); }}
+  function zoomAt(clientX, clientY, factor) {{
+    const rect = root.getBoundingClientRect();
+    const px = clientX - rect.left;
+    const py = clientY - rect.top;
+    const oldScale = view.scale;
+    const nextScale = clamp(oldScale * factor, minScale, maxScale);
+    if (nextScale === oldScale) return;
+    const worldX = (px - view.x) / oldScale;
+    const worldY = (py - view.y) / oldScale;
+    view.scale = nextScale;
+    view.x = px - worldX * nextScale;
+    view.y = py - worldY * nextScale;
+    applyView();
+  }}
+  function zoomCenter(factor) {{
+    const rect = root.getBoundingClientRect();
+    zoomAt(rect.left + rect.width / 2, rect.top + rect.height / 2, factor);
+  }}
+
+  root.addEventListener('click', function(event) {{
+    const button = event.target.closest('button[data-action]');
+    if (!button) return;
+    event.preventDefault();
+    const action = button.dataset.action;
+    if (action === 'zoom-in') zoomCenter(buttonFactor);
+    if (action === 'zoom-out') zoomCenter(1 / buttonFactor);
+    if (action === 'reset') reset100();
+    if (action === 'fit') fitAll();
+  }});
+  root.addEventListener('wheel', function(event) {{
+    event.preventDefault();
+    const factor = event.deltaY < 0 ? buttonFactor : 1 / buttonFactor;
+    zoomAt(event.clientX, event.clientY, factor);
+  }}, {{ passive: false }});
+
+  let dragging = false;
+  let movingRow = null;
+  let selectingBox = null;
+  let dragStart = {{ x: 0, y: 0, viewX: 0, viewY: 0 }};
+  window.addEventListener('keydown', function(event) {{ if (event.code === 'Space') spacePressed = true; if (event.code === 'Escape') cancelTransient(); }});
+  window.addEventListener('keyup', function(event) {{ if (event.code === 'Space') spacePressed = false; }});
+  function rowElements(rowNumber) {{ return Array.from(root.querySelectorAll(`[data-row-number="${{CSS.escape(rowNumber)}}"]`)); }}
+  function snappedMeters(pixelDelta) {{
+    const meters = pixelDelta / (view.scale * {scale});
+    const snapped = snapEnabled && snapStep > 0 ? Math.round(meters / snapStep) * snapStep : meters;
+    return snapped * view.scale * {scale};
+  }}
+  function cancelTransient() {{
+    if (movingRow) {{ movingRow.items.forEach(function(item) {{ item.style.transform = ''; item.style.opacity = ''; }}); movingRow = null; }}
+    if (selectingBox) {{ selectingBox.el.remove(); selectingBox = null; }}
+  }}
+  root.addEventListener('pointerdown', function(event) {{
+    if (event.target.closest('button')) return;
+    const editTarget = event.target.closest('[data-edit-select]');
+    if (!spacePressed && editTool === 'Перемещение' && editTarget && editTarget.dataset.rowNumber) {{
+      movingRow = {{ row: editTarget.dataset.rowNumber, x: event.clientX, y: event.clientY, items: rowElements(editTarget.dataset.rowNumber) }};
+      movingRow.items.forEach(function(item) {{ item.style.opacity = '0.58'; }});
+      root.setPointerCapture(event.pointerId);
+      return;
+    }}
+    if (!spacePressed && editTool === 'Выделение рамкой') {{
+      const rect = root.getBoundingClientRect();
+      const el = document.createElement('div');
+      el.style.cssText = 'position:absolute;z-index:25;border:1px dashed #2563eb;background:rgba(37,99,235,0.12);pointer-events:none;';
+      root.appendChild(el);
+      selectingBox = {{ el, x: event.clientX - rect.left, y: event.clientY - rect.top, shift: event.shiftKey, ctrl: event.ctrlKey }};
+      root.setPointerCapture(event.pointerId);
+      return;
+    }}
+    dragging = true;
+    dragStart = {{ x: event.clientX, y: event.clientY, viewX: view.x, viewY: view.y }};
+    canvas.style.cursor = 'grabbing';
+    root.setPointerCapture(event.pointerId);
+  }});
+  root.addEventListener('pointermove', function(event) {{
+    if (movingRow) {{
+      const dx = snappedMeters(event.clientX - movingRow.x);
+      const dy = snappedMeters(event.clientY - movingRow.y);
+      movingRow.items.forEach(function(item) {{ item.style.transform = `translate(${{dx}}px, ${{dy}}px)`; }});
+      return;
+    }}
+    if (selectingBox) {{
+      const rect = root.getBoundingClientRect();
+      const x2 = event.clientX - rect.left;
+      const y2 = event.clientY - rect.top;
+      const left = Math.min(selectingBox.x, x2);
+      const top = Math.min(selectingBox.y, y2);
+      selectingBox.el.style.left = `${{left}}px`;
+      selectingBox.el.style.top = `${{top}}px`;
+      selectingBox.el.style.width = `${{Math.abs(x2 - selectingBox.x)}}px`;
+      selectingBox.el.style.height = `${{Math.abs(y2 - selectingBox.y)}}px`;
+      return;
+    }}
+    if (!dragging) return;
+    view.x = dragStart.viewX + event.clientX - dragStart.x;
+    view.y = dragStart.viewY + event.clientY - dragStart.y;
+    applyView();
+  }});
+  function stopDrag(event) {{
+    if (movingRow) {{
+      try {{ localStorage.setItem(storageKey + ':row-preview:' + movingRow.row, JSON.stringify({{ row: movingRow.row }})); }} catch (err) {{}}
+      movingRow.items.forEach(function(item) {{ item.style.opacity = ''; }});
+      movingRow = null;
+      try {{ root.releasePointerCapture(event.pointerId); }} catch (err) {{}}
+      return;
+    }}
+    if (selectingBox) {{
+      const box = selectingBox.el.getBoundingClientRect();
+      if (!selectingBox.shift && !selectingBox.ctrl) root.querySelectorAll('[data-edit-selected="1"]').forEach(function(item) {{ item.dataset.editSelected = '0'; item.style.outline = ''; item.style.outlineOffset = ''; }});
+      root.querySelectorAll('[data-edit-select]').forEach(function(item) {{
+        const r = item.getBoundingClientRect();
+        const hit = r.left < box.right && r.right > box.left && r.top < box.bottom && r.bottom > box.top;
+        if (!hit) return;
+        if (selectingBox.ctrl) {{ item.dataset.editSelected = '0'; item.style.outline = ''; item.style.outlineOffset = ''; }}
+        else {{ item.dataset.editSelected = '1'; item.style.outline = '3px solid #ff7043'; item.style.outlineOffset = '2px'; }}
+      }});
+      selectingBox.el.remove(); selectingBox = null;
+      try {{ root.releasePointerCapture(event.pointerId); }} catch (err) {{}}
+      return;
+    }}
+    if (!dragging) return;
+    dragging = false;
+    canvas.style.cursor = 'grab';
+    try {{ root.releasePointerCapture(event.pointerId); }} catch (err) {{}}
+    saveView();
+  }}
+  root.addEventListener('pointerup', stopDrag);
+  root.addEventListener('pointercancel', stopDrag);
+  root.addEventListener('dblclick', function(event) {{
+    if (event.target.closest('button')) return;
+    event.preventDefault();
+    fitAll();
+  }});
+  root.addEventListener('click', function(event) {{
+    const target = event.target.closest('[data-edit-select]');
+    if (!target) return;
+    root.querySelectorAll('[data-edit-selected="1"]').forEach(function(item) {{
+      item.dataset.editSelected = '0';
+      item.style.outline = '';
+      item.style.outlineOffset = '';
+    }});
+    target.dataset.editSelected = '1';
+    target.style.outline = '3px solid #ff7043';
+    target.style.outlineOffset = '2px';
+    try {{ localStorage.setItem(storageKey + ':selected', JSON.stringify(target.dataset)); }} catch (err) {{}}
+  }});
+
+  let restored = false;
+  try {{
+    const stored = JSON.parse(localStorage.getItem(storageKey) || 'null');
+    if (stored && Number.isFinite(stored.scale) && Number.isFinite(stored.x) && Number.isFinite(stored.y)) {{
+      view.scale = clamp(stored.scale, minScale, maxScale);
+      view.x = stored.x;
+      view.y = stored.y;
+      restored = true;
+    }}
+  }} catch (err) {{}}
+  if (restored) applyView(false); else fitAll();
+  window.addEventListener('resize', function() {{ applyView(false); }});
+}})();
+</script>
+"""
+    parts.append(f"</div>{script}")
     return "".join(parts)
