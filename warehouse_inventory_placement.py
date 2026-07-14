@@ -340,6 +340,7 @@ def import_inventory(model: dict[str, Any], normalized_df: pd.DataFrame, allow_r
 
 def _cell_sort_key(cell: dict[str, Any], model: dict[str, Any] | None = None) -> tuple[Any, Any]:
     row_order = cell.get("row_order", 10**9)
+    direction = get_row_direction(model or {"cells": [cell]}, cell.get("row_number"))
     cell_num = _number_key(cell.get("cell_number"))
     if cell_num[0] == 0:
         return (row_order, cell_num[1], 0)
