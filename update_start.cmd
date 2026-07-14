@@ -54,11 +54,10 @@ if errorlevel 1 (
 
 call :log Pulling latest code with fast-forward only...
 git pull --ff-only >>"%UPDATE_LOG%" 2>&1
-
 if errorlevel 1 (
-    echo.
-    call :fail git pull --ff-only failed. Resolve divergent history or conflicts manually, then run update_start.cmd again. See %UPDATE_LOG%.
-    exit /b 1
+    call :log git pull --ff-only failed. Starting local version; see %UPDATE_LOG% for details.
+    call "%~dp0start.cmd"
+    exit /b %errorlevel%
 )
 
 call :log Update completed. Starting application...

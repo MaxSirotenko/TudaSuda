@@ -694,6 +694,8 @@ def export_current_model_excel_bytes(model: dict[str, Any]) -> bytes:
 
 
 def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bool = True, label_settings: dict[str, Any] | None = None) -> str:
+    label_settings = label_settings or {}
+    scale = float(scale) * float(label_settings.get("visual_cell_scale", 1.2) or 1.0)
     rows = model.get("rows", [])
     cells = model.get("cells", [])
     aisles = model.get("aisles", [])
@@ -733,7 +735,7 @@ def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bo
         "unclassified": "#CBD5E1",
         "unassigned": "#E5E7EB",
     }
-    settings.update(label_settings or {})
+    settings.update(label_settings)
     colors = dict(default_colors)
     colors.update(settings.get("colors", {}))
     label_mode = str(settings.get("label_mode", "Авто"))
@@ -817,6 +819,70 @@ def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bo
             hover_attrs = f" onmouseenter=\"this.dataset.bg=this.style.background;this.style.background=\'{safe_hover}\'\" onmouseleave=\"this.style.background=this.dataset.bg||\'{safe_color}\'\""
         parts.append(f"<div title='{html.escape(title or label)}'{hover_attrs}{extra_attrs} style='position:absolute;left:{left:.1f}px;top:{top:.1f}px;width:{w:.1f}px;height:{h:.1f}px;background:{color};border:{border};box-sizing:border-box;overflow:hidden;clip-path:inset(0);{extra_style}'><div style='{content_style}'>{content}</div></div>")
 
+    def _placement_display_name(placement: dict[str, Any]) -> str:
+        return str(placement.get("sku_name") or placement.get("item_name") or placement.get("sku_code") or "").strip()
+
+    def _cell_sku_label(placements: list[dict[str, Any]]) -> str:
+        unique: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for placement in placements:
+            name = _placement_display_name(placement)
+            if not name:
+                continue
+            key = str(placement.get("sku_key") or placement.get("sku_code") or name).strip()
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append((key, name))
+        if not unique:
+            return ""
+        first_name = unique[0][1]
+        return f"{first_name} +{len(unique) - 1}" if len(unique) > 1 else first_name
+
+    def _ellipsis(text: str, max_chars: int) -> str:
+        text = " ".join(str(text).split())
+        if max_chars <= 1:
+            return "…" if text else ""
+        if len(text) <= max_chars:
+            return text
+        suffix_match = re.search(r"\s\+\d+$", text)
+        if suffix_match:
+            suffix = suffix_match.group(0)
+            if max_chars <= len(suffix) + 2:
+                return "…" + suffix
+            head_limit = max_chars - len(suffix) - 1
+            return text[:head_limit].rstrip() + "…" + suffix
+        return text[: max_chars - 1].rstrip() + "…"
+
+    def cell_label_overlay(cell: dict[str, Any], occupied: float, placements: list[dict[str, Any]]) -> None:
+        if not settings.get("show_cell_labels", True):
+            return
+        left = cell["x_min"] * scale + 60
+        top = height - (cell["y_max"] * scale + y_offset)
+        w = max(2, (cell["x_max"] - cell["x_min"]) * scale)
+        h = max(2, (cell["y_max"] - cell["y_min"]) * scale)
+        number = str(cell.get("cell_number", ""))
+        lines = [number] if number else []
+        if occupied > 0:
+            name = _cell_sku_label(placements)
+            if name:
+                max_chars = max(4, int((w - 6) / 5.6))
+                lines.append(_ellipsis(name, max_chars))
+        if not lines:
+            return
+        longest = max(len(line) for line in lines)
+        width_size = int((w - 6) / max(longest * 0.55, 1))
+        height_size = int((h - 4) / max(len(lines) * 1.1, 1))
+        font_size = max(7, min(12, width_size, height_size))
+        line_height = max(font_size + 1, int(font_size * 1.15))
+        safe_lines = "<br>".join(html.escape(line) for line in lines)
+        parts.append(
+            f"<div aria-hidden='true' style='position:absolute;left:{left:.1f}px;top:{top:.1f}px;width:{w:.1f}px;height:{h:.1f}px;"
+            f"display:flex;align-items:center;justify-content:center;padding:2px;box-sizing:border-box;overflow:hidden;"
+            f"font:600 {font_size}px/{line_height}px Arial;text-align:center;color:#1f2937;text-shadow:0 1px 1px rgba(255,255,255,0.72);"
+            f"white-space:normal;pointer-events:none;z-index:8;'><div style='max-width:100%;overflow:hidden;text-overflow:ellipsis;'>{safe_lines}</div></div>"
+        )
+
     for road in roads:
         label = "верхний проезд" if road["road_type"] == "top" else "нижний проезд"
         road_label = label if settings.get("show_aisle_labels", True) else ""
@@ -857,26 +923,16 @@ def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bo
             else:
                 color = colors["deep_lane_cell_color"] if cell.get("storage_type") == "deep_lane" else colors["cell_color"]
                 border = "1px solid #8FB39A" if cell.get("storage_type") == "deep_lane" else "1px solid #AAB4C3"
-            cell_number_label = str(cell["cell_number"]) if settings.get("show_cell_labels", True) else ""
-            occupancy_text = occupancy_label if settings.get("show_occupancy_labels", True) and occupied > 0 else ""
-            if label_mode == "Короткие":
-                full_lines = [occupancy_text or cell_number_label]
-                short_lines = [occupancy_text or cell_number_label]
-            elif label_mode == "Только при наведении":
-                full_lines = []
-                short_lines = []
-            else:
-                full_lines = [cell_number_label, occupancy_text] if occupancy_text else [cell_number_label]
-                short_lines = [occupancy_text] if occupancy_text else [cell_number_label]
             if current_cell_key == selected_cell_key:
                 color = colors["selected_cell_color"]
                 border = "2px solid #E5532D"
             cell_attrs = f" data-edit-select='cell' data-cell-key='{html.escape(current_cell_key, quote=True)}' data-row-number='{html.escape(str(cell.get('row_number')), quote=True)}'" if edit_mode else ""
-            rect(cell["x_min"], cell["y_min"], cell["x_max"], cell["y_max"], color, border, cell_number_label, title, short_label=occupancy_text or cell_number_label, label_lines=full_lines, short_lines=short_lines, hover_color=colors["hover_cell_color"], extra_attrs=cell_attrs)
+            rect(cell["x_min"], cell["y_min"], cell["x_max"], cell["y_max"], color, border, "", title, hover_color=colors["hover_cell_color"], extra_attrs=cell_attrs)
             occupied_slots = int(min(round(occupied), len(cell.get("physical_slots", []))))
             for slot in cell.get("physical_slots", []):
                 slot_color = "rgba(34,197,94,0.45)" if slot.get("slot_index", 0) <= occupied_slots else "rgba(255,255,255,0.18)"
                 rect(slot["x_min"], slot["y_min"], slot["x_max"], slot["y_max"], slot_color, "1px dashed #93A4B8", "", title, extra_style="pointer-events:none;")
+            cell_label_overlay(cell, occupied, placements)
     else:
         for row in rows:
             row_label = f"ряд {row['row_number']} ({row['cells_count']})" if settings.get("show_row_labels", True) else ""

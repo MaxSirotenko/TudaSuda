@@ -188,3 +188,41 @@ def test_deep_lane_physical_slots_do_not_override_logical_cell_tooltip():
     assert "pointer-events:none;" in html
     assert "Хрупкий товар размещён" in html
     assert "Физическое место" not in html
+
+
+def test_map_labels_show_cell_number_and_sku_name_without_slot_captions():
+    model = _model()
+    state = {"placements": [{"cell_key": "2|1|1", "row_number": "2", "cell_number": "1", "tier": "1", "sku_key": "fragile-sku", "sku_name": "Стекло", "qty_pallets": 3, "occupied_capacity_pallets": 3, "source": "receipt", "receipt_numbers": ["R1"], "receipt_line_ids": ["L1"], "weight_class": "fragile", "calculated_zone": "fragile", "placement_reason_code": "fragile_priority", "placement_reason_text": "Хрупкий товар размещён в зоне хрупкого товара."}], "unplaced_inventory": []}
+    enriched = enrich_model_with_placement_diagnostics(model, state, None)
+    html = build_geometry_html(enriched, scale=10, detailed=True, label_settings={})
+    assert "Стекло" in html
+    assert "pointer-events:none;" in html
+    assert "Физическое место" not in html
+    assert "3/4" not in html
+
+
+def test_map_label_collapses_multiple_sku_names_with_suffix():
+    model = _model()
+    state = {"placements": [
+        {"cell_key": "1|1|1", "row_number": "1", "cell_number": "1", "tier": "1", "sku_key": "berry", "sku_name": "Голубика 125 г", "qty_pallets": 0.5, "occupied_capacity_pallets": 0.5, "source": "receipt", "weight_class": "heavy"},
+        {"cell_key": "1|1|1", "row_number": "1", "cell_number": "1", "tier": "1", "sku_key": "salad", "sku_name": "Салат Фриллис", "qty_pallets": 0.5, "occupied_capacity_pallets": 0.5, "source": "receipt", "weight_class": "heavy"},
+    ], "unplaced_inventory": []}
+    enriched = enrich_model_with_placement_diagnostics(model, state, None)
+    html = build_geometry_html(enriched, scale=80, detailed=True, label_settings={})
+    assert "Голубика" in html and "+1" in html
+
+
+def test_deep_lane_labels_are_rendered_once_over_capacities_three_four_five():
+    for capacity in (3, 4, 5):
+        model = _model()
+        for cell in model["cells"]:
+            if cell["row_number"] == "2" and cell["cell_number"] == "1":
+                cell["capacity_pallets"] = capacity
+                cell["deep_lane_width"] = capacity
+                cell["x_max"] = cell["x_min"] + capacity * 0.8
+                cell["physical_slots"] = [{"slot_index": idx, "x_min": cell["x_min"] + (idx - 1) * 0.8, "x_max": cell["x_min"] + idx * 0.8, "y_min": cell["y_min"], "y_max": cell["y_max"], "capacity_pallets": 1} for idx in range(1, capacity + 1)]
+        state = {"placements": [{"cell_key": "2|1|1", "row_number": "2", "cell_number": "1", "tier": "1", "sku_key": "deep", "sku_name": "Набивной SKU", "qty_pallets": capacity, "occupied_capacity_pallets": capacity, "source": "receipt", "weight_class": "fragile"}], "unplaced_inventory": []}
+        enriched = enrich_model_with_placement_diagnostics(model, state, None)
+        html = build_geometry_html(enriched, scale=10, detailed=True, label_settings={})
+        assert "Набивной SKU" in html
+        assert "Физическое место" not in html
