@@ -704,6 +704,9 @@ def _basic_placement_record(item: dict[str, Any], cell: dict[str, Any], qty: flo
         "receipt_line_ids": [_display_value(item.get("receipt_line_id"))] if item.get("receipt_line_id") else [],
         "receipt_numbers": [_display_value(item.get("receipt_number"))] if item.get("receipt_number") else [],
         "weight_zone": _display_value(cell.get("weight_zone")) or "unassigned",
+        "zone_overflow": (_display_value(cell.get("weight_zone")) or "unassigned") != weight_class,
+        "target_weight_zone": weight_class,
+        "actual_weight_zone": _display_value(cell.get("weight_zone")) or "unassigned",
         "placement_status": "placed" if not reason else "error",
         "placement_mode": mode,
         "unplaced_reason": reason,
@@ -795,16 +798,57 @@ def calculate_basic_weight_placement(model: dict[str, Any], state: dict[str, Any
                 return
         placed.append(record)
 
-    def candidate_cells_for_sku(zone_cells: list[dict[str, Any]], sku_key: str) -> list[dict[str, Any]]:
-        sku_cells = [cells[p.get("cell_key")] for p in placed if _display_value(p.get("sku_key")) == sku_key and p.get("cell_key") in cells and cells[p.get("cell_key")].get("weight_zone") in {p.get("weight_zone"), sku_classes.get(sku_key)}]
+    row_numbers_by_order = [_display_value(row.get("row_number")) for row in sorted(model.get("rows", []), key=lambda row: (_safe_float(row.get("row_order"), 10**9), _display_value(row.get("row_number"))))]
+    row_index = {row_number: idx for idx, row_number in enumerate(row_numbers_by_order)}
+
+    def row_cells(row_number: str, reverse: bool = False) -> list[dict[str, Any]]:
+        row_items = [cell for cell in ordered_cells if _display_value(cell.get("row_number")) == row_number]
+        return sorted(row_items, key=lambda cell: _number_key(cell.get("cell_number"))[1] if _number_key(cell.get("cell_number"))[0] == 0 else _safe_float(cell.get("y_center")), reverse=reverse)
+
+    def overflow_rows_for_zone(weight_class: str) -> list[tuple[str, bool]]:
+        target_rows = [row for row in row_numbers_by_order if row_zones.get(row) == weight_class]
+        if not target_rows:
+            return []
+        target_indices = [row_index[row] for row in target_rows if row in row_index]
+        min_target = min(target_indices)
+        max_target = max(target_indices)
+        candidates: list[tuple[int, int, str, bool]] = []
+        for row in row_numbers_by_order:
+            if row in target_rows:
+                continue
+            idx = row_index[row]
+            if idx < min_target:
+                distance = min_target - idx
+                reverse = True
+            elif idx > max_target:
+                distance = idx - max_target
+                reverse = False
+            else:
+                continue
+            candidates.append((distance, idx, row, reverse))
+        return [(row, reverse) for _, _, row, reverse in sorted(candidates)]
+
+    def cells_for_zone_with_overflow(weight_class: str) -> tuple[list[dict[str, Any]], dict[str, int]]:
+        target_rows = [row for row in row_numbers_by_order if row_zones.get(row) == weight_class]
+        cells_in_order: list[dict[str, Any]] = []
+        for row in target_rows:
+            cells_in_order.extend(row_cells(row, reverse=False))
+        for row, reverse in overflow_rows_for_zone(weight_class):
+            cells_in_order.extend(row_cells(row, reverse=reverse))
+        order_index = {cell_key(cell.get("row_number"), cell.get("cell_number"), cell.get("tier")): idx for idx, cell in enumerate(cells_in_order)}
+        return cells_in_order, order_index
+
+    def candidate_cells_for_sku(zone_cells: list[dict[str, Any]], sku_key: str, order_index: dict[str, int]) -> list[dict[str, Any]]:
+        sku_cells = [cells[p.get("cell_key")] for p in placed if _display_value(p.get("sku_key")) == sku_key and p.get("cell_key") in cells and p.get("cell_key") in order_index]
         if not sku_cells:
             return zone_cells
         row_orders = [_safe_float(cell.get("row_order"), 10**9) for cell in sku_cells]
         same_rows = {_display_value(cell.get("row_number")) for cell in sku_cells}
         cell_positions = {(_display_value(cell.get("row_number")), _number_key(cell.get("cell_number"))[1]) for cell in sku_cells if _number_key(cell.get("cell_number"))[0] == 0}
 
-        def rank(cell: dict[str, Any]) -> tuple[float, float, Any, Any]:
+        def rank(cell: dict[str, Any]) -> tuple[float, float, int]:
             row = _display_value(cell.get("row_number"))
+            key = cell_key(cell.get("row_number"), cell.get("cell_number"), cell.get("tier"))
             cell_num_key = _number_key(cell.get("cell_number"))
             cell_num = cell_num_key[1] if cell_num_key[0] == 0 else 10**9
             if row in same_rows:
@@ -815,7 +859,7 @@ def calculate_basic_weight_placement(model: dict[str, Any], state: dict[str, Any
                 min_cell_delta = 10**9
                 priority = 2
             min_row_delta = min(abs(_safe_float(cell.get("row_order"), 10**9) - row_order) for row_order in row_orders)
-            return (priority, min_cell_delta if priority < 2 else min_row_delta, *_cell_sort_key(cell, model))
+            return (priority, min_cell_delta if priority < 2 else min_row_delta, order_index.get(key, 10**9))
 
         return sorted(zone_cells, key=rank)
 
@@ -834,20 +878,23 @@ def calculate_basic_weight_placement(model: dict[str, Any], state: dict[str, Any
             reason = "missing_calculated_zone" if "calculated_zone" in item else "missing_weight_class"
             unplaced.append(_unplaced_record(item, total_qty, reason, source, weight_class))
             return
-        zone_cells = [cell for cell in ordered_cells if cell.get("weight_zone") == weight_class]
-        if not zone_cells:
+        target_rows = [row for row in row_numbers_by_order if row_zones.get(row) == weight_class]
+        if not target_rows:
             unplaced.append(_unplaced_record(item, total_qty, "no_rows_for_zone", source, weight_class, weight_class))
             return
+        zone_cells, order_index = cells_for_zone_with_overflow(weight_class)
         remaining = total_qty
-        # first fill same SKU/characteristic partial cells in the same zone
+        # first fill same SKU/characteristic partial cells in all allowed rows
         same_cells = []
         for cell in zone_cells:
             key = cell_key(cell.get("row_number"), cell.get("cell_number"), cell.get("tier"))
             if occupied.get(key, 0.0) <= 0:
                 continue
-            if any(_same_item(p, item) and p.get("weight_zone") == weight_class for p in placed if p.get("cell_key") == key):
+            if any(_same_item(p, item) for p in placed if p.get("cell_key") == key):
                 same_cells.append(cell)
-        for cell in same_cells + candidate_cells_for_sku(zone_cells, sku):
+        same_cell_keys = {cell_key(cell.get("row_number"), cell.get("cell_number"), cell.get("tier")) for cell in same_cells}
+        ordered_candidates = [cell for cell in candidate_cells_for_sku(zone_cells, sku, order_index) if cell_key(cell.get("row_number"), cell.get("cell_number"), cell.get("tier")) not in same_cell_keys]
+        for cell in same_cells + ordered_candidates:
             if remaining <= 0:
                 break
             key = cell_key(cell.get("row_number"), cell.get("cell_number"), cell.get("tier"))
@@ -863,8 +910,13 @@ def calculate_basic_weight_placement(model: dict[str, Any], state: dict[str, Any
             qty = min(remaining, capacity - used)
             if qty <= 0:
                 continue
-            reason_code = "same_sku_partial_cell" if used > 0 else ("fragile_priority" if weight_class == "fragile" else ("adjacent_to_same_sku" if any(_display_value(p.get("sku_key")) == sku for p in placed) else "matching_weight_zone"))
+            actual_zone = _display_value(cell.get("weight_zone")) or "unassigned"
+            is_overflow = actual_zone != weight_class
+            reason_code = "same_sku_partial_cell" if used > 0 else ("zone_overflow" if is_overflow else ("fragile_priority" if weight_class == "fragile" else ("adjacent_to_same_sku" if any(_display_value(p.get("sku_key")) == sku for p in placed) else "matching_weight_zone")))
             record = _basic_placement_record(item, cell, qty, source, "calculated", weight_class, reason_code=reason_code, quantity_before=used)
+            record["zone_overflow"] = is_overflow
+            record["target_weight_zone"] = weight_class
+            record["actual_weight_zone"] = actual_zone
             merge_or_append(record)
             occupied[key] = used + qty
             sku_by_cell.setdefault(key, set()).add(sku)
