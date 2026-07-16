@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import re
 import uuid
@@ -615,6 +616,304 @@ def export_placements_excel_bytes(model: dict[str, Any], state: dict[str, Any]) 
         pd.DataFrame(state.get("unplaced_inventory", [])).to_excel(writer, sheet_name="Не размещено", index=False)
         pd.DataFrame(state.get("journal", [])).to_excel(writer, sheet_name="Журнал", index=False)
     return buffer.getvalue()
+
+
+def _placement_qty(placement: dict[str, Any]) -> float:
+    qty = _safe_float(placement.get("occupied_capacity_pallets"))
+    return qty if qty > 0 else _safe_float(placement.get("qty_pallets"))
+
+
+def _parse_inventory_qty(row: dict[str, Any]) -> tuple[float | None, str]:
+    raw = row.get("qty_pallets")
+    if raw is None or str(raw).strip() == "":
+        return None, "qty_pallets отсутствует"
+    try:
+        qty = float(str(raw).replace(",", "."))
+    except (TypeError, ValueError):
+        return None, "qty_pallets не удалось преобразовать в число"
+    if qty < 0:
+        return None, "qty_pallets не может быть отрицательным"
+    return qty, ""
+
+
+def _inventory_row_sku_key(row: dict[str, Any]) -> str:
+    return _display_value(row.get("sku_key")) or make_sku_key(row)
+
+
+def _inventory_date(inventory_rows: list[dict[str, Any]], inventory_date: str | None) -> str:
+    if inventory_date:
+        return inventory_date
+    for row in inventory_rows:
+        for field in ("inventory_date", "date", "document_date", "receipt_date"):
+            value = _display_value(row.get(field))
+            if value:
+                return value
+    return _now_iso().split("T", 1)[0]
+
+
+def _inventory_report(
+    *,
+    success: bool,
+    inventory_sku_count: int,
+    sku_before_count: int,
+    sku_after_count: int,
+    quantity_before: float,
+    quantity_inventory: float,
+    quantity_after: float,
+    removed_sku_count: int,
+    reduced_sku_count: int,
+    unchanged_sku_count: int,
+    excess_inventory_sku_count: int,
+    freed_cells: int,
+    occupied_cells_after: int,
+    details: list[dict[str, Any]],
+    errors: list[str] | None = None,
+) -> dict[str, Any]:
+    return {
+        "success": success,
+        "errors": errors or [],
+        "summary": {
+            "SKU в инвенте": inventory_sku_count,
+            "SKU до сверки": sku_before_count,
+            "SKU после сверки": sku_after_count,
+            "Количество до": round(quantity_before, 4),
+            "Количество по инвенту": round(quantity_inventory, 4),
+            "Количество после": round(quantity_after, 4),
+            "Полностью удалено SKU": removed_sku_count,
+            "Уменьшено SKU": reduced_sku_count,
+            "Без изменений SKU": unchanged_sku_count,
+            "Инвент больше размещения": excess_inventory_sku_count,
+            "Освобождено логических ячеек": freed_cells,
+            "Осталось занятых логических ячеек": occupied_cells_after,
+        },
+        "details": details,
+    }
+
+
+def reconcile_placements_with_inventory(
+    model: dict[str, Any],
+    placement_state: dict[str, Any],
+    inventory_rows: list[dict[str, Any]],
+    inventory_date: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Reconcile current placements with an end-of-day inventory snapshot.
+
+    The function is intentionally side-effect free: it returns a new placement
+    state and never writes placements.json, warehouse_model.json or receipts.json.
+    """
+    _ = model
+    original_state = copy.deepcopy(placement_state)
+    working_state = copy.deepcopy(placement_state)
+    inventory_date_value = _inventory_date(inventory_rows, inventory_date)
+    grouped_inventory: dict[str, dict[str, Any]] = {}
+    invalid_details: list[dict[str, Any]] = []
+    errors: list[str] = []
+
+    for idx, row in enumerate(inventory_rows, start=1):
+        row_dict = dict(row)
+        sku_key = _inventory_row_sku_key(row_dict)
+        qty, reason = _parse_inventory_qty(row_dict)
+        if not sku_key:
+            reason = "sku_key не удалось определить"
+        if qty is None or not sku_key:
+            errors.append(f"Строка инвента {idx}: {reason}")
+            invalid_details.append({
+                "sku_key": sku_key or "Нет данных",
+                "Номенклатура": _display_value(row_dict.get("sku_name") or row_dict.get("item_name")) or "Нет данных",
+                "Характеристика": _display_value(row_dict.get("characteristic_name") or row_dict.get("characteristic")) or "Нет данных",
+                "Было размещено": 0.0,
+                "По инвенту": _display_value(row_dict.get("qty_pallets")) or "Нет данных",
+                "Осталось после": 0.0,
+                "Удалено": 0.0,
+                "Освобождено ячеек": 0,
+                "Статус": "invalid_inventory_row",
+                "Причина": reason,
+            })
+            continue
+        entry = grouped_inventory.setdefault(sku_key, {
+            "sku_key": sku_key,
+            "sku_code": _display_value(row_dict.get("sku_code")),
+            "sku_name": _display_value(row_dict.get("sku_name") or row_dict.get("item_name")),
+            "item_name": _display_value(row_dict.get("item_name") or row_dict.get("sku_name")),
+            "characteristic_code": _display_value(row_dict.get("characteristic_code")),
+            "characteristic_name": _display_value(row_dict.get("characteristic_name") or row_dict.get("characteristic")),
+            "qty_pallets": 0.0,
+            "rows": 0,
+        })
+        entry["qty_pallets"] = round(_safe_float(entry.get("qty_pallets")) + qty, 4)
+        entry["rows"] += 1
+        for field in ("sku_code", "sku_name", "item_name", "characteristic_code", "characteristic_name"):
+            if not entry.get(field):
+                entry[field] = _display_value(row_dict.get(field))
+
+    placements_before = list(original_state.get("placements", []))
+    sku_before = {_display_value(p.get("sku_key")) or make_sku_key(p) for p in placements_before}
+    sku_before.discard("")
+    quantity_before = sum(_placement_qty(p) for p in placements_before)
+    quantity_inventory = sum(_safe_float(item.get("qty_pallets")) for item in grouped_inventory.values())
+    occupied_before = {p.get("cell_key", "") for p in placements_before if _placement_qty(p) > 0 and p.get("cell_key")}
+
+    if errors:
+        report = _inventory_report(
+            success=False,
+            inventory_sku_count=len(grouped_inventory),
+            sku_before_count=len(sku_before),
+            sku_after_count=len(sku_before),
+            quantity_before=quantity_before,
+            quantity_inventory=quantity_inventory,
+            quantity_after=quantity_before,
+            removed_sku_count=0,
+            reduced_sku_count=0,
+            unchanged_sku_count=0,
+            excess_inventory_sku_count=0,
+            freed_cells=0,
+            occupied_cells_after=len(occupied_before),
+            details=invalid_details,
+            errors=errors,
+        )
+        return original_state, report
+
+    placements_by_sku: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+    for idx, placement in enumerate(placements_before):
+        sku_key = _display_value(placement.get("sku_key")) or make_sku_key(placement)
+        if not sku_key:
+            continue
+        placements_by_sku.setdefault(sku_key, []).append((idx, placement))
+
+    new_by_index: dict[int, dict[str, Any]] = {}
+    unplaced_inventory: list[dict[str, Any]] = []
+    details: list[dict[str, Any]] = []
+    removed_sku_count = 0
+    reduced_sku_count = 0
+    unchanged_sku_count = 0
+    excess_inventory_sku_count = 0
+
+    for sku_key in sorted(set(placements_by_sku) | set(grouped_inventory)):
+        records = placements_by_sku.get(sku_key, [])
+        inventory_item = grouped_inventory.get(sku_key)
+        current_qty = round(sum(_placement_qty(p) for _, p in records), 4)
+        target_qty = round(_safe_float((inventory_item or {}).get("qty_pallets")), 4)
+        removed_qty = max(current_qty - target_qty, 0.0)
+        freed_for_sku = 0
+        status = "unchanged"
+        new_quantities = [_placement_qty(p) for _, p in records]
+
+        if target_qty <= 0 and current_qty > 0:
+            status = "removed"
+            removed_sku_count += 1
+            freed_for_sku = len({p.get("cell_key", "") for _, p in records if p.get("cell_key")})
+            new_quantities = [0.0 for _ in records]
+        elif current_qty > target_qty:
+            status = "reduced"
+            reduced_sku_count += 1
+            excess = round(current_qty - target_qty, 4)
+            for pos in range(len(new_quantities) - 1, -1, -1):
+                if excess <= 0:
+                    break
+                qty = new_quantities[pos]
+                if excess >= qty:
+                    excess = round(excess - qty, 4)
+                    new_quantities[pos] = 0.0
+                    cell = records[pos][1].get("cell_key", "")
+                    if cell:
+                        freed_for_sku += 1
+                else:
+                    new_quantities[pos] = round(qty - excess, 4)
+                    excess = 0.0
+        elif current_qty < target_qty:
+            status = "inventory_exceeds_placements"
+            excess_inventory_sku_count += 1
+            diff = round(target_qty - current_qty, 4)
+            source = inventory_item or {"sku_key": sku_key}
+            unplaced_inventory.append({
+                "sku_key": sku_key,
+                "sku_code": _display_value(source.get("sku_code")),
+                "sku_name": _display_value(source.get("sku_name") or source.get("item_name")),
+                "item_name": _display_value(source.get("item_name") or source.get("sku_name")),
+                "characteristic_code": _display_value(source.get("characteristic_code")),
+                "characteristic_name": _display_value(source.get("characteristic_name")),
+                "qty_pallets": diff,
+                "source": "inventory_reconciliation",
+                "placement_status": "not_placed",
+                "placement_mode": "not_calculated",
+                "reason": "inventory_quantity_exceeds_placements",
+                "unplaced_reason": "inventory_quantity_exceeds_placements",
+            })
+        else:
+            unchanged_sku_count += 1
+
+        for (idx, placement), new_qty in zip(records, new_quantities):
+            if new_qty <= 0:
+                continue
+            updated = copy.deepcopy(placement)
+            before_qty = _placement_qty(placement)
+            updated["qty_pallets"] = round(new_qty, 4)
+            updated["occupied_capacity_pallets"] = round(new_qty, 4)
+            updated["source"] = "inventory_carryover"
+            updated["placement_mode"] = "factual"
+            updated["placement_status"] = "placed"
+            updated["inventory_reconciled"] = True
+            updated["inventory_date"] = inventory_date_value
+            updated["quantity_before_inventory"] = round(before_qty, 4)
+            updated["quantity_after_inventory"] = round(new_qty, 4)
+            new_by_index[idx] = updated
+
+        name_source = inventory_item or (records[0][1] if records else {"sku_key": sku_key})
+        details.append({
+            "sku_key": sku_key,
+            "Номенклатура": _display_value(name_source.get("sku_name") or name_source.get("item_name")) or "Нет данных",
+            "Характеристика": _display_value(name_source.get("characteristic_name") or name_source.get("characteristic")) or "Нет данных",
+            "Было размещено": round(current_qty, 4),
+            "По инвенту": round(target_qty, 4),
+            "Осталось после": round(min(current_qty, target_qty), 4) if status != "inventory_exceeds_placements" else round(current_qty, 4),
+            "Удалено": round(removed_qty, 4),
+            "Освобождено ячеек": freed_for_sku,
+            "Статус": status,
+        })
+
+    new_placements = [new_by_index[idx] for idx in sorted(new_by_index)]
+    occupied_after = {p.get("cell_key", "") for p in new_placements if _placement_qty(p) > 0 and p.get("cell_key")}
+    quantity_after = sum(_placement_qty(p) for p in new_placements)
+    working_state["placements"] = new_placements
+    working_state["unplaced_inventory"] = unplaced_inventory
+    working_state["source_unplaced_inventory"] = [dict(item) for item in unplaced_inventory]
+    working_state["last_inventory_reconciliation"] = {
+        "inventory_date": inventory_date_value,
+        "reconciled_at": _now_iso(),
+        "inventory_rows": len(inventory_rows),
+        "inventory_sku_count": len(grouped_inventory),
+        "placements_before": len(placements_before),
+        "placements_after": len(new_placements),
+        "quantity_before": round(quantity_before, 4),
+        "quantity_after": round(quantity_after, 4),
+        "removed_sku_count": removed_sku_count,
+        "reduced_sku_count": reduced_sku_count,
+        "excess_inventory_sku_count": excess_inventory_sku_count,
+    }
+    working_state.setdefault("journal", []).append({
+        "created_at": _now_iso(),
+        "action": "сверка размещения с инвентом",
+        "qty_pallets": round(quantity_after, 4),
+        "source": "inventory_reconciliation",
+    })
+
+    report = _inventory_report(
+        success=True,
+        inventory_sku_count=len(grouped_inventory),
+        sku_before_count=len(sku_before),
+        sku_after_count=len({_display_value(p.get("sku_key")) or make_sku_key(p) for p in new_placements if (_display_value(p.get("sku_key")) or make_sku_key(p))}),
+        quantity_before=quantity_before,
+        quantity_inventory=quantity_inventory,
+        quantity_after=quantity_after,
+        removed_sku_count=removed_sku_count,
+        reduced_sku_count=reduced_sku_count,
+        unchanged_sku_count=unchanged_sku_count,
+        excess_inventory_sku_count=excess_inventory_sku_count,
+        freed_cells=len(occupied_before - occupied_after),
+        occupied_cells_after=len(occupied_after),
+        details=details,
+    )
+    return working_state, report
 
 
 def _sku_weight_classes(items: list[dict[str, Any]]) -> tuple[dict[str, str], dict[str, list[str]]]:
