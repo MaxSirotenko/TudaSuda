@@ -2,7 +2,8 @@
 setlocal EnableExtensions
 
 cd /d "%~dp0"
-set "START_LOG=%CD%\start.log"
+if not exist "%CD%\data\last_import" mkdir "%CD%\data\last_import" >nul 2>&1
+set "START_LOG=%CD%\data\last_import\start.log"
 
 call :log ============================================================
 call :log Starting TudaSuda recognizer from %CD%
@@ -132,8 +133,8 @@ if errorlevel 1 (
 call :log Pulling latest code with fast-forward only...
 git pull --ff-only >>"%START_LOG%" 2>&1
 if errorlevel 1 (
-    call :fail git pull --ff-only failed. Resolve divergent history or conflicts manually, then run start.cmd again. See %START_LOG%.
-    exit /b 1
+    call :log git pull --ff-only failed. Continuing with local checkout; see %START_LOG% for details.
+    exit /b 0
 )
 call :log Git auto-update completed.
 exit /b 0
