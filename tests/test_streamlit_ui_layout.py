@@ -65,3 +65,30 @@ def test_workflow_uses_add_and_carryover_action_labels():
     assert "reconcile_placements_with_inventory" in inventory
     assert "save_placement_state(reconciled_state)" in inventory
     assert SOURCE.count("calculate_basic_weight_placement(model, placement_state, state)") == 1
+
+
+def test_map_exposes_only_working_cell_editor_controls():
+    editor = _function_source("render_map_edit_panel")
+
+    assert '"Ручное редактирование ячеек"' in editor
+    assert "Выбрана ячейка" in editor
+    assert '"Применить изменения ячейки"' in editor
+    assert '"Добавить до"' in editor
+    assert '"Добавить после"' in editor
+    assert '"Подтвердить удаление ячейки"' in editor
+    assert '"Режим редактирования"' not in editor
+    assert '"Перемещение"' not in editor
+    assert '"Выделение рамкой"' not in editor
+    assert '"+ Ячейка"' not in editor
+    assert '"− Ячейка"' not in editor
+    assert "render_bulk_map_actions" not in editor
+
+
+def test_row_shift_is_only_exposed_as_experimental_service_action():
+    service = _function_source("render_service_tab")
+    map_editor = _function_source("render_map_edit_panel")
+
+    assert '"Экспериментальное редактирование геометрии"' in service
+    assert "Ручной сдвиг может нарушить геометрию проездов" in service
+    assert "_shift_rows" in service
+    assert "_shift_rows" not in map_editor

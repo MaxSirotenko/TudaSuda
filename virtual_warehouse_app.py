@@ -1447,6 +1447,23 @@ def render_service_tab(saved_model: dict | None, model: dict | None) -> None:
         with st.expander("Ручное редактирование и технические данные"):
             render_manual_cell_editor(model)
             render_geometry_data_tabs(st.session_state.get("geometry_model", model))
+        with st.expander("Экспериментальное редактирование геометрии", expanded=False):
+            st.warning("Ручной сдвиг может нарушить геометрию проездов и будущий расчёт маршрутов")
+            row_choices = _row_options(model)
+            selected_labels = st.multiselect("Ряды для сдвига", list(row_choices), key="service_geometry_shift_rows")
+            selected_rows = [row_choices[label] for label in selected_labels]
+            g1, g2, g3 = st.columns(3)
+            dx = g1.number_input("Сдвиг X, м", value=0.0, step=0.1, key="service_geometry_shift_x")
+            dy = g2.number_input("Сдвиг Y, м", value=0.0, step=0.1, key="service_geometry_shift_y")
+            snap = g3.checkbox("Привязать к шагу 0,1 м", value=True, key="service_geometry_shift_snap")
+            if st.button("Применить экспериментальный сдвиг", disabled=not selected_rows, key="service_geometry_shift_apply"):
+                _save_map_edit_snapshot(model)
+                ok, message = _shift_rows(model, selected_rows, dx, dy, snap, 0.1)
+                if ok:
+                    _persist_map_edit(model, message)
+                    st.rerun()
+                else:
+                    st.error(message)
         st.download_button(
             "Экспортировать модель JSON",
             json.dumps(model, ensure_ascii=False, indent=2).encode("utf-8"),
@@ -2349,95 +2366,9 @@ def _shift_rows(model: dict, row_numbers: list[str], dx: float, dy: float, snap:
     return True, "Ряды сдвинуты."
 
 
-def render_bulk_map_actions(model: dict, snap: bool, snap_step: float) -> dict:
-    row_choices = _row_options(model)
-    cell_choices = _cell_options(model)
-    selected_row_labels = st.multiselect("Массовое выделение рядов", list(row_choices), key="map_bulk_rows")
-    selected_cell_labels = st.multiselect("Массовое выделение ячеек", list(cell_choices), key="map_bulk_cells")
-    row_numbers = [row_choices[label] for label in selected_row_labels]
-    cell_keys = [cell_choices[label] for label in selected_cell_labels]
-    stats = _selection_stats(model, row_numbers, cell_keys)
-    s1, s2, s3, s4, s5 = st.columns(5)
-    s1.metric("Выбрано рядов", stats["rows"])
-    s2.metric("Выбрано ячеек", stats["cells"])
-    s3.metric("Вместимость", f"{stats['capacity']:g}")
-    s4.metric("Занято", f"{stats['occupied']:g}")
-    s5.metric("Свободно", f"{stats['free']:g}")
-    if st.button("Снять выделение", key="map_clear_bulk_selection"):
-        st.session_state["map_bulk_rows"] = []
-        st.session_state["map_bulk_cells"] = []
-        st.rerun()
-    with st.expander("Массовые действия", expanded=False):
-        st.caption("Параметры ряда изменяются в разделе «Настройки рядов». Здесь доступны только геометрическое выделение, блокировка ячеек, сдвиг рядов и удаление пустых ячеек.")
-        block = st.checkbox("Заблокировать выбранные ячейки", key="bulk_block")
-        if st.button("Применить блокировку к выбранным ячейкам", key="bulk_apply"):
-            if not cell_keys:
-                st.warning("Выберите ячейки для массового изменения.")
-            else:
-                _save_map_edit_snapshot(model)
-                for cell in model.get("cells", []):
-                    if _map_cell_key(cell) in set(cell_keys):
-                        cell["source"] = "block_manual" if block else "manual_update"
-                _persist_map_edit(model, "Массовая блокировка ячеек применена.")
-                st.rerun()
-        dx = st.number_input("Сдвиг выбранных рядов X, м", value=0.0, step=snap_step, key="bulk_shift_x")
-        dy = st.number_input("Сдвиг выбранных рядов Y, м", value=0.0, step=snap_step, key="bulk_shift_y")
-        if st.button("Сдвинуть выбранные ряды", key="bulk_shift_rows"):
-            _save_map_edit_snapshot(model)
-            ok, msg = _shift_rows(model, row_numbers, dx, dy, snap, snap_step)
-            if ok:
-                _persist_map_edit(model, msg)
-                st.rerun()
-            else:
-                st.error(msg)
-        confirm = st.checkbox("Подтвердить массовое удаление пустых ячеек", key="bulk_delete_confirm")
-        if st.button("Удалить выбранные пустые ячейки", disabled=not confirm, key="bulk_delete_cells"):
-            occupied_keys = [key for key in cell_keys if _occupied_for_cell(model, key) > 0]
-            if occupied_keys:
-                st.error("Нельзя удалить занятые ячейки.")
-            else:
-                _save_map_edit_snapshot(model)
-                model["cells"] = [c for c in model.get("cells", []) if _map_cell_key(c) not in set(cell_keys)]
-                _persist_map_edit(model, "Пустые ячейки удалены.")
-                st.rerun()
-    return model
-
 def render_map_edit_panel(model: dict) -> dict:
-    st.caption("Включите ручное редактирование, чтобы менять выбранные ряды и ячейки прямо рядом с картой. Изменения сохраняются через текущий механизм ручных правок.")
-    edit_mode = st.toggle("Режим редактирования", key="map_edit_mode")
-    if not edit_mode:
-        st.caption("Режим редактирования выключен: zoom и pan работают без изменения склада.")
-        st.session_state.pop("map_selected_cell_key", None)
-        st.session_state.pop("map_selected_row_number", None)
-        return model
-    st.caption("В режиме редактирования клики по карте подсвечивают объект. Для применения изменений выберите объект в панели ниже.")
-    tool = st.radio("Инструмент", ["Выбор", "Перемещение", "Выделение рамкой"], horizontal=True, key="map_edit_tool")
-    snap = st.checkbox("Привязка к сетке", value=True, key="map_snap_enabled")
-    snap_step = st.selectbox("Шаг сетки, м", [0.1, 0.2, 0.5, 1.0], key="map_snap_step")
-    quick = st.columns(7)
-    quick[0].button("Выбор", key="map_quick_select")
-    if quick[1].button("Снять выделение", key="map_quick_clear_selection"):
-        st.session_state["map_bulk_rows"] = []
-        st.session_state["map_bulk_cells"] = []
-        st.session_state.pop("map_selected_cell_key", None)
-        st.session_state.pop("map_selected_row_number", None)
-        st.rerun()
-    object_type = st.radio("Объект", ["Ячейка", "Ряд"], horizontal=True, key="map_edit_object_type")
-    model = render_bulk_map_actions(model, snap, float(snap_step))
-    if quick[5].button("Сохранить", key="map_edit_save"):
-        save_geometry_model(model)
-        st.success("Текущая модель сохранена.")
-    if quick[6].button("Отменить последнее изменение", key="map_edit_undo"):
-        undo = st.session_state.get("map_edit_undo_model")
-        if undo:
-            save_geometry_model(undo)
-            st.session_state["geometry_model"] = undo
-            st.success("Последнее изменение отменено.")
-            st.rerun()
-        else:
-            st.warning("Нет изменения для отмены.")
-
-    if object_type == "Ячейка":
+    with st.expander("Ручное редактирование ячеек", expanded=False):
+        st.caption("Выберите ячейку из списка. Карта не сообщает клики обратно в Streamlit, поэтому выбранным считается только объект из этого списка.")
         options = _cell_options(model)
         if not options:
             st.info("В модели нет ячеек.")
@@ -2451,12 +2382,23 @@ def render_map_edit_panel(model: dict) -> dict:
             return model
         occupied = _occupied_for_cell(model, key)
         capacity = float(cell.get("capacity_pallets", 1) or 1)
-        st.write({"ряд": cell.get("row_number"), "ячейка": cell.get("cell_number"), "ярус": cell.get("tier"), "адрес": key, "тип": display_label(STORAGE_TYPE_LABELS, cell.get("storage_type")), "вместимость": capacity, "занято": occupied, "свободно": max(capacity - occupied, 0), "весовая зона": display_label(WEIGHT_ZONE_LABELS, cell.get("weight_zone", "unassigned")), "состояние": CELL_STATE_LABELS["block" not in str(cell.get("source", "")).lower()]})
-        c1, c2, c3, c4 = st.columns(4)
+        is_active = "block" not in str(cell.get("source", "")).lower()
+        st.markdown("#### Выбрана ячейка")
+        info = st.columns(4)
+        info[0].metric("Ряд / ячейка", f"{cell.get('row_number')} / {cell.get('cell_number')}")
+        info[1].metric("Ярус", cell.get("tier") or "1")
+        info[2].metric("Вместимость", f"{capacity:g}")
+        info[3].metric("Свободно", f"{max(capacity - occupied, 0):g}")
+        st.info(
+            f"Адрес: {key} · Занято: {occupied:g} · "
+            f"Тип: {display_label(STORAGE_TYPE_LABELS, cell.get('storage_type'))} · "
+            f"Весовая зона: {display_label(WEIGHT_ZONE_LABELS, cell.get('weight_zone', 'unassigned'))} · "
+            f"Состояние: {CELL_STATE_LABELS[is_active]}"
+        )
+        c1, c2, c3 = st.columns(3)
         new_number = c1.text_input("Новый номер ячейки", value=str(cell.get("cell_number", "")), key="map_cell_new_number")
         new_capacity = c2.number_input("Вместимость", min_value=0.0, value=capacity, step=1.0, key="map_cell_capacity")
-        new_type = select_internal("Тип", STORAGE_TYPE_LABELS, str(cell.get("storage_type", "normal")), key="map_cell_type", container=c3)
-        blocked = c4.checkbox("Заблокирована", value="block" in str(cell.get("source", "")).lower(), key="map_cell_blocked")
+        blocked = c3.checkbox("Заблокирована", value=not is_active, key="map_cell_blocked")
         if st.button("Применить изменения ячейки", key="map_cell_apply"):
             if _cell_duplicate_exists(model, str(cell.get("row_number")), new_number, str(cell.get("tier") or "1"), key):
                 st.error("Ячейка с таким адресом уже существует.")
@@ -2467,7 +2409,6 @@ def render_map_edit_panel(model: dict) -> dict:
                 old_key = _map_cell_key(cell)
                 cell["cell_number"] = str(new_number)
                 cell["capacity_pallets"] = new_capacity
-                cell["storage_type"] = new_type
                 cell["source"] = "block_manual" if blocked else "manual_update"
                 new_key = _map_cell_key(cell)
                 for placement in model.get("placements", []):
@@ -2498,35 +2439,6 @@ def render_map_edit_panel(model: dict) -> dict:
                 _persist_map_edit(model, "Ячейка удалена.")
                 st.session_state.pop("map_selected_cell_key", None)
                 st.rerun()
-        quick[1].button("+ Ячейка", key="map_quick_add_cell", disabled=False)
-        quick[2].button("− Ячейка", key="map_quick_del_cell", disabled=False)
-    else:
-        options = _row_options(model)
-        if not options:
-            st.info("В модели нет рядов.")
-            return model
-        label = st.selectbox("Выбранный ряд", list(options), key="map_row_select")
-        row_number = options[label]
-        st.session_state["map_selected_row_number"] = row_number
-        st.session_state.pop("map_selected_cell_key", None)
-        row = _find_map_row(model, row_number)
-        row_cells = [c for c in model.get("cells", []) if str(c.get("row_number")) == row_number]
-        occupied = sum(_occupied_for_cell(model, _map_cell_key(c)) for c in row_cells)
-        st.write({"номер ряда": row_number, "порядок ряда": row.get("row_order"), "ячеек": len(row_cells), "направление": display_label(DIRECTION_LABELS, row.get("cell_direction")), "тип": display_label(ROW_STORAGE_TYPE_LABELS, row.get("row_storage_type")), "весовая зона": display_label(WEIGHT_ZONE_LABELS, row.get("weight_zone", "unassigned")), "вместимость": sum(float(c.get("capacity_pallets", 1) or 1) for c in row_cells), "занято": occupied})
-        st.info("Параметры ряда изменяются в разделе «Настройки рядов». На карте оставлены просмотр, геометрическое выделение, сдвиг выбранных рядов и удаление пустого ряда.")
-        confirm_row = st.checkbox("Подтвердить удаление ряда", key="map_row_delete_confirm")
-        if st.button("Удалить ряд", disabled=not confirm_row, key="map_row_delete"):
-            if _row_has_placements(model, row_number):
-                st.error("В ряду есть товар. Сначала переместите или сбросьте размещение товара.")
-            else:
-                _save_map_edit_snapshot(model)
-                model["rows"] = [r for r in model.get("rows", []) if str(r.get("row_number")) != row_number]
-                model["cells"] = [c for c in model.get("cells", []) if str(c.get("row_number")) != row_number]
-                _persist_map_edit(model, "Ряд удалён.")
-                st.session_state.pop("map_selected_row_number", None)
-                st.rerun()
-        quick[3].button("+ Ряд", key="map_quick_add_row")
-        quick[4].button("− Ряд", key="map_quick_del_row", disabled=False)
     return model
 
 def render_geometry_map_view(model: dict) -> None:
@@ -2555,12 +2467,9 @@ def render_geometry_map_view(model: dict) -> None:
     with control_right:
         scale = st.slider("Масштаб, px/м", min_value=4.0, max_value=60.0, value=22.0, step=1.0, key="map_scale")
     label_settings = render_map_settings_editor()
-    label_settings["edit_mode"] = bool(st.session_state.get("map_edit_mode", False))
+    label_settings["edit_mode"] = False
     label_settings["selected_cell_key"] = st.session_state.get("map_selected_cell_key", "")
-    label_settings["selected_row_number"] = st.session_state.get("map_selected_row_number", "")
-    label_settings["edit_tool"] = st.session_state.get("map_edit_tool", "Выбор")
-    label_settings["snap_enabled"] = bool(st.session_state.get("map_snap_enabled", True))
-    label_settings["snap_step"] = float(st.session_state.get("map_snap_step", 0.1) or 0.1)
+    label_settings["selected_row_number"] = ""
     render_started = perf_counter()
     html = build_geometry_html_cached(json.dumps(model, ensure_ascii=False), scale, detailed, json.dumps(label_settings, ensure_ascii=False, sort_keys=True))
     components.html(html, height=980, scrolling=True)
