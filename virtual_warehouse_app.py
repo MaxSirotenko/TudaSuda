@@ -61,6 +61,7 @@ from warehouse_inventory_placement import (
     normalize_inventory_table,
     placement_diagnostics,
     read_inventory_table,
+    reconcile_placements_with_inventory,
     save_placement_state,
     update_placement_qty,
     move_placement,
@@ -737,8 +738,8 @@ def render_manual_cell_editor(model: dict) -> None:
 
 
 def render_inventory_placement(model: dict) -> dict:
-    st.subheader("Размещение товара")
-    st.caption("Загрузите переходящие остатки или рассчитайте базовое размещение. Результат сохраняется отдельно от геометрии склада.")
+    st.subheader("Инвентаризация")
+    st.caption("Загрузите инвент на конец дня, проверьте строки и зафиксируйте фактический переходящий остаток без перемещения сохранённых SKU.")
     state, state_warning = load_placement_state(model)
     if state_warning:
         st.warning(state_warning)
@@ -750,19 +751,19 @@ def render_inventory_placement(model: dict) -> dict:
     )
     settings["allow_mixed_sku_in_deep_lane"] = allow_mixed
 
-    upload_tab, unplaced_tab, manual_tab, edit_tab, diag_tab = st.tabs([
-        "Загрузка инвента / остатков",
+    upload_tab, unplaced_tab, manual_tab, edit_tab = st.tabs([
+        "Загрузка и сверка инвента",
         "Товар без привязки к ячейкам",
         "Разместить вручную",
         "Редактировать размещение",
-        "Диагностика размещения",
     ])
 
     with upload_tab:
-        st.caption("Загрузите Excel с переходящими остатками. После импорта товары с адресом попадут в фактическое размещение, а товары без адреса — в список для расчёта.")
+        st.caption("Шаги: загрузите файл → проверьте сопоставление и предпросмотр → зафиксируйте переходящий остаток.")
         inventory_file = st.file_uploader("Загрузить Excel с остатками", type=["xlsx"], key="inventory_upload")
-        replace_current = st.checkbox("Заменить текущее размещение", value=True, key="inventory_replace_current")
-        if inventory_file is not None:
+        if inventory_file is None:
+            st.button("Зафиксировать переходящий остаток", type="primary", disabled=True, key="inventory_reconcile_disabled")
+        else:
             inventory_bytes = inventory_file.getvalue()
             inventory_hash = file_hash(inventory_bytes)
             sheet_names = get_inventory_sheet_names(inventory_bytes)
@@ -797,17 +798,46 @@ def render_inventory_placement(model: dict) -> dict:
             has_cell_columns = bool(mapping.get("cell_address") or (mapping.get("row_number") and mapping.get("cell_number")))
             if not has_cell_columns:
                 st.warning("В инвенте нет адресов ячеек. Система не может восстановить фактическое расположение товара. Автоматическое размещение будет модельным и используется только для расчётов.")
-            if st.button("Импортировать инвент", type="primary", key="inventory_import_button"):
+            if st.button("Зафиксировать переходящий остаток", type="primary", key="inventory_reconcile_button"):
                 if any(item.get("level") == "error" for item in inv_diagnostics):
-                    st.error("Исправьте обязательные колонки перед импортом.")
-                elif not replace_current and (state.get("placements") or state.get("unplaced_inventory")):
-                    st.error("Подтвердите замену текущего размещения или очистите его вручную.")
+                    st.error("Исправьте обязательные колонки перед сверкой.")
                 else:
-                    state, placement_import_diag = import_inventory(model, normalized_inventory, allow_replace=True)
-                    st.session_state["placement_state"] = state
-                    st.success("Инвент импортирован. Размещение сохранено в data/last_import/placements.json.")
-                    st.dataframe(pd.DataFrame(placement_import_diag), use_container_width=True)
-                    st.rerun()
+                    reconciled_state, report = reconcile_placements_with_inventory(model, state, normalized_inventory)
+                    if not report.get("success"):
+                        st.error("Сверка не выполнена: исправьте ошибки инвента. Текущее размещение не изменено.")
+                        st.dataframe(pd.DataFrame(report.get("details", [])), use_container_width=True)
+                    else:
+                        save_placement_state(reconciled_state)
+                        st.session_state["placement_state"] = reconciled_state
+                        st.session_state["last_inventory_reconciliation_report"] = report
+                        summary = report.get("summary", {})
+                        st.success(
+                            f"Переходящий остаток зафиксирован: SKU до — {summary.get('SKU до сверки', 0)}, "
+                            f"по инвенту — {summary.get('SKU в инвенте', 0)}, после — {summary.get('SKU после сверки', 0)}."
+                        )
+                        r1, r2, r3 = st.columns(3)
+                        r1.metric("Удалено SKU", summary.get("Полностью удалено SKU", 0))
+                        r2.metric("Уменьшено SKU", summary.get("Уменьшено SKU", 0))
+                        r3.metric("Освобождено ячеек", summary.get("Освобождено логических ячеек", 0))
+                        with st.expander("Подробная диагностика"):
+                            st.dataframe(pd.DataFrame(report.get("details", [])), use_container_width=True)
+            with st.expander("Импорт адресного инвента (служебный сценарий)"):
+                st.caption("Сохраняет прежний сценарий импорта фактических адресов. Используйте его только для первичной загрузки склада.")
+                if st.button("Импортировать адресный инвент", key="inventory_import_button"):
+                    if any(item.get("level") == "error" for item in inv_diagnostics):
+                        st.error("Исправьте обязательные колонки перед импортом.")
+                    else:
+                        state, placement_import_diag = import_inventory(model, normalized_inventory, allow_replace=True)
+                        st.session_state["placement_state"] = state
+                        st.success("Адресный инвент импортирован.")
+                        st.dataframe(pd.DataFrame(placement_import_diag), use_container_width=True)
+                        st.rerun()
+
+        last_report = st.session_state.get("last_inventory_reconciliation_report")
+        if last_report:
+            with st.expander("Результат последней сверки с инвентом"):
+                _metric_grid(last_report.get("summary", {}), columns=4)
+                st.dataframe(pd.DataFrame(last_report.get("details", [])), use_container_width=True)
 
     with unplaced_tab:
         unplaced = state.get("unplaced_inventory", [])
@@ -822,23 +852,7 @@ def render_inventory_placement(model: dict) -> dict:
             st.dataframe(pd.DataFrame(unplaced), use_container_width=True)
         else:
             st.info("Товаров без привязки к ячейкам сейчас нет.")
-        st.caption("Нажмите кнопку расчёта, чтобы последовательно разместить остатки и приходы по назначенным весовым зонам.")
-        st.info("Размещение выполняется последовательно по маршруту внутри весовых зон. Алгоритм пока не учитывает ABC, прогноз, соседство и другие правила оптимизации.")
-        if st.button("Рассчитать базовое размещение", key="basic_weight_place_inventory"):
-            receipts_state, receipts_warning = load_receipts_state(model)
-            if receipts_warning:
-                st.warning(receipts_warning)
-            model = apply_active_boundaries_to_model(model)
-            save_geometry_model(model)
-            save_pre_placement_snapshot(model, state, receipts_state, trigger="basic_weight_placement")
-            state, basic_diag = calculate_basic_weight_placement(model, state, receipts_state)
-            st.session_state["geometry_model"] = attach_placements_to_model(model, state)
-            st.session_state["placement_state"] = state
-            st.success("Базовое размещение по весовым зонам выполнено.")
-            st.dataframe(pd.DataFrame([{"Показатель": key, "Значение": value} for key, value in basic_diag.items() if key != "Неразмещённые позиции"]), use_container_width=True)
-            if basic_diag.get("Неразмещённые позиции"):
-                st.dataframe(pd.DataFrame(basic_diag["Неразмещённые позиции"]), use_container_width=True)
-            st.rerun()
+        st.caption("Новый приход размещается кнопкой «Добавить приход на текущий склад» на предыдущем шаге. Здесь остаются только ручные операции с неразмещённым товаром.")
         if st.button("Разложить автоматически по складу", disabled=not unplaced, key="auto_place_inventory"):
             state, auto_diag = auto_place_unplaced(model, state, allow_mixed_sku_in_deep_lane=allow_mixed)
             st.session_state["placement_state"] = state
@@ -905,18 +919,6 @@ def render_inventory_placement(model: dict) -> dict:
                     st.session_state["placement_state"] = state
                     st.success("Размещение удалено, товар возвращён в Без ячейки.")
                     st.rerun()
-
-    with diag_tab:
-        render_placement_diagnostics_section(model, state)
-        if st.button("Очистить журнал", key="placement_clear_journal"):
-            state["journal"] = []
-            save_placement_state(state)
-            st.rerun()
-        if st.button("Сбросить рассчитанное размещение", key="placement_clear_all"):
-            state = clear_calculated_placements(state)
-            st.session_state["placement_state"] = state
-            st.success("Рассчитанное размещение очищено. Фактические остатки, приходы и настройки зон сохранены.")
-            st.rerun()
 
     return attach_placements_to_model(model, state)
 
@@ -1238,7 +1240,8 @@ def render_receipts_section(model: dict) -> None:
 
     with data_tab:
         if not receipts:
-            st.info("Загруженных приходов пока нет. Кнопка «Рассчитать размещение приходов» появится после загрузки Excel с приходами.")
+            st.info("Загруженных приходов пока нет. Сначала загрузите и проверьте файл прихода.")
+            st.button("Добавить приход на текущий склад", type="primary", disabled=True, key="receipt_add_disabled")
         else:
             st.dataframe(_receipt_dataframe(receipts), use_container_width=True)
             st.subheader("Правила определения зоны товара")
@@ -1306,14 +1309,10 @@ def render_receipts_section(model: dict) -> None:
                 st.error("Зоны товаров ещё не рассчитаны или все SKU без категории. Настройте правила и нажмите «Рассчитать зоны товаров». Исходная зона 1С используется только для сравнения.")
             elif zone_summary.get("unclassified", 0):
                 st.warning("У части строк прихода нет рассчитанной зоны. Эти строки не будут размещены автоматически и получат причину missing_calculated_zone.")
-            st.caption("Чтобы приходы появились на карте, нажмите «Рассчитать размещение приходов». Расчёт запишет placements.json и обновит занятость ячеек на вкладке «Карта склада».")
-            b1, b2, b3 = st.columns(3)
+            st.caption("Чтобы добавить приход поверх текущего остатка, нажмите «Добавить приход на текущий склад». Операция не очищает фактический переходящий остаток.")
+            b1, b3 = st.columns(2)
             b1.download_button("Скачать загруженные приходы", export_receipts_excel_bytes(state), file_name="receipts.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-            if b2.button("Очистить загруженные приходы", key="receipt_clear_button"):
-                clear_receipts_state()
-                st.success("Загруженные приходы очищены.")
-                st.rerun()
-            if b3.button("Рассчитать размещение приходов", key="receipt_calculate_stub", type="primary"):
+            if b3.button("Добавить приход на текущий склад", key="receipt_calculate_stub", type="primary"):
                 if current_medium_limit <= current_light_limit:
                     st.error("Исправьте границы веса и пересчитайте зоны товаров перед размещением.")
                     return
@@ -1333,10 +1332,16 @@ def render_receipts_section(model: dict) -> None:
                 st.session_state["geometry_model"] = attach_placements_to_model(model, placement_state)
                 st.session_state["placement_state"] = placement_state
                 st.session_state["last_receipt_placement_diag"] = basic_diag
-                st.success("Размещение приходов рассчитано по активным границам зон. Если строки не попали на карту, смотрите таблицу причин ниже.")
-                _render_receipt_placement_diagnostics(basic_diag)
+                summary = basic_diag or {}
+                st.success(
+                    f"Приход добавлен на текущий склад: размещено — {summary.get('Размещено паллет', summary.get('Размещено', 0))}, "
+                    f"не размещено — {summary.get('Не размещено паллет', summary.get('Не размещено', 0))}."
+                )
+                with st.expander("Подробная диагностика", expanded=False):
+                    _render_receipt_placement_diagnostics(basic_diag)
             elif st.session_state.get("last_receipt_placement_diag"):
-                _render_receipt_placement_diagnostics(st.session_state.get("last_receipt_placement_diag"))
+                with st.expander("Подробная диагностика последнего добавления прихода", expanded=False):
+                    _render_receipt_placement_diagnostics(st.session_state.get("last_receipt_placement_diag"))
 
     with diag_tab:
         st.subheader("Диагностика приходов")
@@ -1348,48 +1353,165 @@ def render_receipts_section(model: dict) -> None:
         else:
             st.info("Диагностика появится после загрузки файла приходов.")
 
+
+def _current_warehouse_state(model: dict) -> None:
+    placement_state, _ = load_placement_state(model)
+    receipts_state, _ = load_receipts_state(model)
+    placements = placement_state.get("placements", [])
+    unplaced = placement_state.get("unplaced_inventory", [])
+    carryover = [item for item in placements if item.get("source") == "inventory_carryover"]
+    new_receipts = [item for item in placements if item.get("source") != "inventory_carryover"]
+    sku_keys = {item.get("sku_key") for item in placements if item.get("sku_key")}
+    occupied_cells = {item.get("cell_key") for item in placements if item.get("cell_key")}
+    last_inventory = placement_state.get("last_inventory_reconciliation", {})
+    operations = placement_state.get("journal", [])
+    last_operation = operations[-1].get("created_at", "—") if operations else "—"
+    cols = st.columns(7)
+    metrics = [
+        ("Последняя операция", last_operation),
+        ("Последний инвент", last_inventory.get("inventory_date", "—")),
+        ("SKU на складе", len(sku_keys)),
+        ("Занято ячеек", len(occupied_cells)),
+        ("Переходящий остаток", f"{sum(float(x.get('qty_pallets', 0) or 0) for x in carryover):g}"),
+        ("Новый приход", f"{sum(float(x.get('qty_pallets', 0) or 0) for x in new_receipts):g}"),
+        ("Не размещено", f"{sum(float(x.get('qty_pallets', 0) or 0) for x in unplaced):g}"),
+    ]
+    for col, (label, value) in zip(cols, metrics):
+        col.metric(label, value)
+    if receipts_state.get("receipts"):
+        st.caption(f"Загружено строк прихода: {len(receipts_state['receipts'])}.")
+
+
+def render_warehouse_map_tab(model: dict | None) -> None:
+    if not model:
+        st.info("Сначала загрузите схему склада на вкладке «Служебное».")
+        return
+    render_geometry_map_view(model)
+    model = st.session_state.get("geometry_model", model)
+    with st.expander("Настройки рядов и геометрии", expanded=False):
+        model = render_unified_row_settings_editor(model)
+        model = st.session_state.get("geometry_model", model)
+        render_active_model_aisle_editor(model)
+    model = st.session_state.get("geometry_model", model)
+    with st.expander("Настройки весовых зон", expanded=False):
+        render_zone_boundaries_editor(model)
+
+
+def render_receipts_inventory_tab(model: dict | None) -> None:
+    if not model:
+        st.info("Для работы с приходами сначала загрузите схему склада на вкладке «Служебное».")
+        return
+    st.subheader("Текущее состояние склада")
+    _current_warehouse_state(model)
+    workflow = st.tabs(["1–3. Приход", "4–6. Инвентаризация", "История операций"])
+    with workflow[0]:
+        render_receipts_section(model)
+    with workflow[1]:
+        render_inventory_placement(model)
+    with workflow[2]:
+        placement_state, _ = load_placement_state(model)
+        journal = placement_state.get("journal", [])
+        if journal:
+            st.dataframe(pd.DataFrame(journal), use_container_width=True)
+        else:
+            st.info("История операций пока пуста.")
+        with st.expander("Запросы для выгрузки из 1С"):
+            st.caption("Используйте действующие запросы проекта для подготовки файлов прихода и инвентаризации. Формат выгрузки в этой версии интерфейса не изменён.")
+
+
+def render_analytics_tab(model: dict | None) -> None:
+    if not model:
+        st.info("Аналитика появится после загрузки модели склада.")
+        return
+    state, warning = load_placement_state(model)
+    if warning:
+        st.warning(warning)
+    render_placement_diagnostics_section(model, state)
+    unplaced = state.get("unplaced_inventory", [])
+    st.subheader("Не размещено")
+    if unplaced:
+        st.dataframe(pd.DataFrame(unplaced), use_container_width=True)
+    else:
+        st.info("Неразмещённого товара нет.")
+    last_report = st.session_state.get("last_inventory_reconciliation_report")
+    if last_report:
+        st.subheader("Результат последней сверки с инвентом")
+        st.dataframe(pd.DataFrame(last_report.get("details", [])), use_container_width=True)
+
+
+def render_service_tab(saved_model: dict | None, model: dict | None) -> None:
+    st.subheader("Загрузка и замена схемы склада")
+    render_geometry_constructor_tab(saved_model, show_active_model=False)
+    model = st.session_state.get("geometry_model", model)
+    if model:
+        with st.expander("Ручное редактирование и технические данные"):
+            render_manual_cell_editor(model)
+            render_geometry_data_tabs(st.session_state.get("geometry_model", model))
+        st.download_button(
+            "Экспортировать модель JSON",
+            json.dumps(model, ensure_ascii=False, indent=2).encode("utf-8"),
+            file_name="warehouse_model.json",
+            mime="application/json",
+            key="service_export_model_json",
+        )
+    with st.expander("Опасные действия", expanded=False):
+        st.warning("Эти действия изменяют сохранённое состояние. Перед выполнением проверьте выбранное подтверждение.")
+        if st.button("Сбросить рассчитанное размещение", key="placement_clear_all"):
+            state, warning = load_placement_state(model or {})
+            if warning:
+                st.warning(warning)
+            state = clear_calculated_placements(state)
+            st.session_state["placement_state"] = state
+            st.success("Рассчитанный приход очищен. Фактический переходящий остаток сохранён.")
+        if st.button("Очистить журнал размещения", key="placement_clear_journal"):
+            state, _ = load_placement_state(model or {})
+            state["journal"] = []
+            save_placement_state(state)
+            st.success("Журнал размещения очищен.")
+        if st.button("Очистить загруженный приход", key="receipt_clear_button"):
+            clear_receipts_state()
+            st.success("Загруженный приход очищен.")
+        reset_confirm = st.checkbox("Подтверждаю полный сброс проекта", key="service_full_reset_confirm")
+        if st.button("Полный сброс проекта", disabled=not reset_confirm, key="geometry_clear_saved"):
+            for path in [MODEL_PATH, META_PATH]:
+                if path.exists():
+                    path.unlink()
+            clear_manual_overrides()
+            clear_row_settings()
+            clear_placement_state()
+            clear_receipts_state()
+            st.session_state.pop("geometry_model", None)
+            st.session_state.pop("placement_state", None)
+            st.success("Проект полностью сброшен.")
+            st.rerun()
+
+
 def render_excel_geometry_warehouse() -> None:
     st.title("Симулятор скорости сборки")
-    st.header("Склад из Excel: ряды + ячейки + проезды")
-    st.caption("Строим не копию Excel-картинки, а рабочую геометрическую модель склада в метрах: вертикальные ряды, фактические ячейки, верхний/нижний проезд и заданные межрядные проезды.")
-
+    st.caption("Рабочий процесс: настройте склад на карте, добавьте приход, зафиксируйте инвент и проверьте результат в аналитике.")
     saved_model = load_geometry_model()
     if saved_model:
         saved_model = sync_row_settings_to_model(saved_model)
     if saved_model and "geometry_model" not in st.session_state:
         st.session_state["geometry_model"] = saved_model
-    with st.sidebar:
-        st.subheader("Сохранённая геометрия")
-        if saved_model:
-            st.success(f"Есть сохранённая модель: {saved_model.get('source_file_name', '—')}")
-            if st.button("Использовать сохранённую геометрию", key="geometry_use_saved"):
-                st.session_state["geometry_model"] = saved_model
-                st.rerun()
-            if st.button("Очистить сохранённую геометрию", key="geometry_clear_saved"):
-                for path in [MODEL_PATH, META_PATH]:
-                    if path.exists():
-                        path.unlink()
-                clear_manual_overrides()
-                clear_row_settings()
-                clear_placement_state()
-                st.session_state.pop("geometry_model", None)
-                st.session_state.pop("placement_state", None)
-                st.rerun()
-        else:
-            st.caption("Сохранённой геометрии пока нет.")
-
-    constructor_tab, map_tab = st.tabs(["Конструктор склада", "Карта склада"])
-    with constructor_tab:
-        render_geometry_constructor_tab(saved_model)
+    model = st.session_state.get("geometry_model")
+    map_tab, operations_tab, analytics_tab, service_tab = st.tabs([
+        "Карта склада",
+        "Приходы и инвент",
+        "Аналитика",
+        "Служебное",
+    ])
     with map_tab:
-        model = st.session_state.get("geometry_model")
-        if model:
-            render_geometry_map_view(model)
-        else:
-            st.info("Сначала загрузите Excel или используйте сохранённую геометрию на вкладке «Конструктор склада».")
+        render_warehouse_map_tab(model)
+    with operations_tab:
+        render_receipts_inventory_tab(model)
+    with analytics_tab:
+        render_analytics_tab(model)
+    with service_tab:
+        render_service_tab(saved_model, model)
 
 
-def render_geometry_constructor_tab(saved_model: dict | None) -> None:
+def render_geometry_constructor_tab(saved_model: dict | None, *, show_active_model: bool = False) -> None:
     st.caption("Загрузите Excel со схемой склада и выберите лист с ячейками. После построения модель сохранится и будет доступна на вкладке «Карта склада».")
     uploaded = st.file_uploader("Excel со списком фактических ячеек", type=["xlsx"], key="geometry_cells_file")
     if uploaded is None:
@@ -1398,7 +1520,7 @@ def render_geometry_constructor_tab(saved_model: dict | None) -> None:
         else:
             st.info("Загрузите Excel со списком ячеек в формате: Код | Ряд | Ячейка | Ярус.")
         model = st.session_state.get("geometry_model")
-        if model:
+        if model and show_active_model:
             render_geometry_constructor_view(model)
         return
 
@@ -1533,7 +1655,7 @@ def render_geometry_constructor_tab(saved_model: dict | None) -> None:
         st.success(f"Геометрическая модель построена и сохранена: {len(model['rows'])} рядов, {len(model['cells'])} ячеек, {len(model['aisles'])} проездов.")
 
     model = st.session_state.get("geometry_model")
-    if model:
+    if model and show_active_model:
         render_geometry_constructor_view(model)
 
 
@@ -1961,7 +2083,7 @@ def render_geometry_data_tabs(model: dict) -> None:
 
 def render_geometry_constructor_view(model: dict) -> None:
     st.subheader("Активная модель")
-    st.caption("Здесь собраны инструменты конструктора: ручные правки, зоны, проезды, остатки, приходы и диагностика. Карта показана отдельно на вкладке «Карта склада».")
+    st.caption("Служебный просмотр активной модели и ручных изменений.")
     overrides = load_manual_overrides()
     if overrides and overrides.get("source_model_id") != model.get("model_id"):
         overrides = None
@@ -1984,16 +2106,7 @@ def render_geometry_constructor_view(model: dict) -> None:
     if diagnostics:
         st.dataframe(pd.DataFrame(diagnostics), use_container_width=True)
     render_manual_cell_editor(model)
-    model = st.session_state.get("geometry_model", model)
-    model = render_unified_row_settings_editor(model)
-    model = st.session_state.get("geometry_model", model)
-    model = render_zone_boundaries_editor(model)
-    model = st.session_state.get("geometry_model", model)
-    render_active_model_aisle_editor(model)
-    model = st.session_state.get("geometry_model", model)
-    model = render_inventory_placement(model)
-    render_receipts_section(model)
-    render_geometry_data_tabs(model)
+    render_geometry_data_tabs(st.session_state.get("geometry_model", model))
 
 
 
