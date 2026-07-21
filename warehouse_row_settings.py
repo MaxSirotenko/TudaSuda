@@ -8,7 +8,7 @@ import pandas as pd
 VALID_DIRECTIONS = {"bottom_to_top", "top_to_bottom"}
 VALID_STORAGE_TYPES = {"normal", "deep_lane"}
 VALID_ZONES = {"heavy", "medium", "light", "fragile", "unassigned"}
-SYNC_FIELDS = ["row_number", "row_order", "cell_direction", "weight_zone", "initial_weight_zone", "row_storage_type", "deep_lane_width", "capacity_pallets", "row_group", "side", "comment", "base_cell_width_m", "base_row_width_m"]
+SYNC_FIELDS = ["row_number", "row_order", "cell_direction", "weight_zone", "initial_weight_zone", "row_storage_type", "deep_lane_width", "capacity_pallets", "row_group", "side", "comment", "base_cell_width_m", "base_row_width_m", "top_offset_cells", "bottom_offset_cells", "top_offset_m", "bottom_offset_m"]
 CELL_SYNC_FIELDS = ["row_order", "cell_direction", "weight_zone", "row_group", "side", "comment"]
 
 
@@ -58,6 +58,8 @@ def build_row_settings_draft(model: dict[str, Any]) -> pd.DataFrame:
             "cell_capacity_pallets": cell_capacity,
             "cells_count": len(row_cells) or int(_float(row.get("cells_count"), 0)),
             "row_capacity_pallets": (len(row_cells) or int(_float(row.get("cells_count"), 0))) * cell_capacity,
+            "top_offset_cells": int(_float(row.get("top_offset_cells") if row.get("top_offset_cells") not in {None, ""} else _row_fallback(model, row_number, "top_offset_cells", 0), 0)),
+            "bottom_offset_cells": int(_float(row.get("bottom_offset_cells") if row.get("bottom_offset_cells") not in {None, ""} else _row_fallback(model, row_number, "bottom_offset_cells", 0), 0)),
             "row_group": row.get("row_group") or _row_fallback(model, row_number, "row_group", ""),
             "side": row.get("side") or _row_fallback(model, row_number, "side", ""),
             "comment": row.get("comment") or _row_fallback(model, row_number, "comment", ""),
@@ -127,15 +129,20 @@ def _apply_row_y_layout(model: dict[str, Any], row: dict[str, Any], cells: list[
         row["y_max"] = 0.0
         return
     length = _cell_length(model, ordered_cells)
+    top_offset_cells = int(_float(row.get("top_offset_cells"), 0))
+    bottom_offset_cells = int(_float(row.get("bottom_offset_cells"), 0))
+    top_offset_m = top_offset_cells * length
+    bottom_offset_m = bottom_offset_cells * length
+    row.update({"top_offset_cells": top_offset_cells, "bottom_offset_cells": bottom_offset_cells, "top_offset_m": top_offset_m, "bottom_offset_m": bottom_offset_m})
     direction = row.get("cell_direction", "bottom_to_top")
     count = len(ordered_cells)
     for idx, cell in enumerate(ordered_cells):
         position_from_bottom = count - 1 - idx if direction == "top_to_bottom" else idx
-        y_min = position_from_bottom * length
+        y_min = top_offset_m + position_from_bottom * length
         y_max = y_min + length
         cell.update({"y_min": y_min, "y_max": y_max, "y_center": (y_min + y_max) / 2, "length_m": length})
     row["y_min"] = 0.0
-    row["y_max"] = count * length
+    row["y_max"] = top_offset_m + count * length + bottom_offset_m
 
 
 def _aisle_width(aisle: dict[str, Any]) -> float:
@@ -182,14 +189,34 @@ def _refresh_navigation(model: dict[str, Any]) -> None:
             aisle["x_max"] = _float(row_to.get("x_min"))
             aisle["aisle_width_m"] = max(_float(aisle.get("x_max")) - _float(aisle.get("x_min")), 0.0)
     total_width = max([_float(row.get("x_max")) for row in model.get("rows", [])] + [0.0])
+    max_row_y = max([_float(row.get("y_max")) for row in model.get("rows", [])] + [0.0])
+    settings = model.get("settings") or {}
+    for aisle in model.get("aisles", []):
+        aisle["y_min"] = 0.0
+        aisle["y_max"] = max_row_y
     for road in model.get("roads", []):
         road["x_max"] = total_width
+        if road.get("road_type") == "top":
+            width = _float(road.get("width_m"), _float(settings.get("top_road_width_m"), 0.0))
+            road.update({"y_min": max_row_y, "y_max": max_row_y + width})
     for node in model.get("navigation_nodes", []):
         row = rows.get(_display(node.get("row_number")))
         if row:
             node["x"] = _float(row.get("x_center"))
+            if str(node.get("node_id", "")).endswith(":bottom") or node.get("node_type") == "row_bottom_entry":
+                node["y"] = _float(row.get("y_min"))
+            elif str(node.get("node_id", "")).endswith(":top") or node.get("node_type") == "row_top_entry":
+                node["y"] = _float(row.get("y_max"))
         elif node.get("node_id") in {"road:bottom", "road:top"}:
             node["x"] = total_width / 2 if total_width else 0.0
+            if node.get("node_id") == "road:top":
+                node["y"] = max_row_y + _float(settings.get("top_road_width_m"), 0.0) / 2
+    for edge in model.get("navigation_edges", []):
+        if edge.get("edge_type") == "row_walk":
+            row_number = _display(str(edge.get("from_node", "")).split(":")[1] if ":" in str(edge.get("from_node", "")) else "")
+            row = rows.get(row_number)
+            if row:
+                edge["distance_m"] = max(_float(row.get("y_max")) - _float(row.get("y_min")), 0.0)
 
 
 def _has_intersection(model: dict[str, Any], row_number: str, x_min: float, x_max: float, y_min: float, y_max: float) -> bool:
@@ -231,6 +258,15 @@ def _validate_edited_rows(model: dict[str, Any], edited_rows: list[dict[str, Any
             errors.append(f"Ошибка: ряд {row_number}: некорректный тип ряда.")
         if edited.get("weight_zone", "unassigned") not in VALID_ZONES:
             errors.append(f"Ошибка: ряд {row_number}: некорректная весовая зона.")
+        for field, label in (("top_offset_cells", "верхний отступ"), ("bottom_offset_cells", "нижний отступ")):
+            raw = edited.get(field, 0)
+            try:
+                value = float(str(raw).replace(",", "."))
+            except (TypeError, ValueError):
+                errors.append(f"Ошибка: ряд {row_number}: {label} должен быть целым числом не меньше 0.")
+                continue
+            if value < 0 or not value.is_integer():
+                errors.append(f"Ошибка: ряд {row_number}: {label} должен быть целым числом не меньше 0.")
         capacity = int(_float(edited.get("cell_capacity_pallets"), 1)) if edited.get("row_storage_type") == "deep_lane" else 1
         if capacity < 1:
             errors.append(f"Ошибка: ряд {row_number}: вместимость должна быть не меньше 1.")
@@ -258,6 +294,8 @@ def sync_row_settings_to_model(model: dict[str, Any]) -> dict[str, Any]:
         row_base_width[row_number] = base_width
         row_widths[row_number] = target_width
         row.setdefault("initial_weight_zone", row.get("weight_zone", "unassigned"))
+        row["top_offset_cells"] = int(_float(row.get("top_offset_cells"), 0))
+        row["bottom_offset_cells"] = int(_float(row.get("bottom_offset_cells"), 0))
         row.update({"base_cell_width_m": base_width, "base_row_width_m": base_width, "deep_lane_width": capacity, "capacity_pallets": capacity * len(row_cells), "cells_count": len(row_cells)})
 
     _relayout_rows_with_aisles(model, row_widths)
@@ -292,10 +330,10 @@ def apply_row_settings_transaction(model: dict[str, Any], edited_rows: list[dict
     rows_by_number = {_display(row.get("row_number")): row for row in candidate.get("rows", [])}
     for row_number, edited in edited_by_number.items():
         row = rows_by_number[row_number]
-        old = {field: row.get(field) for field in ["row_order", "cell_direction", "weight_zone", "row_storage_type", "deep_lane_width", "row_group", "side", "comment"]}
+        old = {field: row.get(field) for field in ["row_order", "cell_direction", "weight_zone", "row_storage_type", "deep_lane_width", "row_group", "side", "comment", "top_offset_cells", "bottom_offset_cells"]}
         storage = edited.get("row_storage_type", "normal")
         capacity = int(_float(edited.get("cell_capacity_pallets"), 1)) if storage == "deep_lane" else 1
-        row.update({"row_order": _float(edited.get("row_order"), row.get("row_order", 0)), "cell_direction": edited.get("cell_direction", "bottom_to_top"), "weight_zone": edited.get("weight_zone", "unassigned"), "row_storage_type": storage, "deep_lane_width": capacity, "row_group": _display(edited.get("row_group")), "side": _display(edited.get("side")), "comment": _display(edited.get("comment"))})
+        row.update({"row_order": _float(edited.get("row_order"), row.get("row_order", 0)), "cell_direction": edited.get("cell_direction", "bottom_to_top"), "weight_zone": edited.get("weight_zone", "unassigned"), "row_storage_type": storage, "deep_lane_width": capacity, "row_group": _display(edited.get("row_group")), "side": _display(edited.get("side")), "comment": _display(edited.get("comment")), "top_offset_cells": int(_float(edited.get("top_offset_cells"), 0)), "bottom_offset_cells": int(_float(edited.get("bottom_offset_cells"), 0))})
         new = {field: row.get(field) for field in old}
         diff = [f"{field}: {old[field]} → {new[field]}" for field in old if old[field] != new[field]]
         if diff:

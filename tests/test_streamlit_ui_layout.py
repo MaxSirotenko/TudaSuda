@@ -92,3 +92,14 @@ def test_row_shift_is_only_exposed_as_experimental_service_action():
     assert "Ручной сдвиг может нарушить геометрию проездов" in service
     assert "_shift_rows" in service
     assert "_shift_rows" not in map_editor
+
+
+def test_row_offsets_are_editable_and_bulk_zero_requires_explicit_opt_in():
+    editor = _function_source("render_unified_row_settings_editor")
+
+    assert "Отступ сверху, ячеек" in SOURCE
+    assert "Отступ снизу, ячеек" in SOURCE
+    assert '"Изменить отступ сверху"' in editor
+    assert '"Изменить отступ снизу"' in editor
+    assert "if apply_top_offset:" in editor
+    assert "if apply_bottom_offset:" in editor

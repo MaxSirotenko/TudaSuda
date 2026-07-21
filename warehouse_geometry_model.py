@@ -171,6 +171,8 @@ def default_row_config(df: pd.DataFrame) -> pd.DataFrame:
             "side": [""] * len(rows),
             "comment": [""] * len(rows),
             "weight_zone": ["unassigned"] * len(rows),
+            "top_offset_cells": [0] * len(rows),
+            "bottom_offset_cells": [0] * len(rows),
         }
     )
 
@@ -243,6 +245,8 @@ def _row_order_map(row_config: pd.DataFrame | None) -> dict[str, dict[str, Any]]
             "side": _display_value(row.get("side")),
             "comment": _display_value(row.get("comment")),
             "weight_zone": _display_value(row.get("weight_zone")) if _display_value(row.get("weight_zone")) in {"heavy", "medium", "light", "fragile", "unassigned"} else "unassigned",
+            "top_offset_cells": max(0, int(_safe_float(row.get("top_offset_cells"), 0))),
+            "bottom_offset_cells": max(0, int(_safe_float(row.get("bottom_offset_cells"), 0))),
         }
     return result
 
@@ -328,6 +332,10 @@ def build_geometry_model(
         cell_direction = meta.get("cell_direction", "bottom_to_top")
         weight_zone = meta.get("weight_zone", "unassigned")
         initial_weight_zone = meta.get("initial_weight_zone", weight_zone)
+        top_offset_cells = int(meta.get("top_offset_cells", 0) or 0)
+        bottom_offset_cells = int(meta.get("bottom_offset_cells", 0) or 0)
+        top_offset_m = top_offset_cells * settings.cell_length_m
+        bottom_offset_m = bottom_offset_cells * settings.cell_length_m
         row_width_m = settings.cell_width_m * deep_lane_width
         row_order_value = meta.get("row_order") or len(rows) + 1
         row_x_min = x_cursor
@@ -337,7 +345,7 @@ def build_geometry_model(
         row_count = len(row_df)
         for idx, (_, cell_row) in enumerate(row_df.iterrows()):
             position_from_bottom = row_count - 1 - idx if cell_direction == "top_to_bottom" else idx
-            y_min = position_from_bottom * settings.cell_length_m
+            y_min = top_offset_m + position_from_bottom * settings.cell_length_m
             y_max = y_min + settings.cell_length_m
             capacity_pallets = deep_lane_width if storage_type == "deep_lane" else 1
             volume_m3 = settings.cell_length_m * settings.cell_width_m * settings.pallet_height_m * capacity_pallets
@@ -385,7 +393,7 @@ def build_geometry_model(
             missing = sorted(set(range(min(numeric_cells), max(numeric_cells) + 1)) - set(numeric_cells))
             if missing:
                 diagnostics.append({"level": "warning", "message": f"В ряду {row_number} есть пропуск номеров: {', '.join(map(str, missing))}."})
-        row_y_max = len(row_cells) * settings.cell_length_m
+        row_y_max = top_offset_m + len(row_cells) * settings.cell_length_m + bottom_offset_m
         max_row_y = max(max_row_y, row_y_max)
         rows.append({
             "row_number": row_number,
@@ -398,6 +406,10 @@ def build_geometry_model(
             "comment": meta.get("comment", ""),
             "weight_zone": weight_zone,
             "initial_weight_zone": initial_weight_zone,
+            "top_offset_cells": top_offset_cells,
+            "bottom_offset_cells": bottom_offset_cells,
+            "top_offset_m": top_offset_m,
+            "bottom_offset_m": bottom_offset_m,
             "x_min": row_x_min,
             "x_max": row_x_max,
             "y_min": 0.0,
@@ -415,6 +427,8 @@ def build_geometry_model(
         previous_row = row_number
 
     total_width = x_cursor if rows else 0.0
+    for aisle in aisles:
+        aisle["y_max"] = max_row_y
     roads = [
         {"road_type": "bottom", "x_min": 0.0, "x_max": total_width, "y_min": -settings.bottom_road_width_m, "y_max": 0.0, "width_m": settings.bottom_road_width_m},
         {"road_type": "top", "x_min": 0.0, "x_max": total_width, "y_min": max_row_y, "y_max": max_row_y + settings.top_road_width_m, "width_m": settings.top_road_width_m},
@@ -468,6 +482,10 @@ def build_geometry_model(
                 "cell_direction": row.get("cell_direction", "bottom_to_top"),
                 "weight_zone": row.get("weight_zone", "unassigned"),
                 "initial_weight_zone": row.get("initial_weight_zone", row.get("weight_zone", "unassigned")),
+                "top_offset_cells": row.get("top_offset_cells", 0),
+                "bottom_offset_cells": row.get("bottom_offset_cells", 0),
+                "top_offset_m": row.get("top_offset_m", 0.0),
+                "bottom_offset_m": row.get("bottom_offset_m", 0.0),
                 "updated_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
                 "comment": row.get("comment", ""),
             }
@@ -606,6 +624,8 @@ def _row_config_from_model(model: dict[str, Any]) -> pd.DataFrame:
             "side": row.get("side", ""),
             "comment": row.get("comment", ""),
             "weight_zone": row.get("weight_zone", "unassigned"),
+            "top_offset_cells": row.get("top_offset_cells", 0),
+            "bottom_offset_cells": row.get("bottom_offset_cells", 0),
         }
         for row in model.get("rows", [])
     ])
@@ -894,6 +914,13 @@ def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bo
         y_max = max_y - model["settings"].get("top_road_width_m", 3.4)
         aisle_label = "проезд" if settings.get("show_aisle_labels", True) else ""
         rect(aisle["x_min"], 0, aisle["x_max"], y_max, colors["aisle_color"], "1px solid #D5DAE2", aisle_label, f"{aisle['row_from']} → {aisle['row_to']}: {aisle['aisle_width_m']} м", short_label="↕")
+    def row_title(row: dict[str, Any]) -> str:
+        return (
+            f"Ряд {row.get('row_number', '')}\n"
+            f"Отступ сверху: {row.get('top_offset_cells', 0)} яч. / {float(row.get('top_offset_m', 0) or 0):g} м\n"
+            f"Отступ снизу: {row.get('bottom_offset_cells', 0)} яч. / {float(row.get('bottom_offset_m', 0) or 0):g} м"
+        )
+
     if detailed:
         for cell in cells:
             source_label = {"excel": "Excel", "manual_add": "добавлена вручную", "manual_update": "изменена вручную"}.get(str(cell.get("source", "excel")), str(cell.get("source", "excel")))
@@ -938,7 +965,7 @@ def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bo
             row_label = f"ряд {row['row_number']} ({row['cells_count']})" if settings.get("show_row_labels", True) else ""
             row_color = colors["selected_cell_color"] if str(row.get("row_number", "")) == selected_row_number else colors["cell_color"]
             row_attrs = f" data-edit-select='row' data-row-number='{html.escape(str(row.get('row_number', '')), quote=True)}'" if edit_mode else ""
-            rect(row["x_min"], row["y_min"], row["x_max"], row["y_max"], row_color, "1px solid #AAB4C3", row_label, short_label=str(row.get("row_number", "")), vertical=True, extra_attrs=row_attrs)
+            rect(row["x_min"], row["y_min"], row["x_max"], row["y_max"], row_color, "1px solid #AAB4C3", row_label, row_title(row), short_label=str(row.get("row_number", "")), vertical=True, extra_attrs=row_attrs)
     if settings.get("show_row_labels", True):
         row_position = str(settings.get("row_label_position", "авто"))
         for idx, row in enumerate(rows):
@@ -966,7 +993,7 @@ def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bo
                     y_max = float(row["y_max"]) - badge_margin_y
                     y_min = max(float(row["y_min"]), y_max - badge_height)
                 if y_max > y_min:
-                    rect(x_min, y_min, x_max, y_max, label_color, label_border, row_label, f"Ряд {row_label}", short_label=row_label, force_label=True, vertical=True, extra_attrs=row_attrs)
+                    rect(x_min, y_min, x_max, y_max, label_color, label_border, row_label, row_title(row), short_label=row_label, force_label=True, vertical=True, extra_attrs=row_attrs)
     parts.append("</div>")
     script = f"""
 <script>

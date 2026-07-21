@@ -1615,6 +1615,8 @@ def render_geometry_constructor_tab(saved_model: dict | None, *, show_active_mod
             "deep_lane_width": st.column_config.NumberColumn("Набивных паллетомест", min_value=1, max_value=7, step=1),
             "cell_direction": st.column_config.SelectboxColumn("Направление ячеек", options=["Снизу вверх", "Сверху вниз"]),
             "weight_zone": st.column_config.SelectboxColumn("Весовая зона", options=["Тяжёлое", "Среднее", "Лёгкое", "Хрупкое", "Не назначено"]),
+            "top_offset_cells": st.column_config.NumberColumn("Отступ сверху, ячеек", min_value=0, step=1),
+            "bottom_offset_cells": st.column_config.NumberColumn("Отступ снизу, ячеек", min_value=0, step=1),
             "row_group": "Группа рядов",
             "side": "Сторона/зона",
             "comment": "Комментарий",
@@ -1715,6 +1717,10 @@ RUSSIAN_COLUMN_LABELS = {
     "y_max": "Y до",
     "x_center": "X центр",
     "y_center": "Y центр",
+    "top_offset_cells": "Отступ сверху, ячеек",
+    "bottom_offset_cells": "Отступ снизу, ячеек",
+    "top_offset_m": "Отступ сверху, м",
+    "bottom_offset_m": "Отступ снизу, м",
 }
 
 
@@ -1849,6 +1855,8 @@ ROW_SETTINGS_COLUMNS = {
     "cell_capacity_pallets": "Вместимость одной логической ячейки",
     "cells_count": "Количество логических ячеек",
     "row_capacity_pallets": "Общая вместимость ряда",
+    "top_offset_cells": "Отступ сверху, ячеек",
+    "bottom_offset_cells": "Отступ снизу, ячеек",
     "row_group": "Группа ряда",
     "side": "Сторона / зона",
     "comment": "Комментарий",
@@ -1876,7 +1884,7 @@ def _row_settings_from_display(display_df: pd.DataFrame) -> pd.DataFrame:
     df["cell_direction"] = df["cell_direction"].map(DIRECTION_LABEL_TO_VALUE).fillna(df["cell_direction"])
     df["weight_zone"] = df["weight_zone"].map(WEIGHT_ZONE_LABEL_TO_VALUE).fillna(df["weight_zone"])
     df["row_storage_type"] = df["row_storage_type"].map({label: value for value, label in ROW_STORAGE_TYPE_LABELS.items()}).fillna(df["row_storage_type"])
-    for column in ["row_order", "cell_capacity_pallets", "cells_count", "row_capacity_pallets"]:
+    for column in ["row_order", "cell_capacity_pallets", "cells_count", "row_capacity_pallets", "top_offset_cells", "bottom_offset_cells"]:
         if column in df.columns:
             df[column] = pd.to_numeric(df[column], errors="coerce").fillna(0)
     return df
@@ -1885,7 +1893,7 @@ def _row_settings_from_display(display_df: pd.DataFrame) -> pd.DataFrame:
 def _merge_row_settings_edits(draft: pd.DataFrame, edited_display: pd.DataFrame) -> pd.DataFrame:
     edited = _row_settings_from_display(edited_display)
     result = draft.copy()
-    editable = ["row_order", "cell_direction", "weight_zone", "row_storage_type", "cell_capacity_pallets", "row_group", "side", "comment"]
+    editable = ["row_order", "cell_direction", "weight_zone", "row_storage_type", "cell_capacity_pallets", "top_offset_cells", "bottom_offset_cells", "row_group", "side", "comment"]
     for _, row in edited.iterrows():
         mask = result["row_number"].astype(str) == str(row.get("row_number"))
         for column in editable:
@@ -1938,6 +1946,8 @@ def render_unified_row_settings_editor(model: dict) -> dict:
                 "Вместимость одной логической ячейки": st.column_config.NumberColumn("Вместимость одной логической ячейки", min_value=1, step=1),
                 "Количество логических ячеек": st.column_config.NumberColumn("Количество логических ячеек", disabled=True),
                 "Общая вместимость ряда": st.column_config.NumberColumn("Общая вместимость ряда", disabled=True),
+                "Отступ сверху, ячеек": st.column_config.NumberColumn("Отступ сверху, ячеек", min_value=0, step=1),
+                "Отступ снизу, ячеек": st.column_config.NumberColumn("Отступ снизу, ячеек", min_value=0, step=1),
             },
         )
         st.markdown("**Массовая настройка выбранных рядов**")
@@ -1951,6 +1961,13 @@ def render_unified_row_settings_editor(model: dict) -> dict:
         b5, b6 = st.columns(2)
         bulk_group = b5.text_input("Группа ряда", value="", key="row_settings_bulk_group")
         bulk_comment = b6.text_input("Комментарий", value="", key="row_settings_bulk_comment")
+        o1, o2 = st.columns(2)
+        with o1:
+            apply_top_offset = st.checkbox("Изменить отступ сверху", value=False, key="row_settings_bulk_apply_top_offset")
+            bulk_top_offset = st.number_input("Отступ сверху", min_value=0, value=0, step=1, disabled=not apply_top_offset, key="row_settings_bulk_top_offset")
+        with o2:
+            apply_bottom_offset = st.checkbox("Изменить отступ снизу", value=False, key="row_settings_bulk_apply_bottom_offset")
+            bulk_bottom_offset = st.number_input("Отступ снизу", min_value=0, value=0, step=1, disabled=not apply_bottom_offset, key="row_settings_bulk_bottom_offset")
         bulk_submit = st.form_submit_button("Записать массовые значения в таблицу")
         reset_submit = st.form_submit_button("Отменить несохранённые изменения")
         apply_submit = st.form_submit_button("Применить изменения рядов", type="primary")
@@ -1971,6 +1988,10 @@ def render_unified_row_settings_editor(model: dict) -> dict:
             updated_draft.loc[mask, "row_group"] = bulk_group
         if bulk_comment:
             updated_draft.loc[mask, "comment"] = bulk_comment
+        if apply_top_offset:
+            updated_draft.loc[mask, "top_offset_cells"] = int(bulk_top_offset)
+        if apply_bottom_offset:
+            updated_draft.loc[mask, "bottom_offset_cells"] = int(bulk_bottom_offset)
         updated_draft["row_capacity_pallets"] = updated_draft["cells_count"].astype(float) * updated_draft["cell_capacity_pallets"].astype(float)
         st.session_state[draft_key] = updated_draft.copy(deep=True)
         st.info("Массовые значения записаны только в черновик таблицы. Модель склада ещё не изменена.")

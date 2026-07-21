@@ -2,12 +2,14 @@ import copy
 import json
 
 import pytest
+import pandas as pd
 
 from warehouse_row_settings import (
     apply_row_settings_transaction,
     build_row_settings_draft,
     sync_row_settings_to_model,
 )
+from warehouse_geometry_model import GeometrySettings, build_geometry_html, build_geometry_model
 
 
 def _cell(row, number, *, direction="bottom_to_top", capacity=1, storage="normal", x_min=0.0, x_max=0.8):
@@ -252,3 +254,154 @@ def test_cell_direction_recalculates_vertical_coordinates_for_target_rows():
     centers_157 = _row_cell_centers(bottom, 157)
     assert centers_157["1"] < centers_157["3"]
     assert next(row for row in bottom["rows"] if row["row_number"] == "155")["cell_direction"] == "top_to_bottom"
+
+
+def test_old_model_defaults_vertical_offsets_to_zero():
+    model = _model()
+    draft = build_row_settings_draft(model)
+    updated = sync_row_settings_to_model(model)
+
+    assert set(draft["top_offset_cells"]) == {0}
+    assert set(draft["bottom_offset_cells"]) == {0}
+    assert all(row["top_offset_m"] == 0 for row in updated["rows"])
+    assert all(row["bottom_offset_m"] == 0 for row in updated["rows"])
+
+
+def test_top_offset_shifts_cells_and_bottom_offset_extends_row_only():
+    model = _model()
+    original_numbers = [cell["cell_number"] for cell in model["cells"] if cell["row_number"] == "152"]
+    original_capacity = sum(cell["capacity_pallets"] for cell in model["cells"] if cell["row_number"] == "152")
+    model["placements"] = [{"cell_key": "152|1|1", "row_number": "152", "cell_number": "1", "tier": "1", "qty_pallets": 1}]
+    edited = _edited(model)
+    row = next(item for item in edited if item["row_number"] == "152")
+    row["top_offset_cells"] = 2
+    row["bottom_offset_cells"] = 3
+
+    updated, messages = apply_row_settings_transaction(model, edited)
+    cells = [cell for cell in updated["cells"] if cell["row_number"] == "152"]
+    base_cells = [cell for cell in updated["base_cells"] if cell["row_number"] == "152"]
+    updated_row = next(item for item in updated["rows"] if item["row_number"] == "152")
+
+    assert not any(message.startswith("Ошибка:") for message in messages)
+    assert min(cell["y_min"] for cell in cells) == 2
+    assert min(cell["y_min"] for cell in base_cells) == 2
+    assert updated_row["y_max"] == 8
+    assert (updated_row["top_offset_m"], updated_row["bottom_offset_m"]) == (2, 3)
+    assert [cell["cell_number"] for cell in cells] == original_numbers
+    assert len(cells) == len(original_numbers)
+    assert sum(cell["capacity_pallets"] for cell in cells) == original_capacity
+    assert updated["placements"] == model["placements"]
+
+
+@pytest.mark.parametrize("direction", ["bottom_to_top", "top_to_bottom"])
+def test_offsets_have_same_physical_bounds_for_both_directions(direction):
+    model = _model()
+    edited = _edited(model)
+    row = next(item for item in edited if item["row_number"] == "152")
+    row.update({"cell_direction": direction, "top_offset_cells": 2, "bottom_offset_cells": 1})
+
+    updated, _ = apply_row_settings_transaction(model, edited)
+    cells = [cell for cell in updated["cells"] if cell["row_number"] == "152"]
+    updated_row = next(item for item in updated["rows"] if item["row_number"] == "152")
+
+    assert sorted(cell["y_min"] for cell in cells) == [2, 3, 4]
+    assert updated_row["y_min"] == 0
+    assert updated_row["y_max"] == 6
+
+
+def test_different_rows_keep_individual_offsets_and_bulk_style_edit_changes_selected_only():
+    model = _model()
+    edited = _edited(model)
+    for row in edited:
+        if row["row_number"] == "152":
+            row["top_offset_cells"] = 1
+            row["bottom_offset_cells"] = 2
+
+    updated, _ = apply_row_settings_transaction(model, edited)
+    rows = {row["row_number"]: row for row in updated["rows"]}
+
+    assert (rows["152"]["top_offset_cells"], rows["152"]["bottom_offset_cells"]) == (1, 2)
+    assert (rows["153"]["top_offset_cells"], rows["153"]["bottom_offset_cells"]) == (0, 0)
+
+
+def test_invalid_offset_rolls_back_entire_transaction():
+    model = _model()
+    original = copy.deepcopy(model)
+    edited = _edited(model)
+    edited[0]["top_offset_cells"] = -1
+    edited[1]["bottom_offset_cells"] = 2
+
+    updated, messages = apply_row_settings_transaction(model, edited)
+
+    assert updated == original
+    assert any(message.startswith("Ошибка:") for message in messages)
+
+
+def test_offsets_survive_json_serialization():
+    model = _model()
+    edited = _edited(model)
+    edited[0]["top_offset_cells"] = 4
+    edited[0]["bottom_offset_cells"] = 2
+    updated, _ = apply_row_settings_transaction(model, edited)
+
+    loaded = json.loads(json.dumps(updated, ensure_ascii=False))
+    row = next(item for item in loaded["rows"] if item["row_number"] == "152")
+    setting = next(item for item in loaded["row_settings"] if item["row_number"] == "152")
+
+    assert (row["top_offset_cells"], row["bottom_offset_cells"]) == (4, 2)
+    assert (setting["top_offset_m"], setting["bottom_offset_m"]) == (4, 2)
+
+
+def test_offsets_use_row_cell_length_and_refresh_navigation_endpoints():
+    model = _direction_model()
+    model["navigation_nodes"] = [
+        {"node_id": "row:152:bottom", "node_type": "row_bottom_entry", "row_number": "152", "x": 0, "y": 0},
+        {"node_id": "row:152:top", "node_type": "row_top_entry", "row_number": "152", "x": 0, "y": 3.6},
+    ]
+    model["navigation_edges"] = [{"from_node": "row:152:bottom", "to_node": "row:152:top", "edge_type": "row_walk", "distance_m": 3.6}]
+    edited = _edited(model)
+    row = next(item for item in edited if item["row_number"] == "152")
+    row.update({"top_offset_cells": 2, "bottom_offset_cells": 1})
+
+    updated, _ = apply_row_settings_transaction(model, edited)
+    cells = [cell for cell in updated["cells"] if cell["row_number"] == "152"]
+    nodes = {node["node_id"]: node for node in updated["navigation_nodes"]}
+
+    assert sorted(round(cell["y_min"], 2) for cell in cells) == [2.4, 3.6, 4.8]
+    assert nodes["row:152:bottom"]["y"] == 0
+    assert nodes["row:152:top"]["y"] == pytest.approx(7.2)
+    assert updated["navigation_edges"][0]["distance_m"] == pytest.approx(7.2)
+
+
+def test_row_tooltip_contains_offset_cells_and_meters():
+    model = _model()
+    edited = _edited(model)
+    edited[0].update({"top_offset_cells": 2, "bottom_offset_cells": 1})
+    updated, _ = apply_row_settings_transaction(model, edited)
+    updated["roads"] = []
+
+    rendered = build_geometry_html(updated, detailed=False)
+
+    assert "Отступ сверху: 2 яч. / 2 м" in rendered
+    assert "Отступ снизу: 1 яч. / 1 м" in rendered
+
+
+def test_new_geometry_build_applies_individual_offsets_without_fake_cells():
+    source = pd.DataFrame([
+        {"code": "A", "row_number": "1", "cell_number": "1", "tier": "1", "source_line": 2},
+        {"code": "B", "row_number": "1", "cell_number": "2", "tier": "1", "source_line": 3},
+        {"code": "C", "row_number": "2", "cell_number": "1", "tier": "1", "source_line": 4},
+    ])
+    config = pd.DataFrame([
+        {"row_number": "1", "row_order": 1, "row_storage_type": "normal", "deep_lane_width": 1, "cell_direction": "bottom_to_top", "weight_zone": "light", "top_offset_cells": 2, "bottom_offset_cells": 1},
+        {"row_number": "2", "row_order": 2, "row_storage_type": "normal", "deep_lane_width": 1, "cell_direction": "bottom_to_top", "weight_zone": "medium", "top_offset_cells": 0, "bottom_offset_cells": 3},
+    ])
+
+    model, _ = build_geometry_model(source, GeometrySettings(cell_length_m=1.2), config)
+    rows = {row["row_number"]: row for row in model["rows"]}
+    row_one_cells = [cell for cell in model["cells"] if cell["row_number"] == "1"]
+
+    assert len(model["cells"]) == 3
+    assert min(cell["y_min"] for cell in row_one_cells) == pytest.approx(2.4)
+    assert rows["1"]["y_max"] == pytest.approx(6.0)
+    assert rows["2"]["bottom_offset_m"] == pytest.approx(3.6)
