@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import re
 import uuid
@@ -9,6 +10,8 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+
+from warehouse_placement_diagnostics import placement_reason_text
 
 PLACEMENTS_PATH = Path("data/last_import/placements.json")
 
@@ -20,12 +23,18 @@ ADDRESS_ALIASES = ["адрес", "ячейка", "адрес ячейки", "cel
 ROW_ALIASES = ["ряд", "row", "row_number"]
 CELL_ALIASES = ["ячейка", "cell_number", "номер ячейки"]
 TIER_ALIASES = ["ярус", "tier"]
+WEIGHT_CLASS_ALIASES = ["weight_class", "weight_zone", "зона", "весоваякатегория", "весовая категория", "категориявеса", "зонаразмещения", "зона размещения"]
+WEIGHT_CLASS_LABELS = {"heavy": "Тяжёлое", "medium": "Среднее", "light": "Лёгкое", "fragile": "Хрупкое", "unclassified": "Не классифицировано"}
+WEIGHT_ZONE_LABELS = {"heavy": "Тяжёлое", "medium": "Среднее", "light": "Лёгкое", "fragile": "Хрупкое", "unassigned": "Не назначено"}
 OPTIONAL_ALIASES = {
     "expiry_date": ["дата срока годности", "срок годности", "expiry", "expiry_date"],
     "batch": ["партия", "batch"],
     "characteristic": ["характеристика", "characteristic"],
+    "characteristic_code": ["характеристика.код", "код характеристики", "characteristic_code"],
+    "characteristic_name": ["характеристика.наименование", "характеристика", "characteristic_name"],
     "weight": ["вес", "weight"],
     "volume": ["объём", "объем", "volume"],
+    "weight_class": WEIGHT_CLASS_ALIASES,
 }
 
 
@@ -48,6 +57,38 @@ def _display_value(value: Any) -> str:
     if isinstance(value, float) and value.is_integer():
         return str(int(value))
     return str(value).strip()
+
+
+def normalize_weight_class(value: Any) -> str:
+    text = _clean_label(value).replace("ё", "е")
+    text = text.replace(" ", "")
+    if text in {"heavy", "тяжелое", "тяжелый"}:
+        return "heavy"
+    if text in {"medium", "среднее", "средний"}:
+        return "medium"
+    if text in {"light", "легкое", "легкий"}:
+        return "light"
+    if text in {"fragile", "хрупкое", "хрупкий"}:
+        return "fragile"
+    return "unclassified"
+
+
+def make_sku_key(item: dict[str, Any]) -> str:
+    sku_code = _display_value(item.get("sku_code"))
+    sku_name = _display_value(item.get("sku_name") or item.get("item_name"))
+    characteristic_code = _display_value(item.get("characteristic_code"))
+    characteristic_name = _display_value(item.get("characteristic_name") or item.get("characteristic"))
+    if sku_code and characteristic_code:
+        return f"code:{sku_code}|char_code:{characteristic_code}"
+    if sku_code and characteristic_name:
+        return f"code:{sku_code}|char_name:{characteristic_name}"
+    if sku_name and characteristic_name:
+        return f"name:{sku_name}|char_name:{characteristic_name}"
+    if sku_name:
+        return f"name:{sku_name}"
+    if sku_code:
+        return f"code:{sku_code}"
+    return ""
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -77,6 +118,20 @@ def _find_column(columns: list[str], aliases: list[str]) -> str | None:
         if any(alias in norm for alias in alias_set):
             return original
     return None
+
+
+def get_row_direction(model: dict[str, Any], row_number: Any) -> str:
+    row_text = _display_value(row_number)
+    for row in model.get("rows", []):
+        if _display_value(row.get("row_number")) == row_text and row.get("cell_direction"):
+            return _display_value(row.get("cell_direction"))
+    for row_setting in model.get("row_settings", []):
+        if _display_value(row_setting.get("row_number")) == row_text and row_setting.get("cell_direction"):
+            return _display_value(row_setting.get("cell_direction"))
+    for cell in model.get("cells", []):
+        if _display_value(cell.get("row_number")) == row_text and cell.get("cell_direction"):
+            return _display_value(cell.get("cell_direction"))
+    return "bottom_to_top"
 
 
 def cell_key(row_number: Any, cell_number: Any, tier: Any) -> str:
@@ -162,6 +217,11 @@ def normalize_inventory_table(df: pd.DataFrame, mapping: dict[str, str | None]) 
             result.at[idx, "tier"] = "1"
     for key in OPTIONAL_ALIASES:
         result[key] = df[mapping[key]].map(_display_value) if mapping.get(key) else ""
+    result["weight_class"] = result["weight_class"].map(normalize_weight_class) if "weight_class" in result else "unclassified"
+    if "characteristic_code" not in result:
+        result["characteristic_code"] = ""
+    if "characteristic_name" not in result:
+        result["characteristic_name"] = result.get("characteristic", "")
     result = result[(result["sku_code"] != "") & (result["qty_pallets"] > 0)].copy()
     diagnostics.append({"level": "info", "message": f"Строк инвента после нормализации: {len(result)}."})
     return result, diagnostics
@@ -226,6 +286,7 @@ def _cell_map(model: dict[str, Any]) -> dict[str, dict[str, Any]]:
 def _placement_record(row: dict[str, Any], cell: dict[str, Any], qty_pallets: float, source: str, confidence: str, placement_mode: str, comment: str = "") -> dict[str, Any]:
     return {
         "placement_id": str(uuid.uuid4()),
+        "sku_key": _display_value(row.get("sku_key")) or make_sku_key(row),
         "sku_code": _display_value(row.get("sku_code")),
         "sku_name": _display_value(row.get("sku_name")),
         "item_name": _display_value(row.get("item_name")) or _display_value(row.get("sku_name")),
@@ -235,10 +296,16 @@ def _placement_record(row: dict[str, Any], cell: dict[str, Any], qty_pallets: fl
         "cell_key": cell_key(cell.get("row_number"), cell.get("cell_number"), cell.get("tier")),
         "qty_pallets": qty_pallets,
         "qty_boxes": _safe_float(row.get("qty_boxes")),
+        "characteristic_code": _display_value(row.get("characteristic_code")),
+        "characteristic_name": _display_value(row.get("characteristic_name")) or _display_value(row.get("characteristic")),
+        "weight_class": _display_value(row.get("weight_class")) or "unclassified",
+        "weight_zone": _display_value(cell.get("weight_zone")) or "unassigned",
         "occupied_capacity_pallets": qty_pallets,
         "source": source,
         "confidence": confidence,
         "placement_mode": placement_mode,
+        "placement_status": "placed",
+        "unplaced_reason": "",
         "comment": comment,
     }
 
@@ -254,25 +321,30 @@ def import_inventory(model: dict[str, Any], normalized_df: pd.DataFrame, allow_r
             state["placements"].append(placement)
         else:
             state["unplaced_inventory"].append({
+                "sku_key": _display_value(row.get("sku_key")) or make_sku_key(row),
                 "sku_code": _display_value(row.get("sku_code")),
                 "sku_name": _display_value(row.get("sku_name")),
                 "item_name": _display_value(row.get("item_name")) or _display_value(row.get("sku_name")),
                 "qty_pallets": _safe_float(row.get("qty_pallets")),
                 "qty_boxes": _safe_float(row.get("qty_boxes")),
+                "characteristic_code": _display_value(row.get("characteristic_code")),
+                "characteristic_name": _display_value(row.get("characteristic_name")) or _display_value(row.get("characteristic")),
+                "weight_class": _display_value(row.get("weight_class")) or "unclassified",
                 "reason": "В исходных данных нет адреса ячейки" if not row.get("row_number") or not row.get("cell_number") else "Ячейка не найдена в модели склада",
             })
+    state["source_unplaced_inventory"] = [dict(item) for item in state.get("unplaced_inventory", [])]
     _append_journal(state, "импорт инвента", qty_pallets=sum(item.get("qty_pallets", 0) for item in state["unplaced_inventory"]), source="inventory")
     diagnostics.append({"level": "info", "message": f"Размещено по адресам: {len(state['placements'])}; без ячейки: {len(state['unplaced_inventory'])}."})
     save_placement_state(state)
     return state, diagnostics
 
 
-def _cell_sort_key(cell: dict[str, Any]) -> tuple[Any, Any]:
+def _cell_sort_key(cell: dict[str, Any], model: dict[str, Any] | None = None) -> tuple[Any, Any]:
     row_order = cell.get("row_order", 10**9)
     cell_num = _number_key(cell.get("cell_number"))
-    if cell.get("cell_direction") == "top_to_bottom":
-        return (row_order, (0, -cell_num[1]) if cell_num[0] == 0 else cell_num)
-    return (row_order, cell_num)
+    if cell_num[0] == 0:
+        return (row_order, cell_num[1], 0)
+    return (row_order, _safe_float(cell.get("y_center")), 1)
 
 
 def _occupied_by_cell(state: dict[str, Any]) -> dict[str, float]:
@@ -289,7 +361,7 @@ def auto_place_unplaced(model: dict[str, Any], state: dict[str, Any], allow_mixe
     sku_by_cell: dict[str, set[str]] = {}
     for placement in state.get("placements", []):
         sku_by_cell.setdefault(placement.get("cell_key", ""), set()).add(placement.get("sku_code", ""))
-    cells = sorted(model.get("cells", []), key=_cell_sort_key)
+    cells = sorted(model.get("cells", []), key=lambda cell: _cell_sort_key(cell, model))
     remaining_unplaced = []
     for item in sorted(state.get("unplaced_inventory", []), key=lambda x: _safe_float(x.get("qty_pallets")), reverse=True):
         remaining = _safe_float(item.get("qty_pallets"))
@@ -543,3 +615,648 @@ def export_placements_excel_bytes(model: dict[str, Any], state: dict[str, Any]) 
         pd.DataFrame(state.get("unplaced_inventory", [])).to_excel(writer, sheet_name="Не размещено", index=False)
         pd.DataFrame(state.get("journal", [])).to_excel(writer, sheet_name="Журнал", index=False)
     return buffer.getvalue()
+
+
+def _placement_qty(placement: dict[str, Any]) -> float:
+    qty = _safe_float(placement.get("occupied_capacity_pallets"))
+    return qty if qty > 0 else _safe_float(placement.get("qty_pallets"))
+
+
+def _parse_inventory_qty(row: dict[str, Any]) -> tuple[float | None, str]:
+    raw = row.get("qty_pallets")
+    if raw is None or str(raw).strip() == "":
+        return None, "qty_pallets отсутствует"
+    try:
+        qty = float(str(raw).replace(",", "."))
+    except (TypeError, ValueError):
+        return None, "qty_pallets не удалось преобразовать в число"
+    if qty < 0:
+        return None, "qty_pallets не может быть отрицательным"
+    return qty, ""
+
+
+def _inventory_row_sku_key(row: dict[str, Any]) -> str:
+    return _display_value(row.get("sku_key")) or make_sku_key(row)
+
+
+def _inventory_date(inventory_rows: list[dict[str, Any]], inventory_date: str | None) -> str:
+    if inventory_date:
+        return inventory_date
+    for row in inventory_rows:
+        for field in ("inventory_date", "date", "document_date", "receipt_date"):
+            value = _display_value(row.get(field))
+            if value:
+                return value
+    return _now_iso().split("T", 1)[0]
+
+
+def _inventory_report(
+    *,
+    success: bool,
+    inventory_sku_count: int,
+    sku_before_count: int,
+    sku_after_count: int,
+    quantity_before: float,
+    quantity_inventory: float,
+    quantity_after: float,
+    removed_sku_count: int,
+    reduced_sku_count: int,
+    unchanged_sku_count: int,
+    excess_inventory_sku_count: int,
+    freed_cells: int,
+    occupied_cells_after: int,
+    details: list[dict[str, Any]],
+    errors: list[str] | None = None,
+) -> dict[str, Any]:
+    return {
+        "success": success,
+        "errors": errors or [],
+        "summary": {
+            "SKU в инвенте": inventory_sku_count,
+            "SKU до сверки": sku_before_count,
+            "SKU после сверки": sku_after_count,
+            "Количество до": round(quantity_before, 4),
+            "Количество по инвенту": round(quantity_inventory, 4),
+            "Количество после": round(quantity_after, 4),
+            "Полностью удалено SKU": removed_sku_count,
+            "Уменьшено SKU": reduced_sku_count,
+            "Без изменений SKU": unchanged_sku_count,
+            "Инвент больше размещения": excess_inventory_sku_count,
+            "Освобождено логических ячеек": freed_cells,
+            "Осталось занятых логических ячеек": occupied_cells_after,
+        },
+        "details": details,
+    }
+
+
+def reconcile_placements_with_inventory(
+    model: dict[str, Any],
+    placement_state: dict[str, Any],
+    inventory_rows: list[dict[str, Any]],
+    inventory_date: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Reconcile current placements with an end-of-day inventory snapshot.
+
+    The function is intentionally side-effect free: it returns a new placement
+    state and never writes placements.json, warehouse_model.json or receipts.json.
+    """
+    _ = model
+    original_state = copy.deepcopy(placement_state)
+    working_state = copy.deepcopy(placement_state)
+    inventory_date_value = _inventory_date(inventory_rows, inventory_date)
+    grouped_inventory: dict[str, dict[str, Any]] = {}
+    invalid_details: list[dict[str, Any]] = []
+    errors: list[str] = []
+
+    for idx, row in enumerate(inventory_rows, start=1):
+        row_dict = dict(row)
+        sku_key = _inventory_row_sku_key(row_dict)
+        qty, reason = _parse_inventory_qty(row_dict)
+        if not sku_key:
+            reason = "sku_key не удалось определить"
+        if qty is None or not sku_key:
+            errors.append(f"Строка инвента {idx}: {reason}")
+            invalid_details.append({
+                "sku_key": sku_key or "Нет данных",
+                "Номенклатура": _display_value(row_dict.get("sku_name") or row_dict.get("item_name")) or "Нет данных",
+                "Характеристика": _display_value(row_dict.get("characteristic_name") or row_dict.get("characteristic")) or "Нет данных",
+                "Было размещено": 0.0,
+                "По инвенту": _display_value(row_dict.get("qty_pallets")) or "Нет данных",
+                "Осталось после": 0.0,
+                "Удалено": 0.0,
+                "Освобождено ячеек": 0,
+                "Статус": "invalid_inventory_row",
+                "Причина": reason,
+            })
+            continue
+        entry = grouped_inventory.setdefault(sku_key, {
+            "sku_key": sku_key,
+            "sku_code": _display_value(row_dict.get("sku_code")),
+            "sku_name": _display_value(row_dict.get("sku_name") or row_dict.get("item_name")),
+            "item_name": _display_value(row_dict.get("item_name") or row_dict.get("sku_name")),
+            "characteristic_code": _display_value(row_dict.get("characteristic_code")),
+            "characteristic_name": _display_value(row_dict.get("characteristic_name") or row_dict.get("characteristic")),
+            "qty_pallets": 0.0,
+            "rows": 0,
+        })
+        entry["qty_pallets"] = round(_safe_float(entry.get("qty_pallets")) + qty, 4)
+        entry["rows"] += 1
+        for field in ("sku_code", "sku_name", "item_name", "characteristic_code", "characteristic_name"):
+            if not entry.get(field):
+                entry[field] = _display_value(row_dict.get(field))
+
+    placements_before = list(original_state.get("placements", []))
+    sku_before = {_display_value(p.get("sku_key")) or make_sku_key(p) for p in placements_before}
+    sku_before.discard("")
+    quantity_before = sum(_placement_qty(p) for p in placements_before)
+    quantity_inventory = sum(_safe_float(item.get("qty_pallets")) for item in grouped_inventory.values())
+    occupied_before = {p.get("cell_key", "") for p in placements_before if _placement_qty(p) > 0 and p.get("cell_key")}
+
+    if errors:
+        report = _inventory_report(
+            success=False,
+            inventory_sku_count=len(grouped_inventory),
+            sku_before_count=len(sku_before),
+            sku_after_count=len(sku_before),
+            quantity_before=quantity_before,
+            quantity_inventory=quantity_inventory,
+            quantity_after=quantity_before,
+            removed_sku_count=0,
+            reduced_sku_count=0,
+            unchanged_sku_count=0,
+            excess_inventory_sku_count=0,
+            freed_cells=0,
+            occupied_cells_after=len(occupied_before),
+            details=invalid_details,
+            errors=errors,
+        )
+        return original_state, report
+
+    placements_by_sku: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+    for idx, placement in enumerate(placements_before):
+        sku_key = _display_value(placement.get("sku_key")) or make_sku_key(placement)
+        if not sku_key:
+            continue
+        placements_by_sku.setdefault(sku_key, []).append((idx, placement))
+
+    new_by_index: dict[int, dict[str, Any]] = {}
+    unplaced_inventory: list[dict[str, Any]] = []
+    details: list[dict[str, Any]] = []
+    removed_sku_count = 0
+    reduced_sku_count = 0
+    unchanged_sku_count = 0
+    excess_inventory_sku_count = 0
+
+    for sku_key in sorted(set(placements_by_sku) | set(grouped_inventory)):
+        records = placements_by_sku.get(sku_key, [])
+        inventory_item = grouped_inventory.get(sku_key)
+        current_qty = round(sum(_placement_qty(p) for _, p in records), 4)
+        target_qty = round(_safe_float((inventory_item or {}).get("qty_pallets")), 4)
+        removed_qty = max(current_qty - target_qty, 0.0)
+        freed_for_sku = 0
+        status = "unchanged"
+        new_quantities = [_placement_qty(p) for _, p in records]
+
+        if target_qty <= 0 and current_qty > 0:
+            status = "removed"
+            removed_sku_count += 1
+            freed_for_sku = len({p.get("cell_key", "") for _, p in records if p.get("cell_key")})
+            new_quantities = [0.0 for _ in records]
+        elif current_qty > target_qty:
+            status = "reduced"
+            reduced_sku_count += 1
+            excess = round(current_qty - target_qty, 4)
+            for pos in range(len(new_quantities) - 1, -1, -1):
+                if excess <= 0:
+                    break
+                qty = new_quantities[pos]
+                if excess >= qty:
+                    excess = round(excess - qty, 4)
+                    new_quantities[pos] = 0.0
+                    cell = records[pos][1].get("cell_key", "")
+                    if cell:
+                        freed_for_sku += 1
+                else:
+                    new_quantities[pos] = round(qty - excess, 4)
+                    excess = 0.0
+        elif current_qty < target_qty:
+            status = "inventory_exceeds_placements"
+            excess_inventory_sku_count += 1
+            diff = round(target_qty - current_qty, 4)
+            source = inventory_item or {"sku_key": sku_key}
+            unplaced_inventory.append({
+                "sku_key": sku_key,
+                "sku_code": _display_value(source.get("sku_code")),
+                "sku_name": _display_value(source.get("sku_name") or source.get("item_name")),
+                "item_name": _display_value(source.get("item_name") or source.get("sku_name")),
+                "characteristic_code": _display_value(source.get("characteristic_code")),
+                "characteristic_name": _display_value(source.get("characteristic_name")),
+                "qty_pallets": diff,
+                "source": "inventory_reconciliation",
+                "placement_status": "not_placed",
+                "placement_mode": "not_calculated",
+                "reason": "inventory_quantity_exceeds_placements",
+                "unplaced_reason": "inventory_quantity_exceeds_placements",
+            })
+        else:
+            unchanged_sku_count += 1
+
+        for (idx, placement), new_qty in zip(records, new_quantities):
+            if new_qty <= 0:
+                continue
+            updated = copy.deepcopy(placement)
+            before_qty = _placement_qty(placement)
+            updated["qty_pallets"] = round(new_qty, 4)
+            updated["occupied_capacity_pallets"] = round(new_qty, 4)
+            updated["source"] = "inventory_carryover"
+            updated["placement_mode"] = "factual"
+            updated["placement_status"] = "placed"
+            updated["inventory_reconciled"] = True
+            updated["inventory_date"] = inventory_date_value
+            updated["quantity_before_inventory"] = round(before_qty, 4)
+            updated["quantity_after_inventory"] = round(new_qty, 4)
+            new_by_index[idx] = updated
+
+        name_source = inventory_item or (records[0][1] if records else {"sku_key": sku_key})
+        details.append({
+            "sku_key": sku_key,
+            "Номенклатура": _display_value(name_source.get("sku_name") or name_source.get("item_name")) or "Нет данных",
+            "Характеристика": _display_value(name_source.get("characteristic_name") or name_source.get("characteristic")) or "Нет данных",
+            "Было размещено": round(current_qty, 4),
+            "По инвенту": round(target_qty, 4),
+            "Осталось после": round(min(current_qty, target_qty), 4) if status != "inventory_exceeds_placements" else round(current_qty, 4),
+            "Удалено": round(removed_qty, 4),
+            "Освобождено ячеек": freed_for_sku,
+            "Статус": status,
+        })
+
+    new_placements = [new_by_index[idx] for idx in sorted(new_by_index)]
+    occupied_after = {p.get("cell_key", "") for p in new_placements if _placement_qty(p) > 0 and p.get("cell_key")}
+    quantity_after = sum(_placement_qty(p) for p in new_placements)
+    working_state["placements"] = new_placements
+    working_state["unplaced_inventory"] = unplaced_inventory
+    working_state["source_unplaced_inventory"] = [dict(item) for item in unplaced_inventory]
+    working_state["last_inventory_reconciliation"] = {
+        "inventory_date": inventory_date_value,
+        "reconciled_at": _now_iso(),
+        "inventory_rows": len(inventory_rows),
+        "inventory_sku_count": len(grouped_inventory),
+        "placements_before": len(placements_before),
+        "placements_after": len(new_placements),
+        "quantity_before": round(quantity_before, 4),
+        "quantity_after": round(quantity_after, 4),
+        "removed_sku_count": removed_sku_count,
+        "reduced_sku_count": reduced_sku_count,
+        "excess_inventory_sku_count": excess_inventory_sku_count,
+    }
+    working_state.setdefault("journal", []).append({
+        "created_at": _now_iso(),
+        "action": "сверка размещения с инвентом",
+        "qty_pallets": round(quantity_after, 4),
+        "source": "inventory_reconciliation",
+    })
+
+    report = _inventory_report(
+        success=True,
+        inventory_sku_count=len(grouped_inventory),
+        sku_before_count=len(sku_before),
+        sku_after_count=len({_display_value(p.get("sku_key")) or make_sku_key(p) for p in new_placements if (_display_value(p.get("sku_key")) or make_sku_key(p))}),
+        quantity_before=quantity_before,
+        quantity_inventory=quantity_inventory,
+        quantity_after=quantity_after,
+        removed_sku_count=removed_sku_count,
+        reduced_sku_count=reduced_sku_count,
+        unchanged_sku_count=unchanged_sku_count,
+        excess_inventory_sku_count=excess_inventory_sku_count,
+        freed_cells=len(occupied_before - occupied_after),
+        occupied_cells_after=len(occupied_after),
+        details=details,
+    )
+    return working_state, report
+
+
+def _sku_weight_classes(items: list[dict[str, Any]]) -> tuple[dict[str, str], dict[str, list[str]]]:
+    values: dict[str, set[str]] = {}
+    for item in items:
+        sku_key = _display_value(item.get("sku_key")) or make_sku_key(item)
+        if not sku_key:
+            continue
+        weight_class_source = item.get("calculated_zone") if "calculated_zone" in item else item.get("weight_class")
+        weight_class = normalize_weight_class(weight_class_source)
+        if weight_class != "unclassified":
+            values.setdefault(sku_key, set()).add(weight_class)
+    classes: dict[str, str] = {}
+    conflicts: dict[str, list[str]] = {}
+    for sku, sku_values in values.items():
+        if len(sku_values) > 1:
+            conflicts[sku] = sorted(sku_values)
+            classes[sku] = "unclassified"
+        elif sku_values:
+            classes[sku] = next(iter(sku_values))
+    for item in items:
+        sku = _display_value(item.get("sku_key")) or make_sku_key(item)
+        if sku and sku not in classes:
+            classes[sku] = "unclassified"
+    return classes, conflicts
+
+
+def _row_zones(model: dict[str, Any]) -> dict[str, str]:
+    zones = {}
+    for row in model.get("rows", []):
+        zone = _display_value(row.get("weight_zone"))
+        zones[_display_value(row.get("row_number"))] = zone if zone in {"heavy", "medium", "light", "fragile"} else "unassigned"
+    return zones
+
+
+def _zone_capacity(model: dict[str, Any], occupied: dict[str, float]) -> dict[str, float]:
+    free = {"heavy": 0.0, "medium": 0.0, "light": 0.0, "fragile": 0.0, "unassigned": 0.0}
+    for cell in model.get("cells", []):
+        zone = _display_value(cell.get("weight_zone")) or "unassigned"
+        if zone not in free:
+            zone = "unassigned"
+        key = cell_key(cell.get("row_number"), cell.get("cell_number"), cell.get("tier"))
+        free[zone] += max(_safe_float(cell.get("capacity_pallets"), 1.0) - occupied.get(key, 0.0), 0.0)
+    return {key: round(value, 4) for key, value in free.items()}
+
+
+def _unplaced_record(item: dict[str, Any], qty: float, reason: str, source: str, weight_class: str, weight_zone: str = "") -> dict[str, Any]:
+    return {
+        "sku_key": _display_value(item.get("sku_key")) or make_sku_key(item),
+        "sku_code": _display_value(item.get("sku_code")),
+        "sku_name": _display_value(item.get("sku_name")),
+        "characteristic_code": _display_value(item.get("characteristic_code")),
+        "characteristic_name": _display_value(item.get("characteristic_name")) or _display_value(item.get("characteristic")),
+        "weight_class": weight_class,
+        "source_zone": _display_value(item.get("source_zone")),
+        "calculated_zone": _display_value(item.get("calculated_zone")) or weight_class,
+        "zone_calculation_reason": _display_value(item.get("zone_calculation_reason")),
+        "source_weight": _display_value(item.get("source_weight")),
+        "fragile_flag": bool(item.get("fragile_flag")),
+        "zone_calculation_status": _display_value(item.get("zone_calculation_status")),
+        "receipt_line_ids": [_display_value(item.get("receipt_line_id"))] if item.get("receipt_line_id") else [],
+        "receipt_numbers": [_display_value(item.get("receipt_number"))] if item.get("receipt_number") else [],
+        "cell_key": "",
+        "row_number": "",
+        "cell_number": "",
+        "weight_zone": weight_zone,
+        "qty_pallets": round(qty, 4),
+        "source": source,
+        "placement_status": "not_placed",
+        "placement_mode": "not_calculated",
+        "unplaced_reason": reason,
+        "reason": reason,
+    }
+
+
+def _basic_placement_record(item: dict[str, Any], cell: dict[str, Any], qty: float, source: str, mode: str, weight_class: str, reason: str = "", reason_code: str = "fallback", quantity_before: float = 0.0) -> dict[str, Any]:
+    placement = _placement_record({**item, "weight_class": weight_class}, cell, qty, source, "estimated" if mode != "factual" else "exact", mode, "Базовое механическое размещение")
+    placement.update({
+        "sku_key": _display_value(item.get("sku_key")) or make_sku_key(item),
+        "weight_class": weight_class,
+        "source_zone": _display_value(item.get("source_zone")),
+        "calculated_zone": _display_value(item.get("calculated_zone")) or weight_class,
+        "zone_calculation_reason": _display_value(item.get("zone_calculation_reason")),
+        "source_weight": _display_value(item.get("source_weight")),
+        "fragile_flag": bool(item.get("fragile_flag")),
+        "zone_calculation_status": _display_value(item.get("zone_calculation_status")),
+        "receipt_line_ids": [_display_value(item.get("receipt_line_id"))] if item.get("receipt_line_id") else [],
+        "receipt_numbers": [_display_value(item.get("receipt_number"))] if item.get("receipt_number") else [],
+        "weight_zone": _display_value(cell.get("weight_zone")) or "unassigned",
+        "zone_overflow": (_display_value(cell.get("weight_zone")) or "unassigned") != weight_class,
+        "target_weight_zone": weight_class,
+        "actual_weight_zone": _display_value(cell.get("weight_zone")) or "unassigned",
+        "placement_status": "placed" if not reason else "error",
+        "placement_mode": mode,
+        "unplaced_reason": reason,
+        "placement_reason_code": reason_code,
+        "placement_reason_text": placement_reason_text(reason_code),
+        "placement_source": source,
+        "was_occupied_before": quantity_before > 0,
+        "quantity_before": round(quantity_before, 4),
+        "quantity_added": round(qty, 4),
+        "quantity_after": round(quantity_before + qty, 4),
+    })
+    return placement
+
+
+def _same_item(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    return (_display_value(a.get("sku_key")) or make_sku_key(a)) == (_display_value(b.get("sku_key")) or make_sku_key(b))
+
+
+def calculate_basic_weight_placement(model: dict[str, Any], state: dict[str, Any], receipts_state: dict[str, Any] | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
+    receipts = [dict(item) for item in (receipts_state or {}).get("receipts", [])]
+    for item in receipts:
+        item.setdefault("source", "receipt")
+        item["sku_key"] = _display_value(item.get("sku_key")) or make_sku_key(item)
+    receipts = sorted(receipts, key=lambda item: (_display_value(item.get("receipt_date")), _display_value(item.get("receipt_number")), _number_key(item.get("source_row_number"))))
+    source_unplaced = [dict(item) for item in state.get("source_unplaced_inventory") or state.get("unplaced_inventory", [])]
+    for item in source_unplaced:
+        item.setdefault("source", "inventory_without_cell")
+        item["sku_key"] = _display_value(item.get("sku_key")) or make_sku_key(item)
+    factual = [dict(p) for p in state.get("placements", []) if p.get("placement_mode") == "factual" or p.get("source") == "inventory_with_cell"]
+    manual = [dict(p) for p in state.get("placements", []) if p.get("placement_mode") == "manual" or p.get("source") == "manual"]
+    all_items = factual + source_unplaced + receipts
+    sku_classes, conflicts = _sku_weight_classes(all_items)
+    row_zones = _row_zones(model)
+    unassigned_rows = [row for row, zone in row_zones.items() if zone == "unassigned"]
+    cells = _cell_map(model)
+    ordered_cells = sorted(model.get("cells", []), key=lambda cell: _cell_sort_key(cell, model))
+    occupied: dict[str, float] = {}
+    sku_by_cell: dict[str, set[str]] = {}
+    placed: list[dict[str, Any]] = []
+    unplaced: list[dict[str, Any]] = []
+    zone_mismatches: list[dict[str, Any]] = []
+
+    for placement in factual + manual:
+        key = placement.get("cell_key") or cell_key(placement.get("row_number"), placement.get("cell_number"), placement.get("tier"))
+        cell = cells.get(key)
+        sku = _display_value(placement.get("sku_key")) or make_sku_key(placement)
+        placement["sku_key"] = sku
+        weight_class = sku_classes.get(sku, normalize_weight_class(placement.get("weight_class")))
+        qty = _safe_float(placement.get("qty_pallets"))
+        if cell:
+            zone = _display_value(cell.get("weight_zone")) or "unassigned"
+            before_qty = occupied.get(key, 0.0)
+            placement.update({
+                "cell_key": key,
+                "weight_class": weight_class,
+                "weight_zone": zone,
+                "placement_status": "placed",
+                "placement_mode": "factual" if placement in factual else placement.get("placement_mode", "manual"),
+                "unplaced_reason": "",
+                "placement_reason_code": placement.get("placement_reason_code") or "existing_stock",
+                "placement_reason_text": placement.get("placement_reason_text") or placement_reason_text("existing_stock"),
+                "placement_source": placement.get("placement_source") or placement.get("source") or "existing_stock",
+                "was_occupied_before": True,
+                "quantity_before": before_qty,
+                "quantity_added": 0.0,
+                "quantity_after": before_qty + qty,
+            })
+            if weight_class in {"heavy", "medium", "light", "fragile"} and zone != weight_class:
+                placement["zone_mismatch"] = True
+                placement["unplaced_reason"] = "zone_mismatch"
+                zone_mismatches.append({"sku_key": sku, "sku_code": placement.get("sku_code", ""), "cell_key": key, "weight_class": weight_class, "weight_zone": zone})
+            occupied[key] = occupied.get(key, 0.0) + qty
+            sku_by_cell.setdefault(key, set()).add(sku)
+        placed.append(placement)
+
+    def merge_or_append(record: dict[str, Any]) -> None:
+        for existing in placed:
+            if existing.get("cell_key") == record.get("cell_key") and _same_item(existing, record) and existing.get("source") == record.get("source") and existing.get("placement_mode") == record.get("placement_mode"):
+                existing["qty_pallets"] = round(_safe_float(existing.get("qty_pallets")) + _safe_float(record.get("qty_pallets")), 4)
+                existing["occupied_capacity_pallets"] = round(_safe_float(existing.get("occupied_capacity_pallets")) + _safe_float(record.get("occupied_capacity_pallets")), 4)
+                existing["quantity_added"] = round(_safe_float(existing.get("quantity_added")) + _safe_float(record.get("quantity_added")), 4)
+                existing["quantity_after"] = round(_safe_float(existing.get("quantity_before")) + _safe_float(existing.get("quantity_added")), 4)
+                for field in ["receipt_line_ids", "receipt_numbers"]:
+                    merged = list(existing.get(field) or [])
+                    for value in record.get(field) or []:
+                        if value and value not in merged:
+                            merged.append(value)
+                    existing[field] = merged
+                return
+        placed.append(record)
+
+    row_numbers_by_order = [_display_value(row.get("row_number")) for row in sorted(model.get("rows", []), key=lambda row: (_safe_float(row.get("row_order"), 10**9), _display_value(row.get("row_number"))))]
+    row_index = {row_number: idx for idx, row_number in enumerate(row_numbers_by_order)}
+
+    def row_cells(row_number: str, reverse: bool = False) -> list[dict[str, Any]]:
+        row_items = [cell for cell in ordered_cells if _display_value(cell.get("row_number")) == row_number]
+        return sorted(row_items, key=lambda cell: _number_key(cell.get("cell_number"))[1] if _number_key(cell.get("cell_number"))[0] == 0 else _safe_float(cell.get("y_center")), reverse=reverse)
+
+    def overflow_rows_for_zone(weight_class: str) -> list[tuple[str, bool]]:
+        target_rows = [row for row in row_numbers_by_order if row_zones.get(row) == weight_class]
+        if not target_rows:
+            return []
+        target_indices = [row_index[row] for row in target_rows if row in row_index]
+        min_target = min(target_indices)
+        max_target = max(target_indices)
+        candidates: list[tuple[int, int, str, bool]] = []
+        for row in row_numbers_by_order:
+            if row in target_rows:
+                continue
+            idx = row_index[row]
+            if idx < min_target:
+                distance = min_target - idx
+                reverse = True
+            elif idx > max_target:
+                distance = idx - max_target
+                reverse = False
+            else:
+                continue
+            candidates.append((distance, idx, row, reverse))
+        return [(row, reverse) for _, _, row, reverse in sorted(candidates)]
+
+    def cells_for_zone_with_overflow(weight_class: str) -> tuple[list[dict[str, Any]], dict[str, int]]:
+        target_rows = [row for row in row_numbers_by_order if row_zones.get(row) == weight_class]
+        cells_in_order: list[dict[str, Any]] = []
+        for row in target_rows:
+            cells_in_order.extend(row_cells(row, reverse=False))
+        for row, reverse in overflow_rows_for_zone(weight_class):
+            cells_in_order.extend(row_cells(row, reverse=reverse))
+        order_index = {cell_key(cell.get("row_number"), cell.get("cell_number"), cell.get("tier")): idx for idx, cell in enumerate(cells_in_order)}
+        return cells_in_order, order_index
+
+    def candidate_cells_for_sku(zone_cells: list[dict[str, Any]], sku_key: str, order_index: dict[str, int]) -> list[dict[str, Any]]:
+        sku_cells = [cells[p.get("cell_key")] for p in placed if _display_value(p.get("sku_key")) == sku_key and p.get("cell_key") in cells and p.get("cell_key") in order_index]
+        if not sku_cells:
+            return zone_cells
+        row_orders = [_safe_float(cell.get("row_order"), 10**9) for cell in sku_cells]
+        same_rows = {_display_value(cell.get("row_number")) for cell in sku_cells}
+        cell_positions = {(_display_value(cell.get("row_number")), _number_key(cell.get("cell_number"))[1]) for cell in sku_cells if _number_key(cell.get("cell_number"))[0] == 0}
+
+        def rank(cell: dict[str, Any]) -> tuple[float, float, int]:
+            row = _display_value(cell.get("row_number"))
+            key = cell_key(cell.get("row_number"), cell.get("cell_number"), cell.get("tier"))
+            cell_num_key = _number_key(cell.get("cell_number"))
+            cell_num = cell_num_key[1] if cell_num_key[0] == 0 else 10**9
+            if row in same_rows:
+                row_positions = [pos for sku_row, pos in cell_positions if sku_row == row]
+                min_cell_delta = min(abs(cell_num - pos) for pos in row_positions) if row_positions and cell_num != 10**9 else 10**9
+                priority = 0 if min_cell_delta == 1 else 1
+            else:
+                min_cell_delta = 10**9
+                priority = 2
+            min_row_delta = min(abs(_safe_float(cell.get("row_order"), 10**9) - row_order) for row_order in row_orders)
+            return (priority, min_cell_delta if priority < 2 else min_row_delta, order_index.get(key, 10**9))
+
+        return sorted(zone_cells, key=rank)
+
+    def place_item(item: dict[str, Any], source: str) -> None:
+        sku = _display_value(item.get("sku_key")) or make_sku_key(item)
+        item["sku_key"] = sku
+        total_qty = _safe_float(item.get("qty_pallets"))
+        weight_class = sku_classes.get(sku, "unclassified")
+        if total_qty <= 0:
+            unplaced.append(_unplaced_record(item, total_qty, "invalid_qty_pallets", source, weight_class))
+            return
+        if sku in conflicts:
+            unplaced.append(_unplaced_record(item, total_qty, "conflicting_weight_class", source, weight_class))
+            return
+        if weight_class == "unclassified":
+            reason = "missing_calculated_zone" if "calculated_zone" in item else "missing_weight_class"
+            unplaced.append(_unplaced_record(item, total_qty, reason, source, weight_class))
+            return
+        target_rows = [row for row in row_numbers_by_order if row_zones.get(row) == weight_class]
+        if not target_rows:
+            unplaced.append(_unplaced_record(item, total_qty, "no_rows_for_zone", source, weight_class, weight_class))
+            return
+        zone_cells, order_index = cells_for_zone_with_overflow(weight_class)
+        remaining = total_qty
+        # first fill same SKU/characteristic partial cells in all allowed rows
+        same_cells = []
+        for cell in zone_cells:
+            key = cell_key(cell.get("row_number"), cell.get("cell_number"), cell.get("tier"))
+            if occupied.get(key, 0.0) <= 0:
+                continue
+            if any(_same_item(p, item) for p in placed if p.get("cell_key") == key):
+                same_cells.append(cell)
+        same_cell_keys = {cell_key(cell.get("row_number"), cell.get("cell_number"), cell.get("tier")) for cell in same_cells}
+        ordered_candidates = [cell for cell in candidate_cells_for_sku(zone_cells, sku, order_index) if cell_key(cell.get("row_number"), cell.get("cell_number"), cell.get("tier")) not in same_cell_keys]
+        for cell in same_cells + ordered_candidates:
+            if remaining <= 0:
+                break
+            key = cell_key(cell.get("row_number"), cell.get("cell_number"), cell.get("tier"))
+            capacity = _safe_float(cell.get("capacity_pallets"), 1.0)
+            used = occupied.get(key, 0.0)
+            if used >= capacity:
+                continue
+            existing_skus = sku_by_cell.get(key, set())
+            if existing_skus and sku not in existing_skus:
+                continue
+            if existing_skus and cell not in same_cells:
+                continue
+            qty = min(remaining, capacity - used)
+            if qty <= 0:
+                continue
+            actual_zone = _display_value(cell.get("weight_zone")) or "unassigned"
+            is_overflow = actual_zone != weight_class
+            reason_code = "same_sku_partial_cell" if used > 0 else ("zone_overflow" if is_overflow else ("fragile_priority" if weight_class == "fragile" else ("adjacent_to_same_sku" if any(_display_value(p.get("sku_key")) == sku for p in placed) else "matching_weight_zone")))
+            record = _basic_placement_record(item, cell, qty, source, "calculated", weight_class, reason_code=reason_code, quantity_before=used)
+            record["zone_overflow"] = is_overflow
+            record["target_weight_zone"] = weight_class
+            record["actual_weight_zone"] = actual_zone
+            merge_or_append(record)
+            occupied[key] = used + qty
+            sku_by_cell.setdefault(key, set()).add(sku)
+            remaining = round(remaining - qty, 4)
+        if remaining > 0:
+            unplaced.append(_unplaced_record(item, remaining, "insufficient_zone_capacity", source, weight_class, weight_class))
+
+    for item in source_unplaced:
+        place_item(item, "inventory_without_cell")
+    for item in receipts:
+        place_item(item, "receipt")
+
+    diagnostics = {
+        "Всего паллет": round(sum(_safe_float(p.get("qty_pallets")) for p in placed) + sum(_safe_float(u.get("qty_pallets")) for u in unplaced), 4),
+        "Размещено": round(sum(_safe_float(p.get("qty_pallets")) for p in placed), 4),
+        "Не размещено": round(sum(_safe_float(u.get("qty_pallets")) for u in unplaced), 4),
+        "Размещено heavy": round(sum(_safe_float(p.get("qty_pallets")) for p in placed if p.get("weight_zone") == "heavy"), 4),
+        "Размещено medium": round(sum(_safe_float(p.get("qty_pallets")) for p in placed if p.get("weight_zone") == "medium"), 4),
+        "Размещено light": round(sum(_safe_float(p.get("qty_pallets")) for p in placed if p.get("weight_zone") == "light"), 4),
+        "Размещено fragile": round(sum(_safe_float(p.get("qty_pallets")) for p in placed if p.get("weight_zone") == "fragile"), 4),
+        "Свободная вместимость зон": _zone_capacity(model, occupied),
+        "SKU без весовой категории": sorted([sku for sku, cls in sku_classes.items() if cls == "unclassified" and sku not in conflicts]),
+        "Ряды без назначенной зоны": unassigned_rows,
+        "Конфликты категорий SKU": conflicts,
+        "Фактические остатки с zone_mismatch": zone_mismatches,
+        "Неразмещённые позиции": unplaced,
+    }
+    state["placements"] = placed
+    state["unplaced_inventory"] = unplaced
+    state["basic_placement_diagnostics"] = diagnostics
+    state.setdefault("settings", {})["basic_weight_placement_enabled"] = True
+    _append_journal(state, "базовое размещение по весовым зонам", qty_pallets=diagnostics["Размещено"], source="basic_weight_placement")
+    save_placement_state(state)
+    return state, diagnostics
+
+
+def clear_calculated_placements(state: dict[str, Any]) -> dict[str, Any]:
+    state["placements"] = [p for p in state.get("placements", []) if p.get("placement_mode") in {"factual", "manual"}]
+    if "source_unplaced_inventory" in state:
+        state["unplaced_inventory"] = [dict(item) for item in state.get("source_unplaced_inventory", [])]
+    else:
+        state["unplaced_inventory"] = [u for u in state.get("unplaced_inventory", []) if u.get("source") not in {"receipt", "inventory_without_cell"}]
+    state.pop("basic_placement_diagnostics", None)
+    save_placement_state(state)
+    return state
