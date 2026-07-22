@@ -494,6 +494,7 @@ def build_geometry_model(
         "cells": cells,
         "base_cells": [dict(cell) for cell in cells],
         "aisles": aisles,
+        "cross_aisles": [],
         "roads": roads,
         "navigation_nodes": navigation_nodes,
         "navigation_edges": navigation_edges,
@@ -518,6 +519,7 @@ def load_geometry_model() -> dict[str, Any] | None:
         return None
     if "base_cells" not in data:
         data["base_cells"] = [dict(cell) for cell in data.get("cells", [])]
+    data.setdefault("cross_aisles", [])
     overrides = load_manual_overrides()
     if overrides and overrides.get("source_model_id") == data.get("model_id"):
         data = apply_manual_overrides(data, overrides)
@@ -719,6 +721,7 @@ def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bo
     rows = model.get("rows", [])
     cells = model.get("cells", [])
     aisles = model.get("aisles", [])
+    cross_aisles = model.get("cross_aisles", [])
     roads = model.get("roads", [])
     max_x = max([road.get("x_max", 0) for road in roads] + [row.get("x_max", 0) for row in rows] + [1])
     min_y = min([road.get("y_min", 0) for road in roads] + [0])
@@ -738,6 +741,7 @@ def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bo
         "cell_color": "#DCEBFF",
         "deep_lane_cell_color": "#CFE8D5",
         "aisle_color": "#F2F2F2",
+        "cross_aisle_color": "#DCE6F2",
         "top_road_color": "#FFE8A3",
         "bottom_road_color": "#FFE8A3",
         "exit_color": "#FFCC80",
@@ -914,6 +918,15 @@ def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bo
         y_max = max_y - model["settings"].get("top_road_width_m", 3.4)
         aisle_label = "проезд" if settings.get("show_aisle_labels", True) else ""
         rect(aisle["x_min"], 0, aisle["x_max"], y_max, colors["aisle_color"], "1px solid #D5DAE2", aisle_label, f"{aisle['row_from']} → {aisle['row_to']}: {aisle['aisle_width_m']} м", short_label="↕")
+    for aisle in cross_aisles:
+        title = (
+            f"Поперечный проезд\nРяд: {aisle.get('row_number', '')}\n"
+            f"После ячейки: {aisle.get('after_cell_number', '')}\n"
+            f"Ширина: {aisle.get('width_cells', 0)} яч. / {float(aisle.get('width_m', 0) or 0):g} м\n"
+            f"Комментарий: {aisle.get('comment') or '—'}"
+        )
+        label = "Поперечный проезд" if settings.get("show_aisle_labels", True) else ""
+        rect(aisle["x_min"], aisle["y_min"], aisle["x_max"], aisle["y_max"], colors["cross_aisle_color"], "1px dashed #8294AA", label, title, short_label="проезд")
     def row_title(row: dict[str, Any]) -> str:
         return (
             f"Ряд {row.get('row_number', '')}\n"

@@ -439,6 +439,16 @@ def apply_row_settings_transaction(model: dict[str, Any], edited_rows: list[dict
         if diff:
             changed.append(f"Ряд {row_number}: " + "; ".join(diff))
     sync_row_settings_to_model(candidate)
+    if candidate.get("cross_aisles"):
+        from warehouse_cross_aisles import apply_cross_aisles_transaction
+
+        cross_draft = [
+            {field: aisle.get(field) for field in ("row_number", "after_cell_number", "width_cells", "comment")}
+            for aisle in candidate["cross_aisles"]
+        ]
+        candidate, cross_errors = apply_cross_aisles_transaction(candidate, cross_draft)
+        if cross_errors:
+            return original, cross_errors
     for row in candidate.get("rows", []):
         row_number = _display(row.get("row_number"))
         if _has_intersection(candidate, row_number, _float(row.get("x_min")), _float(row.get("x_max")), _float(row.get("y_min")), _float(row.get("y_max"))):
