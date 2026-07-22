@@ -67,6 +67,43 @@ def build_row_settings_draft(model: dict[str, Any]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def create_row_settings_state(model: dict[str, Any]) -> dict[str, Any]:
+    """Create an isolated, JSON-serializable editor state from the saved model."""
+    records = build_row_settings_draft(model).to_dict(orient="records")
+    return {
+        "model_id": str(model.get("model_id") or model.get("source_file_hash") or "active"),
+        "baseline": copy.deepcopy(records),
+        "draft": copy.deepcopy(records),
+        "editor_revision": 0,
+    }
+
+
+def update_row_settings_state(state: dict[str, Any], edited_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Replace the draft with submitted editor values without touching the model."""
+    updated = copy.deepcopy(state)
+    updated["draft"] = copy.deepcopy(edited_rows)
+    return updated
+
+
+def reset_row_settings_state(state: dict[str, Any]) -> dict[str, Any]:
+    """Discard draft edits while retaining the state scope for the active model."""
+    reset = copy.deepcopy(state)
+    reset["draft"] = copy.deepcopy(reset.get("baseline", []))
+    reset["editor_revision"] = int(reset.get("editor_revision", 0)) + 1
+    return reset
+
+
+def changed_row_numbers(state: dict[str, Any]) -> list[str]:
+    """Return row numbers whose submitted draft differs from its baseline."""
+    baseline = {_display(row.get("row_number")): row for row in state.get("baseline", [])}
+    changed = []
+    for row in state.get("draft", []):
+        row_number = _display(row.get("row_number"))
+        if row != baseline.get(row_number):
+            changed.append(row_number)
+    return changed
+
+
 def _base_cell_width(model: dict[str, Any], row: dict[str, Any], cells: list[dict[str, Any]]) -> float:
     settings_width = _float((model.get("settings") or {}).get("cell_width_m"), 0.0)
     if row.get("base_cell_width_m"):
@@ -242,37 +279,100 @@ def _validate_edited_rows(model: dict[str, Any], edited_rows: list[dict[str, Any
     errors: list[str] = []
     model_rows = {_display(row.get("row_number")) for row in model.get("rows", [])}
     seen = set()
+    seen_orders: dict[float, str] = {}
+
     occupied = _occupied_by_cell(model)
     cells = model.get("cells", [])
+
     for edited in edited_rows:
         row_number = _display(edited.get("row_number"))
+
         if not row_number or row_number not in model_rows:
             errors.append(f"Ошибка: ряд {row_number or '—'} не найден в модели.")
             continue
+
         if row_number in seen:
             errors.append(f"Ошибка: ряд {row_number}: дублирующая строка настроек.")
+
         seen.add(row_number)
+
+        try:
+            row_order = float(str(edited.get("row_order", "")).replace(",", "."))
+
+            if row_order <= 0:
+                raise ValueError
+
+            if row_order in seen_orders:
+                errors.append(
+                    f"Ошибка: ряды {seen_orders[row_order]} и {row_number}: одинаковый порядок {row_order:g}."
+                )
+            else:
+                seen_orders[row_order] = row_number
+
+        except (TypeError, ValueError):
+            errors.append(
+                f"Ошибка: ряд {row_number}: порядок должен быть положительным числом."
+            )
+
         if edited.get("cell_direction") not in VALID_DIRECTIONS:
             errors.append(f"Ошибка: ряд {row_number}: некорректное направление.")
+
         if edited.get("row_storage_type") not in VALID_STORAGE_TYPES:
             errors.append(f"Ошибка: ряд {row_number}: некорректный тип ряда.")
+
         if edited.get("weight_zone", "unassigned") not in VALID_ZONES:
             errors.append(f"Ошибка: ряд {row_number}: некорректная весовая зона.")
-        for field, label in (("top_offset_cells", "верхний отступ"), ("bottom_offset_cells", "нижний отступ")):
+
+        for field, label in (
+            ("top_offset_cells", "верхний отступ"),
+            ("bottom_offset_cells", "нижний отступ"),
+        ):
             raw = edited.get(field, 0)
+
             try:
                 value = float(str(raw).replace(",", "."))
+
             except (TypeError, ValueError):
-                errors.append(f"Ошибка: ряд {row_number}: {label} должен быть целым числом не меньше 0.")
+                errors.append(
+                    f"Ошибка: ряд {row_number}: {label} должен быть целым числом не меньше 0."
+                )
                 continue
+
             if value < 0 or not value.is_integer():
-                errors.append(f"Ошибка: ряд {row_number}: {label} должен быть целым числом не меньше 0.")
-        capacity = int(_float(edited.get("cell_capacity_pallets"), 1)) if edited.get("row_storage_type") == "deep_lane" else 1
+                errors.append(
+                    f"Ошибка: ряд {row_number}: {label} должен быть целым числом не меньше 0."
+                )
+
+        capacity = (
+            int(_float(edited.get("cell_capacity_pallets"), 1))
+            if edited.get("row_storage_type") == "deep_lane"
+            else 1
+        )
+
         if capacity < 1:
-            errors.append(f"Ошибка: ряд {row_number}: вместимость должна быть не меньше 1.")
+            errors.append(
+                f"Ошибка: ряд {row_number}: вместимость должна быть не меньше 1."
+            )
+
         for cell in cells:
-            if _display(cell.get("row_number")) == row_number and occupied.get(_cell_key(cell), 0.0) > capacity:
-                errors.append(f"Ошибка: ряд {row_number}, ячейка {_cell_key(cell)}: занято {occupied[_cell_key(cell)]:g}, новая вместимость {capacity:g}.")
+            if (
+                _display(cell.get("row_number")) == row_number
+                and occupied.get(_cell_key(cell), 0.0) > capacity
+            ):
+                errors.append(
+                    f"Ошибка: ряд {row_number}, ячейка {_cell_key(cell)}: "
+                    f"занято {occupied[_cell_key(cell)]:g}, "
+                    f"новая вместимость {capacity:g}."
+                )
+
+    missing_rows = sorted(model_rows - seen)
+
+    if missing_rows:
+        errors.append(
+            "Ошибка: в черновике отсутствуют ряды: "
+            + ", ".join(missing_rows)
+            + "."
+        )
     return errors
 
 

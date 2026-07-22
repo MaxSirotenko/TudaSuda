@@ -7,7 +7,11 @@ import pandas as pd
 from warehouse_row_settings import (
     apply_row_settings_transaction,
     build_row_settings_draft,
+    changed_row_numbers,
+    create_row_settings_state,
+    reset_row_settings_state,
     sync_row_settings_to_model,
+    update_row_settings_state,
 )
 from warehouse_geometry_model import GeometrySettings, build_geometry_html, build_geometry_model
 
@@ -405,3 +409,80 @@ def test_new_geometry_build_applies_individual_offsets_without_fake_cells():
     assert min(cell["y_min"] for cell in row_one_cells) == pytest.approx(2.4)
     assert rows["1"]["y_max"] == pytest.approx(6.0)
     assert rows["2"]["bottom_offset_m"] == pytest.approx(3.6)
+
+
+def test_first_submitted_edit_is_kept_without_a_second_change():
+    model = _model()
+    state = create_row_settings_state(model)
+    edited = copy.deepcopy(state["draft"])
+    edited[0]["weight_zone"] = "heavy"
+
+    state = update_row_settings_state(state, edited)
+    updated, messages = apply_row_settings_transaction(model, state["draft"])
+
+    assert next(row for row in updated["rows"] if row["row_number"] == "152")["weight_zone"] == "heavy"
+    assert not any(message.startswith("Ошибка:") for message in messages)
+
+
+def test_draft_isolated_from_model_and_keeps_multiple_row_changes():
+    model = _model()
+    original = copy.deepcopy(model)
+    state = create_row_settings_state(model)
+    edited = copy.deepcopy(state["draft"])
+    edited[0].update({"weight_zone": "heavy", "top_offset_cells": 3, "cell_direction": "bottom_to_top"})
+    edited[1]["weight_zone"] = "medium"
+
+    state = update_row_settings_state(state, edited)
+
+    assert model == original
+    assert set(changed_row_numbers(state)) == {"152", "153"}
+    updated, _ = apply_row_settings_transaction(model, state["draft"])
+    rows = {row["row_number"]: row for row in updated["rows"]}
+    assert (rows["152"]["weight_zone"], rows["152"]["top_offset_cells"]) == ("heavy", 3)
+    assert rows["153"]["weight_zone"] == "medium"
+
+
+def test_reset_draft_restores_baseline_and_state_survives_deepcopy_rerun():
+    state = create_row_settings_state(_model())
+    edited = copy.deepcopy(state["draft"])
+    edited[0]["weight_zone"] = "heavy"
+    state = update_row_settings_state(state, edited)
+
+    simulated_session_rerun = copy.deepcopy(state)
+    reset = reset_row_settings_state(simulated_session_rerun)
+
+    assert changed_row_numbers(simulated_session_rerun) == ["152"]
+    assert changed_row_numbers(reset) == []
+    assert reset["draft"] == reset["baseline"]
+
+
+def test_apply_transaction_runs_geometry_sync_once(monkeypatch):
+    import warehouse_row_settings as row_settings
+
+    calls = 0
+    real_sync = row_settings.sync_row_settings_to_model
+
+    def counted_sync(model):
+        nonlocal calls
+        calls += 1
+        return real_sync(model)
+
+    monkeypatch.setattr(row_settings, "sync_row_settings_to_model", counted_sync)
+    model = _model()
+    updated, messages = row_settings.apply_row_settings_transaction(model, _edited(model))
+
+    assert updated["rows"]
+    assert not any(message.startswith("Ошибка:") for message in messages)
+    assert calls == 1
+
+
+def test_invalid_order_rolls_back_entire_draft():
+    model = _model()
+    edited = _edited(model)
+    edited[0]["row_order"] = edited[1]["row_order"]
+    edited[1]["weight_zone"] = "medium"
+
+    updated, messages = apply_row_settings_transaction(model, edited)
+
+    assert updated == model
+    assert any("одинаковый порядок" in message for message in messages)

@@ -12,24 +12,27 @@ def _function_source(name: str) -> str:
     return ast.get_source_segment(SOURCE, node) or ""
 
 
-def test_geometry_mode_has_four_top_level_tabs():
+def test_geometry_mode_has_dedicated_settings_tab():
     body = _function_source("render_excel_geometry_warehouse")
 
-    for label in ("Карта склада", "Приходы и инвент", "Аналитика", "Служебное"):
+    for label in ("Карта склада", "Настройки склада", "Приходы и инвент", "Аналитика", "Служебное"):
         assert f'"{label}"' in body
     assert "render_warehouse_map_tab(model)" in body
+    assert "render_warehouse_settings_tab(model)" in body
     assert "render_receipts_inventory_tab(model)" in body
     assert "render_analytics_tab(model)" in body
     assert "render_service_tab(saved_model, model)" in body
 
 
-def test_row_and_zone_settings_are_rendered_with_the_map():
-    body = _function_source("render_warehouse_map_tab")
+def test_row_and_zone_settings_are_separate_from_map_view():
+    map_body = _function_source("render_warehouse_map_tab")
+    body = _function_source("render_warehouse_settings_tab")
 
-    assert '"Настройки рядов и геометрии"' in body
     assert "render_unified_row_settings_editor(model)" in body
     assert "render_active_model_aisle_editor(model)" in body
-    assert "render_zone_boundaries_editor(model)" in body
+    assert "render_zone_boundaries_editor" in body
+    assert "render_unified_row_settings_editor" not in map_body
+    assert "render_map_edit_panel" not in map_body
 
 
 def test_receipts_and_inventory_are_only_in_operations_tab_renderer():
@@ -94,12 +97,35 @@ def test_row_shift_is_only_exposed_as_experimental_service_action():
     assert "_shift_rows" not in map_editor
 
 
-def test_row_offsets_are_editable_and_bulk_zero_requires_explicit_opt_in():
+def test_row_offsets_are_editable_in_the_single_draft_table():
     editor = _function_source("render_unified_row_settings_editor")
 
     assert "Отступ сверху, ячеек" in SOURCE
     assert "Отступ снизу, ячеек" in SOURCE
-    assert '"Изменить отступ сверху"' in editor
-    assert '"Изменить отступ снизу"' in editor
-    assert "if apply_top_offset:" in editor
-    assert "if apply_bottom_offset:" in editor
+    assert '"Отступ сверху, ячеек"' in editor
+    assert '"Отступ снизу, ячеек"' in editor
+
+
+def test_map_renderer_is_view_only_and_row_editor_uses_a_form():
+    map_view = _function_source("render_geometry_map_view")
+    editor = _function_source("render_unified_row_settings_editor")
+
+    assert "render_map_edit_panel" not in map_view
+    assert "st.form(" in editor
+    assert 'form_submit_button("Применить изменения"' in editor
+    assert 'form_submit_button("Отменить изменения"' in editor
+    assert "apply_row_settings_transaction" in editor
+    assert "on_change=" not in editor
+
+
+def test_outbound_picking_is_available_by_the_map_with_guarded_actions():
+    map_tab = _function_source("render_warehouse_map_tab")
+    picking = _function_source("render_outbound_picking")
+
+    assert '"Моделирование сборки"' in map_tab
+    assert "render_outbound_picking(model)" in map_tab
+    assert '"Собрать выбранные РО"' in picking
+    assert '"Собрать все необработанные РО"' in picking
+    assert '"Сбросить результаты сборки"' in picking
+    assert "disabled=not selected_keys" in picking
+    assert "disabled=not all_unprocessed" in picking

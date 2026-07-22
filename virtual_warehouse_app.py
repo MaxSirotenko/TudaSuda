@@ -93,8 +93,10 @@ from warehouse_receipts import (
 )
 from warehouse_row_settings import (
     apply_row_settings_transaction,
-    build_row_settings_draft,
-    sync_row_settings_to_model,
+    changed_row_numbers,
+    create_row_settings_state,
+    reset_row_settings_state,
+    update_row_settings_state,
 )
 from warehouse_zone_boundaries import (
     ZONE_LABELS,
@@ -103,6 +105,24 @@ from warehouse_zone_boundaries import (
     calculate_dynamic_zone_boundaries,
     ensure_zone_boundary_settings,
     set_base_boundaries_from_current_rows,
+)
+from warehouse_outbound_orders import (
+    detect_outbound_columns,
+    ensure_pre_outbound_snapshot,
+    enrich_model_with_outbound_diagnostics,
+    execute_outbound_orders,
+    get_outbound_sheet_names,
+    load_outbound_execution_log,
+    load_outbound_execution_state,
+    load_outbound_orders,
+    normalize_outbound_table,
+    outbound_execution_summary,
+    read_outbound_table,
+    reset_outbound_execution,
+    save_outbound_execution_log,
+    save_outbound_execution_state,
+    save_outbound_orders,
+    summarize_outbound_orders,
 )
 st.set_page_config(page_title="Симулятор сборки", layout="wide")
 
@@ -1382,19 +1402,146 @@ def _current_warehouse_state(model: dict) -> None:
         st.caption(f"Загружено строк прихода: {len(receipts_state['receipts'])}.")
 
 
+def render_outbound_picking(model: dict) -> None:
+    orders_state = load_outbound_orders(model)
+    execution_state = load_outbound_execution_state(model)
+    execution_log = load_outbound_execution_log(model)
+    rows = orders_state.get("rows", [])
+    st.caption("Сборка выполняется последовательно в целых qty_units. Вес, масса и весовые коэффициенты не используются.")
+    uploaded = st.file_uploader("Excel с расходными ордерами", type=["xlsx"], key="outbound_orders_upload")
+    if uploaded is not None:
+        file_bytes = uploaded.getvalue()
+        sheet_names = get_outbound_sheet_names(file_bytes)
+        sheet_name = st.selectbox("Лист с расходными ордерами", sheet_names, key="outbound_sheet")
+        header_rows = st.radio("Строк заголовка РО", [1, 2], horizontal=True, key="outbound_header_rows")
+        source_table = read_outbound_table(file_bytes, sheet_name, header_rows)
+        detected = detect_outbound_columns(source_table)
+        columns = [None, *source_table.columns.tolist()]
+        mapping: dict[str, str | None] = {}
+        labels = {
+            "outbound_order_number": "Номер РО",
+            "created_at": "Дата создания",
+            "nomenclature": "Номенклатура",
+            "characteristic": "Характеристика",
+            "qty_units": "Количество юнитов",
+            "unit_name": "Единица измерения",
+            "warehouse": "Склад",
+        }
+        mapping_columns = st.columns(4)
+        for index, (field, label) in enumerate(labels.items()):
+            detected_column = detected.get(field)
+            mapping[field] = mapping_columns[index % 4].selectbox(
+                label,
+                columns,
+                index=columns.index(detected_column) if detected_column in columns else 0,
+                key=f"outbound_map_{field}",
+            )
+        normalized_rows, diagnostics = normalize_outbound_table(source_table, mapping)
+        with st.expander("Предпросмотр распознанных расходных ордеров"):
+            st.dataframe(pd.DataFrame(normalized_rows).head(200), use_container_width=True)
+            if diagnostics:
+                st.dataframe(pd.DataFrame(diagnostics), use_container_width=True)
+        if st.button("Загрузить расходные ордера", type="primary", key="outbound_save_upload"):
+            if any(item.get("level") == "error" for item in diagnostics):
+                st.error("Исправьте сопоставление обязательных колонок.")
+            else:
+                orders_state = {
+                    "model_id": model.get("model_id"),
+                    "loaded_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+                    "source_file_name": uploaded.name,
+                    "source_file_hash": file_hash(file_bytes),
+                    "rows": normalized_rows,
+                }
+                save_outbound_orders(orders_state)
+                st.success(f"Загружено строк РО: {len(normalized_rows)}.")
+                st.rerun()
+
+    order_summary = summarize_outbound_orders(rows, execution_state)
+    if not order_summary:
+        st.info("Расходные ордера пока не загружены.")
+        return
+    st.markdown("**Расходные ордера**")
+    st.dataframe(pd.DataFrame(order_summary), use_container_width=True, hide_index=True)
+    available = [item for item in order_summary if not item["processed"]]
+    option_to_key = {f"{item['created_at']} · {item['outbound_order_number']} · {item['requested_units']} юн.": item["order_key"] for item in available}
+    selected_labels = st.multiselect("Выберите необработанные РО", list(option_to_key), key="outbound_selected_orders")
+    selected_keys = [option_to_key[label] for label in selected_labels]
+
+    def execute(keys: list[str]) -> None:
+        placement_state, warning = load_placement_state(model)
+        if warning:
+            st.warning(warning)
+        ensure_pre_outbound_snapshot(placement_state)
+        updated_placements, updated_execution, updated_log, summary = execute_outbound_orders(
+            model,
+            placement_state,
+            rows,
+            execution_state,
+            execution_log,
+            keys,
+        )
+        save_placement_state(updated_placements)
+        save_outbound_execution_state(updated_execution)
+        save_outbound_execution_log(updated_log, model.get("model_id"))
+        st.session_state["placement_state"] = updated_placements
+        st.session_state["last_outbound_summary"] = summary
+        st.success(f"Собрано юнитов: {summary.get('Собрано юнитов', 0)}; дефицит: {summary.get('Дефицит юнитов', 0)}.")
+        st.rerun()
+
+    c1, c2, c3 = st.columns(3)
+    if c1.button("Собрать выбранные РО", disabled=not selected_keys, key="outbound_execute_selected"):
+        execute(selected_keys)
+    all_unprocessed = [item["order_key"] for item in available]
+    if c2.button("Собрать все необработанные РО", disabled=not all_unprocessed, key="outbound_execute_all"):
+        execute(all_unprocessed)
+    if c3.button("Сбросить результаты сборки", disabled=not bool(execution_state.get("processed_orders")), key="outbound_reset"):
+        restored, result = reset_outbound_execution(model)
+        if result["success"]:
+            st.session_state["placement_state"] = restored
+            st.success(result["message"])
+            st.rerun()
+        else:
+            st.error(result["message"])
+
+    execution_state = load_outbound_execution_state(model)
+    execution_log = load_outbound_execution_log(model)
+    line_results = execution_state.get("line_results", [])
+    summary = outbound_execution_summary(rows, execution_state, line_results)
+    metric_columns = st.columns(5)
+    for index, (label, value) in enumerate(summary.items()):
+        metric_columns[index % 5].metric(label, value)
+    if line_results:
+        with st.expander("Результаты строк РО"):
+            st.dataframe(pd.DataFrame(line_results), use_container_width=True)
+        shortages = [item for item in line_results if int(item.get("shortage_units", 0) or 0) > 0 or item.get("line_status") not in {"completed"}]
+        with st.expander("Дефицитные и отклонённые строки"):
+            st.dataframe(pd.DataFrame(shortages), use_container_width=True)
+    if execution_log:
+        with st.expander("Журнал списаний по ячейкам"):
+            st.dataframe(pd.DataFrame(execution_log), use_container_width=True)
+
+
 def render_warehouse_map_tab(model: dict | None) -> None:
     if not model:
         st.info("Сначала загрузите схему склада на вкладке «Служебное».")
         return
+    with st.expander("Моделирование сборки", expanded=False):
+        render_outbound_picking(model)
     render_geometry_map_view(model)
+
+
+def render_warehouse_settings_tab(model: dict | None) -> None:
+    st.subheader("Настройки склада")
+    if not model:
+        st.info("Сначала загрузите схему склада на вкладке «Служебное».")
+        return
+    st.caption("Основной способ изменения склада — единый черновик настроек рядов. Карта остаётся режимом просмотра.")
+    render_unified_row_settings_editor(model)
     model = st.session_state.get("geometry_model", model)
-    with st.expander("Настройки рядов и геометрии", expanded=False):
-        model = render_unified_row_settings_editor(model)
-        model = st.session_state.get("geometry_model", model)
+    with st.expander("Настройки проездов", expanded=False):
         render_active_model_aisle_editor(model)
-    model = st.session_state.get("geometry_model", model)
     with st.expander("Настройки весовых зон", expanded=False):
-        render_zone_boundaries_editor(model)
+        render_zone_boundaries_editor(st.session_state.get("geometry_model", model))
 
 
 def render_receipts_inventory_tab(model: dict | None) -> None:
@@ -1512,14 +1659,17 @@ def render_excel_geometry_warehouse() -> None:
     if saved_model and "geometry_model" not in st.session_state:
         st.session_state["geometry_model"] = saved_model
     model = st.session_state.get("geometry_model")
-    map_tab, operations_tab, analytics_tab, service_tab = st.tabs([
+    map_tab, settings_tab, operations_tab, analytics_tab, service_tab = st.tabs([
         "Карта склада",
+        "Настройки склада",
         "Приходы и инвент",
         "Аналитика",
         "Служебное",
     ])
     with map_tab:
         render_warehouse_map_tab(model)
+    with settings_tab:
+        render_warehouse_settings_tab(model)
     with operations_tab:
         render_receipts_inventory_tab(model)
     with analytics_tab:
@@ -1864,13 +2014,6 @@ ROW_SETTINGS_COLUMNS = {
 ROW_SETTINGS_REVERSE_COLUMNS = {label: key for key, label in ROW_SETTINGS_COLUMNS.items()}
 
 
-def _row_settings_signature(df: pd.DataFrame) -> str:
-    if df.empty:
-        return ""
-    ordered = df.sort_values("row_number").reset_index(drop=True)
-    return ordered.to_json(orient="records", force_ascii=False)
-
-
 def _row_settings_to_display(df: pd.DataFrame) -> pd.DataFrame:
     display_df = df.copy()
     display_df["cell_direction"] = display_df["cell_direction"].map(DIRECTION_LABELS).fillna(display_df["cell_direction"])
@@ -1906,108 +2049,76 @@ def _merge_row_settings_edits(draft: pd.DataFrame, edited_display: pd.DataFrame)
 
 def render_unified_row_settings_editor(model: dict) -> dict:
     st.subheader("Настройки рядов")
-    st.caption("Все параметры рядов меняются здесь одной таблицей. Пока вы не нажали «Применить изменения рядов», модель, карта и сохранённые файлы не изменяются.")
+    st.caption("Измените несколько строк и примените их одной транзакцией. До нажатия кнопки модель, карта и файлы не изменяются.")
     model_id = str(model.get("model_id") or model.get("source_file_hash") or "active")
-    current_draft = build_row_settings_draft(model)
-    draft_key = "row_settings_draft"
-    original_key = "row_settings_draft_original"
-    model_key = "row_settings_draft_model_id"
-    if st.session_state.get(model_key) != model_id or draft_key not in st.session_state:
-        st.session_state[model_key] = model_id
-        st.session_state[draft_key] = current_draft.copy(deep=True)
-        st.session_state[original_key] = current_draft.copy(deep=True)
-    draft = st.session_state[draft_key].copy(deep=True)
-    original = st.session_state.get(original_key, current_draft).copy(deep=True)
-    if _row_settings_signature(draft) != _row_settings_signature(original):
-        st.warning("Есть несохранённые изменения")
+    state_key = "row_settings_state"
+    state = st.session_state.get(state_key)
+    if not isinstance(state, dict) or state.get("model_id") != model_id:
+        state = create_row_settings_state(model)
+        st.session_state[state_key] = state
+    draft = pd.DataFrame(copy.deepcopy(state.get("draft", [])))
+    changed_rows = changed_row_numbers(state)
+    if changed_rows:
+        st.warning(f"Есть несохранённые изменения. Изменено рядов: {len(changed_rows)}")
+    else:
+        st.caption("Несохранённых изменений нет. Правки внутри формы не запускают пересчёт карты.")
+    apply_state = st.session_state.get("apply_state", {})
+    if apply_state.get("status") == "cancelled":
+        st.info(apply_state.get("message", "Черновик восстановлен."))
+        st.session_state["apply_state"] = {}
     if st.session_state.get("row_settings_last_changes"):
         st.success("Последние применённые изменения рядов:")
         st.write(st.session_state.pop("row_settings_last_changes"))
 
-    with st.form("unified_row_settings_form"):
-        filter_text = st.text_input("Фильтр рядов", value="", help="Введите номер ряда, группу, сторону или комментарий, чтобы быстро найти строки в таблице.")
-        visible = draft.copy(deep=True)
-        if filter_text.strip():
-            needle = filter_text.strip().lower()
-            mask = visible.apply(lambda row: any(needle in str(row.get(column, "")).lower() for column in ["row_number", "row_group", "side", "comment"]), axis=1)
-            visible = visible.loc[mask].copy()
+    revision = int(state.get("editor_revision", 0))
+    compact_columns = {
+        "Номер ряда": "Ряд",
+        "Порядок ряда": "Порядок",
+        "Направление сборки": "Направление",
+        "Весовая зона": "Зона",
+        "Вместимость одной логической ячейки": "Вместимость",
+    }
+    with st.form(f"unified_row_settings_form_{model_id}_{revision}"):
         edited_display = st.data_editor(
-            _row_settings_to_display(visible),
+            _row_settings_to_display(draft).rename(columns=compact_columns),
             use_container_width=True,
             hide_index=True,
-            key="unified_row_settings_editor",
-            disabled=["Номер ряда", "Количество логических ячеек", "Общая вместимость ряда"],
+            key=f"unified_row_settings_editor_{model_id}_{revision}",
+            disabled=["Ряд"],
             column_config={
-                "Номер ряда": st.column_config.TextColumn("Номер ряда", disabled=True),
-                "Порядок ряда": st.column_config.NumberColumn("Порядок ряда", step=1),
-                "Направление сборки": st.column_config.SelectboxColumn("Направление сборки", options=list(DIRECTION_LABELS.values())),
-                "Весовая зона": st.column_config.SelectboxColumn("Весовая зона", options=list(WEIGHT_ZONE_LABELS.values())),
+                "Ряд": st.column_config.TextColumn("Ряд", disabled=True),
+                "Порядок": st.column_config.NumberColumn("Порядок", step=1),
+                "Направление": st.column_config.SelectboxColumn("Направление", options=list(DIRECTION_LABELS.values())),
+                "Зона": st.column_config.SelectboxColumn("Зона", options=list(WEIGHT_ZONE_LABELS.values())),
                 "Тип ряда": st.column_config.SelectboxColumn("Тип ряда", options=list(ROW_STORAGE_TYPE_LABELS.values())),
-                "Вместимость одной логической ячейки": st.column_config.NumberColumn("Вместимость одной логической ячейки", min_value=1, step=1),
-                "Количество логических ячеек": st.column_config.NumberColumn("Количество логических ячеек", disabled=True),
-                "Общая вместимость ряда": st.column_config.NumberColumn("Общая вместимость ряда", disabled=True),
+                "Вместимость": st.column_config.NumberColumn("Вместимость", min_value=1, step=1),
                 "Отступ сверху, ячеек": st.column_config.NumberColumn("Отступ сверху, ячеек", min_value=0, step=1),
                 "Отступ снизу, ячеек": st.column_config.NumberColumn("Отступ снизу, ячеек", min_value=0, step=1),
             },
+            column_order=["Ряд", "Порядок", "Направление", "Зона", "Тип ряда", "Вместимость", "Отступ сверху, ячеек", "Отступ снизу, ячеек"],
         )
-        st.markdown("**Массовая настройка выбранных рядов**")
-        row_options = draft["row_number"].astype(str).tolist()
-        bulk_rows = st.multiselect("Ряды", row_options, key="row_settings_bulk_rows")
-        b1, b2, b3, b4 = st.columns(4)
-        bulk_direction = b1.selectbox("Направление", ["Не менять", *DIRECTION_LABELS.values()], key="row_settings_bulk_direction")
-        bulk_zone = b2.selectbox("Весовая зона", ["Не менять", *WEIGHT_ZONE_LABELS.values()], key="row_settings_bulk_zone")
-        bulk_storage = b3.selectbox("Тип ряда", ["Не менять", *ROW_STORAGE_TYPE_LABELS.values()], key="row_settings_bulk_storage")
-        bulk_capacity = b4.number_input("Вместимость", min_value=1, value=1, step=1, key="row_settings_bulk_capacity")
-        b5, b6 = st.columns(2)
-        bulk_group = b5.text_input("Группа ряда", value="", key="row_settings_bulk_group")
-        bulk_comment = b6.text_input("Комментарий", value="", key="row_settings_bulk_comment")
-        o1, o2 = st.columns(2)
-        with o1:
-            apply_top_offset = st.checkbox("Изменить отступ сверху", value=False, key="row_settings_bulk_apply_top_offset")
-            bulk_top_offset = st.number_input("Отступ сверху", min_value=0, value=0, step=1, disabled=not apply_top_offset, key="row_settings_bulk_top_offset")
-        with o2:
-            apply_bottom_offset = st.checkbox("Изменить отступ снизу", value=False, key="row_settings_bulk_apply_bottom_offset")
-            bulk_bottom_offset = st.number_input("Отступ снизу", min_value=0, value=0, step=1, disabled=not apply_bottom_offset, key="row_settings_bulk_bottom_offset")
-        bulk_submit = st.form_submit_button("Записать массовые значения в таблицу")
-        reset_submit = st.form_submit_button("Отменить несохранённые изменения")
-        apply_submit = st.form_submit_button("Применить изменения рядов", type="primary")
+        cancel_column, apply_column = st.columns(2)
+        reset_submit = cancel_column.form_submit_button("Отменить изменения")
+        apply_submit = apply_column.form_submit_button("Применить изменения", type="primary")
 
-    updated_draft = _merge_row_settings_edits(draft, edited_display)
-    if bulk_submit:
-        mask = updated_draft["row_number"].astype(str).isin([str(item) for item in bulk_rows])
-        if bulk_direction != "Не менять":
-            updated_draft.loc[mask, "cell_direction"] = DIRECTION_LABEL_TO_VALUE[bulk_direction]
-        if bulk_zone != "Не менять":
-            updated_draft.loc[mask, "weight_zone"] = WEIGHT_ZONE_LABEL_TO_VALUE[bulk_zone]
-        if bulk_storage != "Не менять":
-            updated_draft.loc[mask, "row_storage_type"] = {label: value for value, label in ROW_STORAGE_TYPE_LABELS.items()}[bulk_storage]
-            updated_draft.loc[mask, "cell_capacity_pallets"] = updated_draft.loc[mask, "row_storage_type"].apply(lambda value: int(bulk_capacity) if value == "deep_lane" else 1)
-        elif bulk_capacity != 1:
-            updated_draft.loc[mask & (updated_draft["row_storage_type"] == "deep_lane"), "cell_capacity_pallets"] = int(bulk_capacity)
-        if bulk_group:
-            updated_draft.loc[mask, "row_group"] = bulk_group
-        if bulk_comment:
-            updated_draft.loc[mask, "comment"] = bulk_comment
-        if apply_top_offset:
-            updated_draft.loc[mask, "top_offset_cells"] = int(bulk_top_offset)
-        if apply_bottom_offset:
-            updated_draft.loc[mask, "bottom_offset_cells"] = int(bulk_bottom_offset)
-        updated_draft["row_capacity_pallets"] = updated_draft["cells_count"].astype(float) * updated_draft["cell_capacity_pallets"].astype(float)
-        st.session_state[draft_key] = updated_draft.copy(deep=True)
-        st.info("Массовые значения записаны только в черновик таблицы. Модель склада ещё не изменена.")
-        return model
+    updated_draft = _merge_row_settings_edits(
+        draft,
+        edited_display.rename(columns={value: key for key, value in compact_columns.items()}),
+    )
+    submitted_state = update_row_settings_state(state, updated_draft.to_dict(orient="records"))
     if reset_submit:
-        st.session_state[draft_key] = current_draft.copy(deep=True)
-        st.session_state[original_key] = current_draft.copy(deep=True)
-        st.info("Черновик восстановлен из текущей сохранённой модели. Файлы склада, приходов и размещений не изменялись.")
+        st.session_state[state_key] = reset_row_settings_state(state)
+        st.session_state["apply_state"] = {"status": "cancelled", "message": "Черновик восстановлен из текущей модели."}
+        st.rerun()
         return model
     if apply_submit:
-        edited_rows = updated_draft.to_dict(orient="records")
+        st.session_state[state_key] = submitted_state
+        edited_rows = submitted_state["draft"]
         updated_model, messages = apply_row_settings_transaction(model, edited_rows)
         if any(str(message).startswith("Ошибка:") for message in messages):
             st.error("Изменения рядов не применены. Модель полностью оставлена без изменений.")
             st.write(messages)
-            st.session_state[draft_key] = updated_draft.copy(deep=True)
+            st.session_state["apply_state"] = {"status": "error", "messages": messages}
             return model
         set_base_boundaries_from_current_rows(updated_model)
         save_geometry_model(updated_model)
@@ -2016,12 +2127,10 @@ def render_unified_row_settings_editor(model: dict) -> dict:
         build_geometry_html_cached.clear()
         prepare_render_cache_cached.clear()
         st.session_state["geometry_model"] = updated_model
-        fresh_draft = build_row_settings_draft(updated_model)
-        st.session_state[draft_key] = fresh_draft.copy(deep=True)
-        st.session_state[original_key] = fresh_draft.copy(deep=True)
+        st.session_state[state_key] = create_row_settings_state(updated_model)
+        st.session_state["apply_state"] = {"status": "applied", "messages": messages}
         st.session_state["row_settings_last_changes"] = messages
         st.rerun()
-    st.session_state[draft_key] = updated_draft.copy(deep=True)
     return model
 
 def render_active_model_aisle_editor(model: dict) -> dict:
@@ -2468,13 +2577,14 @@ def render_geometry_map_view(model: dict) -> None:
     placement_state, placement_warning = load_placement_state(model)
     if placement_warning:
         st.warning(placement_warning)
-    elif placement_state.get("placements"):
+    else:
         model = attach_placements_to_model(model, placement_state)
-        snapshot, _ = load_pre_placement_snapshot(model)
-        model = enrich_model_with_placement_diagnostics(model, placement_state, snapshot)
-        st.caption("На карте показана занятость из сохранённого placements.json, включая рассчитанные приходы.")
+        if placement_state.get("placements"):
+            snapshot, _ = load_pre_placement_snapshot(model)
+            model = enrich_model_with_placement_diagnostics(model, placement_state, snapshot)
+            st.caption("На карте показана занятость из сохранённого placements.json, включая рассчитанные приходы.")
+        model = enrich_model_with_outbound_diagnostics(model, placement_state)
     _model_summary_metrics(model)
-    model = render_map_edit_panel(model)
     st.markdown(
         " · ".join(
             f"<span style='display:inline-flex;align-items:center;gap:4px;margin-right:8px'><span style='display:inline-block;width:14px;height:14px;background:{color};border:1px solid #94A3B8'></span>{ZONE_LABELS_RU.get(zone, zone)}</span>"

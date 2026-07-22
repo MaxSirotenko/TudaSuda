@@ -37,8 +37,8 @@ def _model(cells_per_row=2, deep_light_capacity=1):
     return {"model_id": "overflow", "settings": {"cell_width_m": 0.8}, "rows": rows, "cells": cells, "aisles": [], "roads": [], "navigation_nodes": [], "navigation_edges": []}
 
 
-def _receipt(sku="light-sku", qty=1, zone="light"):
-    return {"sku_key": sku, "sku_code": sku, "sku_name": sku, "qty_pallets": qty, "calculated_zone": zone, "weight_class": zone, "receipt_number": "R1", "receipt_line_id": f"R1-{sku}"}
+def _receipt(sku="light-sku", qty=1, zone="light", units=0):
+    return {"sku_key": sku, "sku_code": sku, "sku_name": sku, "qty_pallets": qty, "qty_units": units, "unit_name": "короб", "calculated_zone": zone, "weight_class": zone, "receipt_number": "R1", "receipt_line_id": f"R1-{sku}"}
 
 
 def _receipt_placements(state, sku="light-sku"):
@@ -95,3 +95,15 @@ def test_insufficient_capacity_only_after_all_allowed_rows_are_full(tmp_path, mo
     new_state, _ = calculate_basic_weight_placement(model, state, {"receipts": [_receipt(qty=1)]})
     assert not _receipt_placements(new_state)
     assert new_state["unplaced_inventory"][0]["unplaced_reason"] == "insufficient_zone_capacity"
+
+
+def test_receipt_units_are_preserved_once_when_pallets_span_multiple_cells(tmp_path, monkeypatch):
+    monkeypatch.setattr(placement_module, "PLACEMENTS_PATH", tmp_path / "placements.json")
+    model = _model(cells_per_row=2)
+
+    new_state, _ = calculate_basic_weight_placement(model, empty_placement_state(model), {"receipts": [_receipt(qty=3, units=12)]})
+    placements = _receipt_placements(new_state)
+
+    assert len(placements) == 3
+    assert sum(placement["qty_units"] for placement in placements) == 12
+    assert all(placement["unit_name"] == "короб" for placement in placements)

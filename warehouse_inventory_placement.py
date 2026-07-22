@@ -284,6 +284,8 @@ def _cell_map(model: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 
 def _placement_record(row: dict[str, Any], cell: dict[str, Any], qty_pallets: float, source: str, confidence: str, placement_mode: str, comment: str = "") -> dict[str, Any]:
+    raw_units = _safe_float(row.get("qty_units"), 0.0)
+    qty_units = int(raw_units) if raw_units >= 0 and raw_units.is_integer() else 0
     return {
         "placement_id": str(uuid.uuid4()),
         "sku_key": _display_value(row.get("sku_key")) or make_sku_key(row),
@@ -296,6 +298,8 @@ def _placement_record(row: dict[str, Any], cell: dict[str, Any], qty_pallets: fl
         "cell_key": cell_key(cell.get("row_number"), cell.get("cell_number"), cell.get("tier")),
         "qty_pallets": qty_pallets,
         "qty_boxes": _safe_float(row.get("qty_boxes")),
+        "qty_units": qty_units,
+        "unit_name": _display_value(row.get("unit_name")),
         "characteristic_code": _display_value(row.get("characteristic_code")),
         "characteristic_name": _display_value(row.get("characteristic_name")) or _display_value(row.get("characteristic")),
         "weight_class": _display_value(row.get("weight_class")) or "unclassified",
@@ -1088,6 +1092,7 @@ def calculate_basic_weight_placement(model: dict[str, Any], state: dict[str, Any
                 existing["occupied_capacity_pallets"] = round(_safe_float(existing.get("occupied_capacity_pallets")) + _safe_float(record.get("occupied_capacity_pallets")), 4)
                 existing["quantity_added"] = round(_safe_float(existing.get("quantity_added")) + _safe_float(record.get("quantity_added")), 4)
                 existing["quantity_after"] = round(_safe_float(existing.get("quantity_before")) + _safe_float(existing.get("quantity_added")), 4)
+                existing["qty_units"] = int(existing.get("qty_units", 0) or 0) + int(record.get("qty_units", 0) or 0)
                 for field in ["receipt_line_ids", "receipt_numbers"]:
                     merged = list(existing.get(field) or [])
                     for value in record.get(field) or []:
@@ -1183,6 +1188,9 @@ def calculate_basic_weight_placement(model: dict[str, Any], state: dict[str, Any
             return
         zone_cells, order_index = cells_for_zone_with_overflow(weight_class)
         remaining = total_qty
+        source_units_value = _safe_float(item.get("qty_units"), 0.0)
+        source_units = int(source_units_value) if source_units_value >= 0 and source_units_value.is_integer() else 0
+        units_assigned = False
         # first fill same SKU/characteristic partial cells in all allowed rows
         same_cells = []
         for cell in zone_cells:
@@ -1213,6 +1221,9 @@ def calculate_basic_weight_placement(model: dict[str, Any], state: dict[str, Any
             is_overflow = actual_zone != weight_class
             reason_code = "same_sku_partial_cell" if used > 0 else ("zone_overflow" if is_overflow else ("fragile_priority" if weight_class == "fragile" else ("adjacent_to_same_sku" if any(_display_value(p.get("sku_key")) == sku for p in placed) else "matching_weight_zone")))
             record = _basic_placement_record(item, cell, qty, source, "calculated", weight_class, reason_code=reason_code, quantity_before=used)
+            record["qty_units"] = source_units if not units_assigned else 0
+            record["unit_name"] = _display_value(item.get("unit_name"))
+            units_assigned = units_assigned or source_units > 0
             record["zone_overflow"] = is_overflow
             record["target_weight_zone"] = weight_class
             record["actual_weight_zone"] = actual_zone
