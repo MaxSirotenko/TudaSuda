@@ -1654,6 +1654,8 @@ def render_excel_geometry_warehouse() -> None:
     st.title("Симулятор скорости сборки")
     st.caption("Рабочий процесс: настройте склад на карте, добавьте приход, зафиксируйте инвент и проверьте результат в аналитике.")
     saved_model = load_geometry_model()
+    if saved_model:
+        saved_model = sync_row_settings_to_model(saved_model)
     if saved_model and "geometry_model" not in st.session_state:
         st.session_state["geometry_model"] = saved_model
     model = st.session_state.get("geometry_model")
