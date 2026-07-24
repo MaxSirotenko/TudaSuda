@@ -151,23 +151,28 @@ def test_cross_aisle_editor_uses_compatible_dataframe_types(monkeypatch):
         "После ячейки": "after_cell_number",
         "Ширина, ячеек": "width_cells",
         "Ширина, м": "width_m",
+        "Комментарий": "comment",
     })
     assert empty_draft.empty
     assert isinstance(empty_draft["row_number"].dtype, pd.StringDtype)
     assert isinstance(empty_draft["after_cell_number"].dtype, pd.StringDtype)
+    assert isinstance(empty_draft["comment"].dtype, pd.StringDtype)
     assert empty_draft["width_cells"].dtype == pd.Int64Dtype()
+    assert empty_draft["width_m"].dtype == pd.Float64Dtype()
 
+    source["settings"]["cell_length_m"] = 1.2
     fake_st.session_state["cross_aisle_settings_state"] = {
         "model_id": "test",
         "editor_revision": 0,
         "baseline": [],
-        "draft": [aisle()],
+        "draft": [aisle(after="20", width=3) | {"comment": None}],
     }
     virtual_warehouse_app.render_cross_aisle_settings_editor(source)
     filled_draft = captured[-1]
     assert filled_draft.loc[0, "Ряд"] == "152"
-    assert filled_draft.loc[0, "После ячейки"] == "2"
-    assert filled_draft.loc[0, "Ширина, м"] == 2.0
+    assert filled_draft.loc[0, "После ячейки"] == "20"
+    assert filled_draft.loc[0, "Комментарий"] == ""
+    assert filled_draft.loc[0, "Ширина, м"] == pytest.approx(3.6)
 
 
 def test_navigation_nodes_edges_and_visualization_have_no_fake_address():
