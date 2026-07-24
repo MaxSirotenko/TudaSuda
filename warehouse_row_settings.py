@@ -502,78 +502,163 @@ def _sync_offset_rows(model: dict[str, Any], row_numbers: set[str]) -> dict[str,
     return model
 
 
-def apply_row_settings_transaction(model: dict[str, Any], edited_rows: list[dict[str, Any]]) -> tuple[dict[str, Any], list[str]]:
+def apply_row_settings_transaction(
+    model: dict[str, Any],
+    edited_rows: list[dict[str, Any]],
+) -> tuple[dict[str, Any], list[str]]:
     original = copy.deepcopy(model)
+
     errors = _validate_edited_rows(model, edited_rows)
     if errors:
         return original, errors
+
     changed: list[str] = []
     changed_fields: dict[str, set[str]] = {}
-    edited_by_number = {_display(row.get("row_number")): row for row in edited_rows}
+
+    edited_by_number = {
+        _display(row.get("row_number")): row
+        for row in edited_rows
+    }
+
     candidate = copy.deepcopy(model)
-    rows_by_number = {_display(row.get("row_number")): row for row in candidate.get("rows", [])}
-    changed_fields: dict[str, set[str]] = {}
+
+    rows_by_number = {
+        _display(row.get("row_number")): row
+        for row in candidate.get("rows", [])
+    }
+
     for row_number, edited in edited_by_number.items():
         row = rows_by_number[row_number]
-        old = {field: row.get(field) for field in ["row_order", "cell_direction", "weight_zone", "row_storage_type", "deep_lane_width", "row_group", "side", "comment", "top_offset_cells", "bottom_offset_cells"]}
+
+        old = {
+            field: row.get(field)
+            for field in [
+                "row_order",
+                "cell_direction",
+                "weight_zone",
+                "row_storage_type",
+                "deep_lane_width",
+                "row_group",
+                "side",
+                "comment",
+                "top_offset_cells",
+                "bottom_offset_cells",
+            ]
+        }
+
         storage = edited.get("row_storage_type", "normal")
-        capacity = int(_float(edited.get("cell_capacity_pallets"), 1)) if storage == "deep_lane" else 1
-        new = {"row_order": _float(edited.get("row_order"), row.get("row_order", 0)), "cell_direction": edited.get("cell_direction", "bottom_to_top"), "weight_zone": edited.get("weight_zone", "unassigned"), "row_storage_type": storage, "deep_lane_width": capacity, "row_group": _display(edited.get("row_group")), "side": _display(edited.get("side")), "comment": _display(edited.get("comment")), "top_offset_cells": _offset_cells(edited.get("top_offset_cells")), "bottom_offset_cells": _offset_cells(edited.get("bottom_offset_cells"))}
-        effective_changes = {field for field in old if _comparison_value(field, old[field]) != _comparison_value(field, new[field])}
-        diff = [f"{field}: {old[field]} → {new[field]}" for field in old if field in effective_changes]
+
+        capacity = (
+            int(_float(edited.get("cell_capacity_pallets"), 1))
+            if storage == "deep_lane"
+            else 1
+        )
+
+        new = {
+            "row_order": _float(
+                edited.get("row_order"),
+                row.get("row_order", 0),
+            ),
+            "cell_direction": edited.get(
+                "cell_direction",
+                "bottom_to_top",
+            ),
+            "weight_zone": edited.get(
+                "weight_zone",
+                "unassigned",
+            ),
+            "row_storage_type": storage,
+            "deep_lane_width": capacity,
+            "row_group": _display(edited.get("row_group")),
+            "side": _display(edited.get("side")),
+            "comment": _display(edited.get("comment")),
+            "top_offset_cells": _offset_cells(
+                edited.get("top_offset_cells")
+            ),
+            "bottom_offset_cells": _offset_cells(
+                edited.get("bottom_offset_cells")
+            ),
+        }
+
+        effective_changes = {
+            field
+            for field in old
+            if _comparison_value(field, old[field])
+            != _comparison_value(field, new[field])
+        }
+
+        diff = [
+            f"{field}: {old[field]} → {new[field]}"
+            for field in old
+            if field in effective_changes
+        ]
+
         if diff:
             row.update(new)
             changed_fields[row_number] = effective_changes
-            changed.append(f"Ряд {row_number}: " + "; ".join(diff))
-    offset_fields = {"top_offset_cells", "bottom_offset_cells"}
-    offsets_only = bool(changed_fields) and all(fields <= offset_fields for fields in changed_fields.values())
-    if offsets_only:
-        _sync_offset_rows(candidate, set(changed_fields))
-    else:
-        sync_row_settings_to_model(candidate)
-    if candidate.get("cross_aisles") and not offsets_only:
-        from warehouse_cross_aisles import apply_cross_aisles_transaction
-
-        cross_draft = [
-            {field: aisle.get(field) for field in ("row_number", "after_cell_number", "width_cells", "comment")}
-            for aisle in candidate["cross_aisles"]
-        ]
-        candidate, cross_errors = apply_cross_aisles_transaction(candidate, cross_draft)
-        if cross_errors:
-            return original, cross_errors
-    if not changed_fields:
-    return original, ["Изменений нет."]
-
-offsets_only = all(
-    fields <= OFFSET_FIELDS
-    for fields in changed_fields.values()
-)
-
-if offsets_only:
-    _sync_offset_rows(candidate, set(changed_fields))
-else:
-    sync_row_settings_to_model(candidate)
-
-if candidate.get("cross_aisles") and not offsets_only:
-    from warehouse_cross_aisles import apply_cross_aisles_transaction
-
-    cross_draft = [
-        {
-            field: aisle.get(field)
-            for field in (
-                "row_number",
-                "after_cell_number",
-                "width_cells",
-                "comment",
+            changed.append(
+                f"Ряд {row_number}: " + "; ".join(diff)
             )
-        }
-        for aisle in candidate["cross_aisles"]
-    ]
 
-    candidate, cross_errors = apply_cross_aisles_transaction(
-        candidate,
-        cross_draft,
+    if not changed_fields:
+        return original, ["Изменений нет."]
+
+    offsets_only = all(
+        fields <= OFFSET_FIELDS
+        for fields in changed_fields.values()
     )
 
-    if cross_errors:
-        return original, cross_errors
+    if offsets_only:
+        _sync_offset_rows(
+            candidate,
+            set(changed_fields),
+        )
+    else:
+        sync_row_settings_to_model(candidate)
+
+    if candidate.get("cross_aisles") and not offsets_only:
+        from warehouse_cross_aisles import (
+            apply_cross_aisles_transaction,
+        )
+
+        cross_draft = [
+            {
+                field: aisle.get(field)
+                for field in (
+                    "row_number",
+                    "after_cell_number",
+                    "width_cells",
+                    "comment",
+                )
+            }
+            for aisle in candidate["cross_aisles"]
+        ]
+
+        candidate, cross_errors = (
+            apply_cross_aisles_transaction(
+                candidate,
+                cross_draft,
+            )
+        )
+
+        if cross_errors:
+            return original, cross_errors
+
+    for row in candidate.get("rows", []):
+        row_number = _display(row.get("row_number"))
+
+        if _has_intersection(
+            candidate,
+            row_number,
+            _float(row.get("x_min")),
+            _float(row.get("x_max")),
+            _float(row.get("y_min")),
+            _float(row.get("y_max")),
+        ):
+            return original, [
+                "Ошибка: недостаточно места для расширения "
+                "набивного ряда. Переместите соседние ряды "
+                "или увеличьте расстояние между ними."
+            ]
+
+    return candidate, changed
