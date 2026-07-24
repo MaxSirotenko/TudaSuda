@@ -29,9 +29,32 @@ def _float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+OFFSET_FIELDS = {"top_offset_cells", "bottom_offset_cells"}
+DISPLAY_FIELDS = {"row_group", "side", "comment"}
+
+
 def _offset_cells(value: Any) -> int:
-    """Treat every representation of an empty/zero offset identically."""
-    return int(_float(value, 0.0))
+    """Return the effective integer offset used by row geometry."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return 0
+    try:
+        if pd.isna(value):
+            return 0
+    except (TypeError, ValueError):
+        pass
+    return int(_float(value, 0))
+
+
+def _comparison_value(field: str, value: Any) -> Any:
+    if field in OFFSET_FIELDS:
+        return _offset_cells(value)
+    if field in DISPLAY_FIELDS:
+        return _display(value)
+    return value
+
+
+def _effective_row(row: dict[str, Any]) -> dict[str, Any]:
+    return {field: _comparison_value(field, value) for field, value in row.items()}
 
 
 def _cell_key(cell: dict[str, Any]) -> str:
@@ -106,7 +129,8 @@ def changed_row_numbers(state: dict[str, Any]) -> list[str]:
     changed = []
     for row in state.get("draft", []):
         row_number = _display(row.get("row_number"))
-        if row != baseline.get(row_number):
+        baseline_row = baseline.get(row_number)
+        if baseline_row is None or _effective_row(row) != _effective_row(baseline_row):
             changed.append(row_number)
     return changed
 
@@ -336,6 +360,9 @@ def _validate_edited_rows(model: dict[str, Any], edited_rows: list[dict[str, Any
         ):
             raw = edited.get(field, 0)
 
+            if raw is None or (isinstance(raw, str) and not raw.strip()) or pd.isna(raw):
+                raw = 0
+
             try:
                 value = float(str(raw).replace(",", "."))
 
@@ -426,20 +453,53 @@ def sync_row_settings_to_model(model: dict[str, Any]) -> dict[str, Any]:
     return model
 
 
-def _sync_offset_rows(model: dict[str, Any], row_numbers: set[str]) -> None:
-    """Rebuild vertical geometry only for rows whose offsets changed."""
-    rows = {_display(row.get("row_number")): row for row in model.get("rows", [])}
+def _sync_offset_rows(model: dict[str, Any], row_numbers: set[str]) -> dict[str, Any]:
+    """Relayout only rows whose effective offsets changed."""
+    rows = {
+        _display(row.get("row_number")): row
+        for row in model.get("rows", [])
+    }
+
+    for row_number, row in rows.items():
+        row["top_offset_cells"] = _offset_cells(
+            row.get("top_offset_cells")
+        )
+        row["bottom_offset_cells"] = _offset_cells(
+            row.get("bottom_offset_cells")
+        )
+        row.setdefault("top_offset_m", 0.0)
+        row.setdefault("bottom_offset_m", 0.0)
+        row.setdefault(
+            "cells_count",
+            sum(
+                _display(cell.get("row_number")) == row_number
+                for cell in model.get("cells", [])
+            ),
+        )
+
     for row_number in row_numbers:
         row = rows[row_number]
+
         for collection in ("cells", "base_cells"):
-            cells = [cell for cell in model.get(collection, []) if _display(cell.get("row_number")) == row_number]
+            cells = [
+                cell
+                for cell in model.get(collection, [])
+                if _display(cell.get("row_number")) == row_number
+            ]
             _apply_row_y_layout(model, row, cells)
+
     if model.get("cross_aisles"):
         from warehouse_cross_aisles import relayout_cross_aisle_rows
 
         relayout_cross_aisle_rows(model, row_numbers)
-    model["row_settings"] = [{field: row.get(field, "") for field in SYNC_FIELDS} for row in model.get("rows", [])]
+
+    model["row_settings"] = [
+        {field: row.get(field, "") for field in SYNC_FIELDS}
+        for row in model.get("rows", [])
+    ]
+
     _refresh_navigation(model)
+    return model
 
 
 def apply_row_settings_transaction(model: dict[str, Any], edited_rows: list[dict[str, Any]]) -> tuple[dict[str, Any], list[str]]:
@@ -448,6 +508,7 @@ def apply_row_settings_transaction(model: dict[str, Any], edited_rows: list[dict
     if errors:
         return original, errors
     changed: list[str] = []
+    changed_fields: dict[str, set[str]] = {}
     edited_by_number = {_display(row.get("row_number")): row for row in edited_rows}
     candidate = copy.deepcopy(model)
     rows_by_number = {_display(row.get("row_number")): row for row in candidate.get("rows", [])}
@@ -457,18 +518,12 @@ def apply_row_settings_transaction(model: dict[str, Any], edited_rows: list[dict
         old = {field: row.get(field) for field in ["row_order", "cell_direction", "weight_zone", "row_storage_type", "deep_lane_width", "row_group", "side", "comment", "top_offset_cells", "bottom_offset_cells"]}
         storage = edited.get("row_storage_type", "normal")
         capacity = int(_float(edited.get("cell_capacity_pallets"), 1)) if storage == "deep_lane" else 1
-        row.update({"row_order": _float(edited.get("row_order"), row.get("row_order", 0)), "cell_direction": edited.get("cell_direction", "bottom_to_top"), "weight_zone": edited.get("weight_zone", "unassigned"), "row_storage_type": storage, "deep_lane_width": capacity, "row_group": _display(edited.get("row_group")), "side": _display(edited.get("side")), "comment": _display(edited.get("comment")), "top_offset_cells": int(_float(edited.get("top_offset_cells"), 0)), "bottom_offset_cells": int(_float(edited.get("bottom_offset_cells"), 0))})
-        new = {field: row.get(field) for field in old}
-        comparable_old = dict(old)
-        comparable_new = dict(new)
-        for field in ("top_offset_cells", "bottom_offset_cells"):
-            comparable_old[field] = _offset_cells(comparable_old[field])
-            comparable_new[field] = _offset_cells(comparable_new[field])
-        fields = {field for field in old if comparable_old[field] != comparable_new[field]}
-        if fields:
-            changed_fields[row_number] = fields
-        diff = [f"{field}: {old[field]} → {new[field]}" for field in old if field in fields]
+        new = {"row_order": _float(edited.get("row_order"), row.get("row_order", 0)), "cell_direction": edited.get("cell_direction", "bottom_to_top"), "weight_zone": edited.get("weight_zone", "unassigned"), "row_storage_type": storage, "deep_lane_width": capacity, "row_group": _display(edited.get("row_group")), "side": _display(edited.get("side")), "comment": _display(edited.get("comment")), "top_offset_cells": _offset_cells(edited.get("top_offset_cells")), "bottom_offset_cells": _offset_cells(edited.get("bottom_offset_cells"))}
+        effective_changes = {field for field in old if _comparison_value(field, old[field]) != _comparison_value(field, new[field])}
+        diff = [f"{field}: {old[field]} → {new[field]}" for field in old if field in effective_changes]
         if diff:
+            row.update(new)
+            changed_fields[row_number] = effective_changes
             changed.append(f"Ряд {row_number}: " + "; ".join(diff))
     offset_fields = {"top_offset_cells", "bottom_offset_cells"}
     offsets_only = bool(changed_fields) and all(fields <= offset_fields for fields in changed_fields.values())
@@ -486,8 +541,39 @@ def apply_row_settings_transaction(model: dict[str, Any], edited_rows: list[dict
         candidate, cross_errors = apply_cross_aisles_transaction(candidate, cross_draft)
         if cross_errors:
             return original, cross_errors
-    for row in candidate.get("rows", []):
-        row_number = _display(row.get("row_number"))
-        if _has_intersection(candidate, row_number, _float(row.get("x_min")), _float(row.get("x_max")), _float(row.get("y_min")), _float(row.get("y_max"))):
-            return original, ["Ошибка: недостаточно места для расширения набивного ряда. Переместите соседние ряды или увеличьте расстояние между ними."]
-    return candidate, changed or ["Изменений нет."]
+    if not changed_fields:
+    return original, ["Изменений нет."]
+
+offsets_only = all(
+    fields <= OFFSET_FIELDS
+    for fields in changed_fields.values()
+)
+
+if offsets_only:
+    _sync_offset_rows(candidate, set(changed_fields))
+else:
+    sync_row_settings_to_model(candidate)
+
+if candidate.get("cross_aisles") and not offsets_only:
+    from warehouse_cross_aisles import apply_cross_aisles_transaction
+
+    cross_draft = [
+        {
+            field: aisle.get(field)
+            for field in (
+                "row_number",
+                "after_cell_number",
+                "width_cells",
+                "comment",
+            )
+        }
+        for aisle in candidate["cross_aisles"]
+    ]
+
+    candidate, cross_errors = apply_cross_aisles_transaction(
+        candidate,
+        cross_draft,
+    )
+
+    if cross_errors:
+        return original, cross_errors

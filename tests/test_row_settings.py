@@ -469,11 +469,52 @@ def test_apply_transaction_runs_geometry_sync_once(monkeypatch):
 
     monkeypatch.setattr(row_settings, "sync_row_settings_to_model", counted_sync)
     model = _model()
-    updated, messages = row_settings.apply_row_settings_transaction(model, _edited(model))
+    edited = _edited(model)
+    edited[0]["weight_zone"] = "heavy"
+    updated, messages = row_settings.apply_row_settings_transaction(model, edited)
 
     assert updated["rows"]
     assert not any(message.startswith("Ошибка:") for message in messages)
     assert calls == 1
+
+
+@pytest.mark.parametrize("baseline_offset", [None, "", float("nan")])
+@pytest.mark.parametrize("draft_offset", [0, 0.0, "0"])
+def test_changed_rows_normalizes_effective_zero_offsets(baseline_offset, draft_offset):
+    state = create_row_settings_state(_model())
+    state["baseline"][0]["top_offset_cells"] = baseline_offset
+    state["draft"][0]["top_offset_cells"] = draft_offset
+
+    assert changed_row_numbers(state) == []
+
+
+def test_single_offset_edit_changes_only_target_row_geometry():
+    model = _model()
+    model["rows"][0].update({"top_offset_cells": None, "bottom_offset_cells": None})
+    model["rows"][1].update({"top_offset_cells": None, "bottom_offset_cells": None})
+    original = copy.deepcopy(model)
+    state = create_row_settings_state(model)
+    edited = copy.deepcopy(state["draft"])
+    next(row for row in edited if row["row_number"] == "153")["bottom_offset_cells"] = 5
+    state = update_row_settings_state(state, edited)
+
+    assert changed_row_numbers(state) == ["153"]
+    assert model == original
+
+    updated, messages = apply_row_settings_transaction(model, state["draft"])
+
+    assert len(messages) == 1
+    assert messages[0].startswith("Ряд 153:")
+    protected = ("x_min", "x_max", "y_min", "y_max", "y_center", "cell_key", "cell_number", "placements")
+    before_152 = [cell for cell in original["cells"] if cell["row_number"] == "152"]
+    after_152 = [cell for cell in updated["cells"] if cell["row_number"] == "152"]
+    for before, after in zip(before_152, after_152):
+        assert {field: before.get(field) for field in protected} == {field: after.get(field) for field in protected}
+    before_153 = [cell for cell in original["cells"] if cell["row_number"] == "153"]
+    after_153 = [cell for cell in updated["cells"] if cell["row_number"] == "153"]
+    assert next(row for row in updated["rows"] if row["row_number"] == "153")["y_max"] == 8
+    assert [(cell["x_min"], cell["x_max"]) for cell in after_153] == [(cell["x_min"], cell["x_max"]) for cell in before_153]
+    assert updated["placements"] == original["placements"]
 
 
 def test_invalid_order_rolls_back_entire_draft():

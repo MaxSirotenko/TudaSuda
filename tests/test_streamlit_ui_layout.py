@@ -24,6 +24,14 @@ def test_geometry_mode_has_dedicated_settings_tab():
     assert "render_service_tab(saved_model, model)" in body
 
 
+def test_geometry_screen_loads_applied_model_without_row_settings_sync():
+    body = _function_source("render_excel_geometry_warehouse")
+
+    assert "saved_model = load_geometry_model()" in body
+    assert "sync_row_settings_to_model" not in body
+    assert 'st.session_state["geometry_model"] = saved_model' in body
+
+
 def test_row_and_zone_settings_are_separate_from_map_view():
     map_body = _function_source("render_warehouse_map_tab")
     body = _function_source("render_warehouse_settings_tab")
