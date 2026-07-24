@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import math
 from typing import Any
 
 import pandas as pd
@@ -22,9 +23,15 @@ def _float(value: Any, default: float = 0.0) -> float:
     try:
         if value is None or str(value).strip() == "":
             return default
-        return float(str(value).replace(",", "."))
+        result = float(str(value).replace(",", "."))
+        return result if math.isfinite(result) else default
     except (TypeError, ValueError):
         return default
+
+
+def _offset_cells(value: Any) -> int:
+    """Treat every representation of an empty/zero offset identically."""
+    return int(_float(value, 0.0))
 
 
 def _cell_key(cell: dict[str, Any]) -> str:
@@ -58,8 +65,8 @@ def build_row_settings_draft(model: dict[str, Any]) -> pd.DataFrame:
             "cell_capacity_pallets": cell_capacity,
             "cells_count": len(row_cells) or int(_float(row.get("cells_count"), 0)),
             "row_capacity_pallets": (len(row_cells) or int(_float(row.get("cells_count"), 0))) * cell_capacity,
-            "top_offset_cells": int(_float(row.get("top_offset_cells") if row.get("top_offset_cells") not in {None, ""} else _row_fallback(model, row_number, "top_offset_cells", 0), 0)),
-            "bottom_offset_cells": int(_float(row.get("bottom_offset_cells") if row.get("bottom_offset_cells") not in {None, ""} else _row_fallback(model, row_number, "bottom_offset_cells", 0), 0)),
+            "top_offset_cells": _offset_cells(row.get("top_offset_cells") if row.get("top_offset_cells") not in {None, ""} else _row_fallback(model, row_number, "top_offset_cells", 0)),
+            "bottom_offset_cells": _offset_cells(row.get("bottom_offset_cells") if row.get("bottom_offset_cells") not in {None, ""} else _row_fallback(model, row_number, "bottom_offset_cells", 0)),
             "row_group": row.get("row_group") or _row_fallback(model, row_number, "row_group", ""),
             "side": row.get("side") or _row_fallback(model, row_number, "side", ""),
             "comment": row.get("comment") or _row_fallback(model, row_number, "comment", ""),
@@ -419,6 +426,22 @@ def sync_row_settings_to_model(model: dict[str, Any]) -> dict[str, Any]:
     return model
 
 
+def _sync_offset_rows(model: dict[str, Any], row_numbers: set[str]) -> None:
+    """Rebuild vertical geometry only for rows whose offsets changed."""
+    rows = {_display(row.get("row_number")): row for row in model.get("rows", [])}
+    for row_number in row_numbers:
+        row = rows[row_number]
+        for collection in ("cells", "base_cells"):
+            cells = [cell for cell in model.get(collection, []) if _display(cell.get("row_number")) == row_number]
+            _apply_row_y_layout(model, row, cells)
+    if model.get("cross_aisles"):
+        from warehouse_cross_aisles import relayout_cross_aisle_rows
+
+        relayout_cross_aisle_rows(model, row_numbers)
+    model["row_settings"] = [{field: row.get(field, "") for field in SYNC_FIELDS} for row in model.get("rows", [])]
+    _refresh_navigation(model)
+
+
 def apply_row_settings_transaction(model: dict[str, Any], edited_rows: list[dict[str, Any]]) -> tuple[dict[str, Any], list[str]]:
     original = copy.deepcopy(model)
     errors = _validate_edited_rows(model, edited_rows)
@@ -428,6 +451,7 @@ def apply_row_settings_transaction(model: dict[str, Any], edited_rows: list[dict
     edited_by_number = {_display(row.get("row_number")): row for row in edited_rows}
     candidate = copy.deepcopy(model)
     rows_by_number = {_display(row.get("row_number")): row for row in candidate.get("rows", [])}
+    changed_fields: dict[str, set[str]] = {}
     for row_number, edited in edited_by_number.items():
         row = rows_by_number[row_number]
         old = {field: row.get(field) for field in ["row_order", "cell_direction", "weight_zone", "row_storage_type", "deep_lane_width", "row_group", "side", "comment", "top_offset_cells", "bottom_offset_cells"]}
@@ -435,11 +459,24 @@ def apply_row_settings_transaction(model: dict[str, Any], edited_rows: list[dict
         capacity = int(_float(edited.get("cell_capacity_pallets"), 1)) if storage == "deep_lane" else 1
         row.update({"row_order": _float(edited.get("row_order"), row.get("row_order", 0)), "cell_direction": edited.get("cell_direction", "bottom_to_top"), "weight_zone": edited.get("weight_zone", "unassigned"), "row_storage_type": storage, "deep_lane_width": capacity, "row_group": _display(edited.get("row_group")), "side": _display(edited.get("side")), "comment": _display(edited.get("comment")), "top_offset_cells": int(_float(edited.get("top_offset_cells"), 0)), "bottom_offset_cells": int(_float(edited.get("bottom_offset_cells"), 0))})
         new = {field: row.get(field) for field in old}
-        diff = [f"{field}: {old[field]} → {new[field]}" for field in old if old[field] != new[field]]
+        comparable_old = dict(old)
+        comparable_new = dict(new)
+        for field in ("top_offset_cells", "bottom_offset_cells"):
+            comparable_old[field] = _offset_cells(comparable_old[field])
+            comparable_new[field] = _offset_cells(comparable_new[field])
+        fields = {field for field in old if comparable_old[field] != comparable_new[field]}
+        if fields:
+            changed_fields[row_number] = fields
+        diff = [f"{field}: {old[field]} → {new[field]}" for field in old if field in fields]
         if diff:
             changed.append(f"Ряд {row_number}: " + "; ".join(diff))
-    sync_row_settings_to_model(candidate)
-    if candidate.get("cross_aisles"):
+    offset_fields = {"top_offset_cells", "bottom_offset_cells"}
+    offsets_only = bool(changed_fields) and all(fields <= offset_fields for fields in changed_fields.values())
+    if offsets_only:
+        _sync_offset_rows(candidate, set(changed_fields))
+    else:
+        sync_row_settings_to_model(candidate)
+    if candidate.get("cross_aisles") and not offsets_only:
         from warehouse_cross_aisles import apply_cross_aisles_transaction
 
         cross_draft = [

@@ -166,6 +166,22 @@ def _refresh_cross_navigation(model: dict[str, Any]) -> None:
     model["navigation_nodes"], model["navigation_edges"] = nodes, edges
 
 
+def relayout_cross_aisle_rows(model: dict[str, Any], row_numbers: set[str]) -> None:
+    """Reapply saved cross-aisle gaps without touching unrelated rows."""
+    rows = {_text(row.get("row_number")): row for row in model.get("rows", [])}
+    aisles_by_row: dict[str, list[dict[str, Any]]] = {}
+    for aisle in model.get("cross_aisles", []):
+        aisles_by_row.setdefault(_text(aisle.get("row_number")), []).append(aisle)
+    for row_number in row_numbers:
+        row = rows.get(row_number)
+        if row is None:
+            continue
+        aisles = aisles_by_row.get(row_number, [])
+        _layout_collection(model, row, aisles, "cells")
+        _layout_collection(model, row, aisles, "base_cells")
+    _refresh_cross_navigation(model)
+
+
 def apply_cross_aisles_transaction(model: dict[str, Any], draft: list[dict[str, Any]]) -> tuple[dict[str, Any], list[str]]:
     """Validate all records and atomically rebuild geometry exactly once."""
     normalized, errors = validate_cross_aisles(model, draft)
