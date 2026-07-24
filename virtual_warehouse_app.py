@@ -30,6 +30,12 @@ from warehouse_performance import (
     measure_step,
     start_performance_run,
 )
+from warehouse_revisions import (
+    REVISION_DOMAINS,
+    bump_revisions,
+    load_revision_state,
+    resolve_model_id,
+)
 from warehouse_geometry_model import (
     GeometrySettings,
     append_manual_change,
@@ -172,6 +178,40 @@ DEFAULT_RENDER_COLOR_SETTINGS = {
     "deep_lane_partial_color": "#A5D6A7",
     "deep_lane_full_color": "#66BB6A",
 }
+
+
+def update_data_revisions(model: dict | object | None, domains: list[str], reason: str) -> bool:
+    """Record a completed business operation, reporting persistence failures to UI."""
+    try:
+        with measure_step("revision_update", metadata={"domains": domains, "reason": reason}):
+            bump_revisions(resolve_model_id(model), domains, reason=reason)
+        return True
+    except OSError as exc:
+        st.error(
+            "Данные сохранены, но ревизия кеша не обновилась. Исправьте доступ к "
+            f"data_revisions.json и повторите операцию или перезапустите приложение: {exc}"
+        )
+        return False
+
+
+def render_data_revisions(model: dict | object | None) -> None:
+    """Render side-effect-free revision diagnostics in the service section."""
+    state = load_revision_state(resolve_model_id(model))
+    st.subheader("Ревизии данных")
+    if state.get("warning"):
+        st.warning(state["warning"])
+    st.dataframe(
+        pd.DataFrame(
+            [{"Домен": domain, "Ревизия": state["revisions"][domain]} for domain in REVISION_DOMAINS]
+        ),
+        use_container_width=True,
+        hide_index=True,
+    )
+    change = state.get("last_change", {})
+    st.caption(f"model_id: {state['model_id']}")
+    st.caption(f"Последнее изменение: {state.get('updated_at') or '—'}")
+    st.caption(f"Причина: {change.get('reason') or '—'}")
+    st.caption(f"Домены последней операции: {', '.join(change.get('domains', [])) or '—'}")
 
 WEIGHT_ZONE_LABELS = {"heavy": "Тяжёлое", "medium": "Среднее", "light": "Лёгкое", "fragile": "Хрупкое", "unassigned": "Не назначено"}
 WEIGHT_ZONE_VALUES = list(WEIGHT_ZONE_LABELS)
@@ -423,23 +463,23 @@ def render_color_settings_editor(settings: dict) -> dict:
         b1, b2 = st.columns(2)
         if b1.button("Сохранить цвета", key="save_render_colors"):
             settings["colors"] = colors
-            save_render_settings(settings)
             st.success("Цвета карты сохранены.")
         if b2.button("Сбросить цвета по умолчанию", key="reset_render_colors"):
             colors = dict(DEFAULT_RENDER_COLOR_SETTINGS)
             settings["colors"] = colors
-            save_render_settings(settings)
             st.success("Цвета сброшены по умолчанию.")
-            st.rerun()
     settings["colors"] = colors
     return settings
 
 
 def render_map_settings_editor() -> dict:
     settings = load_render_settings()
+    saved_settings = copy.deepcopy(settings)
     settings = render_label_settings_editor(settings)
     settings = render_color_settings_editor(settings)
-    save_render_settings(settings)
+    if settings != saved_settings:
+        save_render_settings(settings)
+        update_data_revisions(st.session_state.get("geometry_model"), ["render_settings"], "save_render_settings")
     return settings
 
 
@@ -680,6 +720,8 @@ def render_manual_cell_editor(model: dict) -> None:
             else:
                 overrides = append_manual_change(model, "add", None, new_cell, comment.strip())
                 _save_model_after_manual_change(model, overrides)
+                if not update_data_revisions(model, ["geometry"], "manual_geometry_add"):
+                    return
                 st.success("Ячейка добавлена, координаты пересчитаны, модель сохранена.")
                 st.rerun()
 
@@ -728,6 +770,8 @@ def render_manual_cell_editor(model: dict) -> None:
                     else:
                         overrides = append_manual_change(model, "update", selected, new_value, edit_comment.strip())
                         _save_model_after_manual_change(model, overrides)
+                        if not update_data_revisions(model, ["geometry"], "manual_geometry_update"):
+                            return
                         st.success("Изменения сохранены, координаты пересчитаны.")
                         st.rerun()
                 if b2.button("Отменить", key="manual_edit_cancel"):
@@ -755,6 +799,8 @@ def render_manual_cell_editor(model: dict) -> None:
                 else:
                     overrides = append_manual_change(model, "delete", selected, None, delete_comment.strip())
                     _save_model_after_manual_change(model, overrides)
+                    if not update_data_revisions(model, ["geometry"], "manual_geometry_delete"):
+                        return
                     st.success("Ячейка удалена из модели, координаты пересчитаны.")
                     st.rerun()
 
@@ -853,6 +899,9 @@ def render_inventory_placement(model: dict) -> dict:
                         st.dataframe(pd.DataFrame(report.get("details", [])), use_container_width=True)
                     else:
                         save_placement_state(reconciled_state)
+                        domains = ["inventory"] + (["placements"] if reconciled_state != state else [])
+                        if not update_data_revisions(model, domains, "reconcile_inventory"):
+                            return model
                         st.session_state["placement_state"] = reconciled_state
                         st.session_state["last_inventory_reconciliation_report"] = report
                         summary = report.get("summary", {})
@@ -874,6 +923,8 @@ def render_inventory_placement(model: dict) -> dict:
                         st.error("Исправьте обязательные колонки перед импортом.")
                     else:
                         state, placement_import_diag = import_inventory(model, normalized_inventory, allow_replace=True)
+                        if not update_data_revisions(model, ["inventory", "placements"], "import_inventory"):
+                            return model
                         st.session_state["placement_state"] = state
                         st.success("Адресный инвент импортирован.")
                         st.dataframe(pd.DataFrame(placement_import_diag), use_container_width=True)
@@ -901,6 +952,8 @@ def render_inventory_placement(model: dict) -> dict:
         st.caption("Новый приход размещается кнопкой «Добавить приход на текущий склад» на предыдущем шаге. Здесь остаются только ручные операции с неразмещённым товаром.")
         if st.button("Разложить автоматически по складу", disabled=not unplaced, key="auto_place_inventory"):
             state, auto_diag = auto_place_unplaced(model, state, allow_mixed_sku_in_deep_lane=allow_mixed)
+            if not update_data_revisions(model, ["placements"], "auto_place_inventory"):
+                return model
             st.session_state["placement_state"] = state
             st.success("Автоматическое модельное размещение выполнено.")
             st.dataframe(pd.DataFrame(auto_diag), use_container_width=True)
@@ -923,6 +976,8 @@ def render_inventory_placement(model: dict) -> dict:
                 if error:
                     st.error(error)
                 else:
+                    if not update_data_revisions(model, ["placements"], "manual_place"):
+                        return model
                     st.session_state["placement_state"] = state
                     st.success("Товар размещён вручную, placements.json обновлён.")
                     st.rerun()
@@ -946,6 +1001,8 @@ def render_inventory_placement(model: dict) -> dict:
                 if error:
                     st.error(error)
                 else:
+                    if not update_data_revisions(model, ["placements"], "update_placement_qty"):
+                        return model
                     st.session_state["placement_state"] = state
                     st.success("Количество размещения изменено.")
                     st.rerun()
@@ -954,6 +1011,8 @@ def render_inventory_placement(model: dict) -> dict:
                 if error:
                     st.error(error)
                 else:
+                    if not update_data_revisions(model, ["placements"], "move_placement"):
+                        return model
                     st.session_state["placement_state"] = state
                     st.success("Размещение перенесено.")
                     st.rerun()
@@ -962,6 +1021,8 @@ def render_inventory_placement(model: dict) -> dict:
                 if error:
                     st.error(error)
                 else:
+                    if not update_data_revisions(model, ["placements"], "delete_placement"):
+                        return model
                     st.session_state["placement_state"] = state
                     st.success("Размещение удалено, товар возвращён в Без ячейки.")
                     st.rerun()
@@ -1282,6 +1343,8 @@ def render_receipts_section(model: dict) -> None:
                         return
                     new_state = make_receipts_state(model, receipt_file.name, receipt_hash, normalized_receipts, receipt_diagnostics, mapping, zone_settings)
                     save_receipts_state(new_state)
+                    if not update_data_revisions(model, ["receipts"], "save_receipts"):
+                        return
                     st.success("Приходы загружены и сохранены. Все строки имеют статус ‘Не размещено’.")
                     st.rerun()
 
@@ -1340,6 +1403,8 @@ def render_receipts_section(model: dict) -> None:
                     state["zone_classification_diagnostics"] = zone_diag
                     state["diagnostics"] = build_receipt_diagnostics(updated_receipts, len(updated_receipts))
                     save_receipts_state(state)
+                    if not update_data_revisions(model, ["receipts"], "calculate_receipt_zones"):
+                        return
                     st.success("Зоны товаров рассчитаны. Размещение будет использовать только рассчитанную зону, а исходная зона 1С останется для сравнения.")
                     st.rerun()
             _render_zone_classification_result(state)
@@ -1484,6 +1549,8 @@ def render_outbound_picking(model: dict) -> None:
                     "rows": normalized_rows,
                 }
                 save_outbound_orders(orders_state)
+                if not update_data_revisions(model, ["outbound"], "save_outbound_orders"):
+                    return
                 st.success(f"Загружено строк РО: {len(normalized_rows)}.")
                 st.rerun()
 
@@ -1514,6 +1581,8 @@ def render_outbound_picking(model: dict) -> None:
         save_placement_state(updated_placements)
         save_outbound_execution_state(updated_execution)
         save_outbound_execution_log(updated_log, model.get("model_id"))
+        if not update_data_revisions(model, ["placements", "outbound"], "execute_outbound_orders"):
+            return
         st.session_state["placement_state"] = updated_placements
         st.session_state["last_outbound_summary"] = summary
         st.success(f"Собрано юнитов: {summary.get('Собрано юнитов', 0)}; дефицит: {summary.get('Дефицит юнитов', 0)}.")
@@ -1528,6 +1597,8 @@ def render_outbound_picking(model: dict) -> None:
     if c3.button("Сбросить результаты сборки", disabled=not bool(execution_state.get("processed_orders")), key="outbound_reset"):
         restored, result = reset_outbound_execution(model)
         if result["success"]:
+            if not update_data_revisions(model, ["placements", "outbound"], "reset_outbound_execution"):
+                return
             st.session_state["placement_state"] = restored
             st.success(result["message"])
             st.rerun()
@@ -1723,6 +1794,7 @@ def render_analytics_fragment(model: dict | None) -> None:
 
 
 def render_service_tab(saved_model: dict | None, model: dict | None) -> None:
+    render_data_revisions(model or saved_model)
     st.subheader("Производительность")
     enabled = st.toggle(
         "Включить измерение производительности",
@@ -1804,8 +1876,13 @@ def render_service_tab(saved_model: dict | None, model: dict | None) -> None:
             save_placement_state(state)
             st.success("Журнал размещения очищен.")
         if st.button("Очистить загруженный приход", key="receipt_clear_button"):
-            clear_receipts_state()
-            st.success("Загруженный приход очищен.")
+            receipts_state, _ = load_receipts_state(model or {})
+            if receipts_state.get("receipts"):
+                clear_receipts_state()
+                if update_data_revisions(model, ["receipts"], "clear_receipts"):
+                    st.success("Загруженный приход очищен.")
+            else:
+                st.info("Загруженных приходов нет — изменения не требуются.")
         reset_confirm = st.checkbox("Подтверждаю полный сброс проекта", key="service_full_reset_confirm")
         if st.button("Полный сброс проекта", disabled=not reset_confirm, key="geometry_clear_saved"):
             for path in [MODEL_PATH, META_PATH]:
@@ -2312,6 +2389,8 @@ def render_unified_row_settings_editor(model: dict) -> dict:
         set_base_boundaries_from_current_rows(updated_model)
         with measure_step("save_geometry_model"):
             save_geometry_model(updated_model)
+        if not update_data_revisions(model, ["geometry"], "apply_row_settings"):
+            return model
         invalidate_geometry_render_cache()
         st.session_state["geometry_model"] = updated_model
         st.session_state[state_key] = create_row_settings_state(updated_model)
@@ -2384,6 +2463,8 @@ def render_cross_aisle_settings_editor(model: dict) -> dict:
             return model
         with measure_step("save_geometry_model"):
             save_geometry_model(updated_model)
+        if not update_data_revisions(model, ["geometry"], "apply_cross_aisles"):
+            return model
         invalidate_geometry_render_cache()
         st.session_state["geometry_model"] = updated_model
         st.session_state[state_key] = create_cross_aisle_settings_state(updated_model)
@@ -2538,6 +2619,8 @@ def _save_map_edit_snapshot(model: dict) -> None:
 
 def _persist_map_edit(model: dict, message: str) -> None:
     save_geometry_model(model)
+    if not update_data_revisions(model, ["geometry"], "manual_map_edit"):
+        return
     invalidate_geometry_render_cache()
     st.session_state["geometry_model"] = model
     st.success(message)
@@ -2969,6 +3052,9 @@ def render_virtual_warehouse_excel() -> None:
             timings["save_model_seconds"] = save_last_import(model, render_cache, meta)
             meta["performance"] = timings
             write_json_atomic(META_PATH, meta)
+            revision_domains = ["geometry"] + (["placements"] if placement_file is not None else [])
+            if not update_data_revisions(model_to_dict(model), revision_domains, "load_new_model"):
+                return
             st.session_state["virtual_warehouse_model"] = model
             st.session_state["virtual_warehouse_render_cache"] = render_cache
             st.session_state["virtual_warehouse_meta"] = meta
