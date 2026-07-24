@@ -22,6 +22,14 @@ from warehouse_excel_parser import parse_warehouse_excel
 from warehouse_model import WarehouseCell, WarehouseModel, WarehouseRow, WarehouseSheet
 from warehouse_placement import apply_cell_addresses, apply_placements, import_cell_addresses, import_placements
 from warehouse_visualization import build_virtual_warehouse_html, prepare_render_cache
+from warehouse_performance import (
+    clear_performance_history,
+    finish_performance_run,
+    is_performance_enabled,
+    load_latest_performance_run,
+    measure_step,
+    start_performance_run,
+)
 from warehouse_geometry_model import (
     GeometrySettings,
     append_manual_change,
@@ -769,7 +777,8 @@ def render_manual_cell_editor(model: dict) -> None:
 def render_inventory_placement(model: dict) -> dict:
     st.subheader("Инвентаризация")
     st.caption("Загрузите инвент на конец дня, проверьте строки и зафиксируйте фактический переходящий остаток без перемещения сохранённых SKU.")
-    state, state_warning = load_placement_state(model)
+    with measure_step("load_inventory_state"):
+        state, state_warning = load_placement_state(model)
     if state_warning:
         st.warning(state_warning)
     settings = state.setdefault("settings", {"allow_mixed_sku_in_deep_lane": False})
@@ -963,7 +972,8 @@ def _metric_grid(metrics: dict[str, object], columns: int = 5) -> None:
 def render_placement_diagnostics_section(model: dict, state: dict) -> None:
     st.subheader("Диагностика размещения")
     st.caption("Раздел анализирует текущие warehouse_model.json, placements.json и receipts.json. Открытие диагностики не запускает размещение и не изменяет сохранённые файлы.")
-    receipts_state, receipts_warning = load_receipts_state(model)
+    with measure_step("load_receipts"):
+        receipts_state, receipts_warning = load_receipts_state(model)
     if receipts_warning:
         st.warning(receipts_warning)
         receipts_state = {"receipts": []}
@@ -1384,8 +1394,10 @@ def render_receipts_section(model: dict) -> None:
 
 
 def _current_warehouse_state(model: dict) -> None:
-    placement_state, _ = load_placement_state(model)
-    receipts_state, _ = load_receipts_state(model)
+    with measure_step("load_placements"):
+        placement_state, _ = load_placement_state(model)
+    with measure_step("load_receipts"):
+        receipts_state, _ = load_receipts_state(model)
     placements = placement_state.get("placements", [])
     unplaced = placement_state.get("unplaced_inventory", [])
     carryover = [item for item in placements if item.get("source") == "inventory_carryover"]
@@ -1412,9 +1424,10 @@ def _current_warehouse_state(model: dict) -> None:
 
 
 def render_outbound_picking(model: dict) -> None:
-    orders_state = load_outbound_orders(model)
-    execution_state = load_outbound_execution_state(model)
-    execution_log = load_outbound_execution_log(model)
+    with measure_step("load_outbound_state"):
+        orders_state = load_outbound_orders(model)
+        execution_state = load_outbound_execution_state(model)
+        execution_log = load_outbound_execution_log(model)
     rows = orders_state.get("rows", [])
     st.caption("Сборка выполняется последовательно в целых qty_units. Вес, масса и весовые коэффициенты не используются.")
     uploaded = st.file_uploader("Excel с расходными ордерами", type=["xlsx"], key="outbound_orders_upload")
@@ -1597,6 +1610,41 @@ def render_analytics_tab(model: dict | None) -> None:
 
 
 def render_service_tab(saved_model: dict | None, model: dict | None) -> None:
+    st.subheader("Производительность")
+    enabled = st.toggle(
+        "Включить измерение производительности",
+        value=bool(st.session_state.get("performance_enabled", False)),
+        key="performance_enabled",
+    )
+    if enabled:
+        st.caption("Результаты текущего измерения появятся после следующего rerun.")
+    else:
+        st.caption("Профилирование выключено. Его также можно включить через WAREHOUSE_PERF=1.")
+    if st.button("Очистить историю измерений", key="performance_clear_history"):
+        clear_performance_history()
+        st.success("История измерений очищена.")
+    latest_run = load_latest_performance_run()
+    if latest_run:
+        steps = sorted(latest_run.get("steps", []), key=lambda item: item.get("duration_ms", 0), reverse=True)
+        metrics = st.columns(5)
+        metrics[0].metric("Тип запуска", "Холодный" if latest_run.get("is_cold_start") else "Повторный")
+        metrics[1].metric("Общее время", f"{float(latest_run.get('total_duration_ms') or 0):.1f} мс")
+        metrics[2].metric("Пиковая память", f"{float(latest_run.get('peak_traced_memory_mb') or 0):.1f} МБ")
+        metrics[3].metric("Статус", latest_run.get("status", "—"))
+        metrics[4].metric("Этапов", len(steps))
+        st.caption("Пять самых медленных этапов: " + ", ".join(item.get("name", "—") for item in steps[:5]))
+        total_ms = float(latest_run.get("total_duration_ms") or 0)
+        rows = [{
+            "Этап": item.get("name"),
+            "Время, мс": round(float(item.get("duration_ms") or 0), 3),
+            "Доля общего времени, %": round(float(item.get("duration_ms") or 0) * 100 / total_ms, 2) if total_ms else 0,
+            "Количество вызовов": item.get("call_count", 1),
+            "Метаданные": json.dumps(item.get("metadata") or {}, ensure_ascii=False),
+        } for item in steps]
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("Сохранённых измерений пока нет.")
+
     st.subheader("Загрузка и замена схемы склада")
     render_geometry_constructor_tab(saved_model, show_active_model=False)
     model = st.session_state.get("geometry_model", model)
@@ -1663,7 +1711,8 @@ def render_service_tab(saved_model: dict | None, model: dict | None) -> None:
 def render_excel_geometry_warehouse() -> None:
     st.title("Симулятор скорости сборки")
     st.caption("Рабочий процесс: настройте склад на карте, добавьте приход, зафиксируйте инвент и проверьте результат в аналитике.")
-    saved_model = load_geometry_model()
+    with measure_step("load_geometry_model"):
+        saved_model = load_geometry_model()
     if saved_model and "geometry_model" not in st.session_state:
         st.session_state["geometry_model"] = saved_model
     model = st.session_state.get("geometry_model")
@@ -1824,10 +1873,12 @@ def render_geometry_constructor_tab(saved_model: dict | None, *, show_active_mod
         st.session_state.pop("placement_state", None)
         st.warning("Загружен новый Excel. Старые ручные изменения, настройки набивных рядов и размещение товара сброшены для новой модели.")
         save_started = perf_counter()
-        save_geometry_model(model)
+        with measure_step("save_geometry_model"):
+            save_geometry_model(model)
         timings["save_model_seconds"] = perf_counter() - save_started
         model["performance"] = timings | model.get("performance", {})
-        save_geometry_model(model)
+        with measure_step("save_geometry_model"):
+            save_geometry_model(model)
         st.session_state["geometry_model"] = model
         st.success(f"Геометрическая модель построена и сохранена: {len(model['rows'])} рядов, {len(model['cells'])} ячеек, {len(model['aisles'])} проездов.")
 
@@ -2122,14 +2173,16 @@ def render_unified_row_settings_editor(model: dict) -> dict:
     if apply_submit:
         st.session_state[state_key] = submitted_state
         edited_rows = submitted_state["draft"]
-        updated_model, messages = apply_row_settings_transaction(model, edited_rows)
+        with measure_step("apply_row_settings"):
+            updated_model, messages = apply_row_settings_transaction(model, edited_rows)
         if any(str(message).startswith("Ошибка:") for message in messages):
             st.error("Изменения рядов не применены. Модель полностью оставлена без изменений.")
             st.write(messages)
             st.session_state["apply_state"] = {"status": "error", "messages": messages}
             return model
         set_base_boundaries_from_current_rows(updated_model)
-        save_geometry_model(updated_model)
+        with measure_step("save_geometry_model"):
+            save_geometry_model(updated_model)
         if RENDER_CACHE_PATH.exists():
             RENDER_CACHE_PATH.unlink()
         build_geometry_html_cached.clear()
@@ -2192,13 +2245,15 @@ def render_cross_aisle_settings_editor(model: dict) -> dict:
         st.rerun()
     if apply:
         st.session_state[state_key] = submitted
-        updated_model, errors = apply_cross_aisles_transaction(model, records)
+        with measure_step("apply_cross_aisles"):
+            updated_model, errors = apply_cross_aisles_transaction(model, records)
         if errors:
             st.error("Поперечные проезды не применены. Исправьте все ошибки:")
             for error in errors:
                 st.error(error)
             return model
-        save_geometry_model(updated_model)
+        with measure_step("save_geometry_model"):
+            save_geometry_model(updated_model)
         if RENDER_CACHE_PATH.exists():
             RENDER_CACHE_PATH.unlink()
         build_geometry_html_cached.clear()
@@ -2658,16 +2713,18 @@ def render_map_edit_panel(model: dict) -> dict:
 def render_geometry_map_view(model: dict) -> None:
     st.subheader("Карта склада")
     st.caption("Используйте кнопки масштаба, колесо мыши и перетаскивание для навигации по карте. Переключение вкладок не перестраивает склад и не сбрасывает ручные правки.")
-    placement_state, placement_warning = load_placement_state(model)
+    with measure_step("load_placements"):
+        placement_state, placement_warning = load_placement_state(model)
     if placement_warning:
         st.warning(placement_warning)
     else:
-        model = attach_placements_to_model(model, placement_state)
-        if placement_state.get("placements"):
-            snapshot, _ = load_pre_placement_snapshot(model)
-            model = enrich_model_with_placement_diagnostics(model, placement_state, snapshot)
-            st.caption("На карте показана занятость из сохранённого placements.json, включая рассчитанные приходы.")
-        model = enrich_model_with_outbound_diagnostics(model, placement_state)
+        with measure_step("enrich_model_with_placements_and_diagnostics"):
+            model = attach_placements_to_model(model, placement_state)
+            if placement_state.get("placements"):
+                snapshot, _ = load_pre_placement_snapshot(model)
+                model = enrich_model_with_placement_diagnostics(model, placement_state, snapshot)
+                st.caption("На карте показана занятость из сохранённого placements.json, включая рассчитанные приходы.")
+            model = enrich_model_with_outbound_diagnostics(model, placement_state)
     _model_summary_metrics(model)
     st.markdown(
         " · ".join(
@@ -2686,7 +2743,8 @@ def render_geometry_map_view(model: dict) -> None:
     label_settings["selected_cell_key"] = st.session_state.get("map_selected_cell_key", "")
     label_settings["selected_row_number"] = ""
     render_started = perf_counter()
-    html = build_geometry_html_cached(json.dumps(model, ensure_ascii=False), scale, detailed, json.dumps(label_settings, ensure_ascii=False, sort_keys=True))
+    with measure_step("build_map_html_svg", {"detailed": detailed}):
+        html = build_geometry_html_cached(json.dumps(model, ensure_ascii=False), scale, detailed, json.dumps(label_settings, ensure_ascii=False, sort_keys=True))
     components.html(html, height=980, scrolling=True)
     st.caption(f"Рендер карты: {perf_counter() - render_started:.2f} сек. Модель: data/last_import/warehouse_model.json")
 
@@ -2760,7 +2818,8 @@ def render_virtual_warehouse_excel() -> None:
                 diagnostics.extend(apply_placements(model, placements))
             timings["build_model_seconds"] = perf_counter() - build_started
             render_started = perf_counter()
-            render_cache = prepare_render_cache_cached(model_to_dict(model))
+            with measure_step("prepare_render_cache"):
+                render_cache = prepare_render_cache_cached(model_to_dict(model))
             timings["prepare_render_seconds"] = perf_counter() - render_started
             meta = {
                 "model_version": MODEL_VERSION,
@@ -2850,7 +2909,20 @@ def main() -> None:
     if _VIRTUAL_WAREHOUSE_APP_RENDERED:
         return
     _VIRTUAL_WAREHOUSE_APP_RENDERED = True
-    render_virtual_warehouse_excel()
+    start_performance_run(enabled=is_performance_enabled(st.session_state))
+    error = None
+    try:
+        with measure_step("streamlit_main"):
+            render_virtual_warehouse_excel()
+    except BaseException as exc:
+        error = exc
+        raise
+    finally:
+        model = st.session_state.get("geometry_model")
+        finish_performance_run(
+            exception=error,
+            model_id=model.get("model_id") if isinstance(model, dict) else None,
+        )
 
 
 if __name__ == "__main__" or get_script_run_ctx(suppress_warning=True) is not None:
