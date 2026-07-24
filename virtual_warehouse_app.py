@@ -33,6 +33,7 @@ from warehouse_performance import (
 from warehouse_revisions import (
     REVISION_DOMAINS,
     bump_revisions,
+    get_revision_token,
     load_revision_state,
     resolve_model_id,
 )
@@ -154,6 +155,14 @@ MODEL_PATH = LAST_IMPORT_DIR / "warehouse_model.json"
 RENDER_CACHE_PATH = LAST_IMPORT_DIR / "render_cache.json"
 META_PATH = LAST_IMPORT_DIR / "import_meta.json"
 RENDER_SETTINGS_PATH = LAST_IMPORT_DIR / "render_settings.json"
+
+GEOMETRY_RENDER_DOMAINS = (
+    "geometry",
+    "placements",
+    "outbound",
+    "render_settings",
+)
+GEOMETRY_HTML_CACHE_VERSION = 1
 
 DEFAULT_RENDER_LABEL_SETTINGS = {
     "show_row_labels": True,
@@ -316,9 +325,28 @@ def normalize_cell_table_cached(table_payload: str, mapping_payload: str) -> tup
     return normalize_cell_table(df, mapping)
 
 
+def get_geometry_render_revision_token(model: dict) -> tuple:
+    """Return the stable, small key for every persisted input rendered on the map."""
+    return get_revision_token(resolve_model_id(model), GEOMETRY_RENDER_DOMAINS)
+
+
 @st.cache_data(show_spinner=False)
-def build_geometry_html_cached(model_payload: str, scale: float, detailed: bool, label_settings_payload: str) -> str:
-    return build_geometry_html(json.loads(model_payload), scale=scale, detailed=detailed, label_settings=json.loads(label_settings_payload))
+def build_geometry_html_cached(
+    _model_payload: dict,
+    revision_token: tuple,
+    scale: float,
+    detailed: bool,
+    _label_settings: dict,
+    renderer_version: int = GEOMETRY_HTML_CACHE_VERSION,
+) -> str:
+    # The renderer currently reads its inputs, but private copies make that contract
+    # explicit and keep a future renderer mutation from leaking into session state.
+    return build_geometry_html(
+        copy.deepcopy(_model_payload),
+        scale=scale,
+        detailed=detailed,
+        label_settings=copy.deepcopy(_label_settings),
+    )
 
 
 def invalidate_geometry_render_cache() -> None:
@@ -2951,8 +2979,37 @@ def render_geometry_map_view(model: dict) -> None:
     label_settings["selected_cell_key"] = st.session_state.get("map_selected_cell_key", "")
     label_settings["selected_row_number"] = ""
     render_started = perf_counter()
-    with measure_step("build_map_html_svg", {"detailed": detailed}):
-        html = build_geometry_html_cached(json.dumps(model, ensure_ascii=False), scale, detailed, json.dumps(label_settings, ensure_ascii=False, sort_keys=True))
+    model_id = resolve_model_id(model)
+    with measure_step("geometry_render_token", {"domains": list(GEOMETRY_RENDER_DOMAINS)}):
+        revision_state = load_revision_state(model_id)
+        geometry_token = None if revision_state.get("warning") else get_geometry_render_revision_token(model)
+    render_metadata = {
+        "revision_token": geometry_token,
+        "scale": scale,
+        "detailed": detailed,
+        "cache_key_mode": "revision",
+        "renderer_version": GEOMETRY_HTML_CACHE_VERSION,
+    }
+    with measure_step("build_geometry_html", render_metadata):
+        if geometry_token is None:
+            st.warning(
+                f"Кеш карты отключён для этого рендера: {revision_state['warning']}"
+            )
+            html = build_geometry_html(
+                copy.deepcopy(model),
+                scale=scale,
+                detailed=detailed,
+                label_settings=copy.deepcopy(label_settings),
+            )
+        else:
+            html = build_geometry_html_cached(
+                model,
+                geometry_token,
+                scale,
+                detailed,
+                label_settings,
+                GEOMETRY_HTML_CACHE_VERSION,
+            )
     components.html(html, height=980, scrolling=True)
     st.caption(f"Рендер карты: {perf_counter() - render_started:.2f} сек. Модель: data/last_import/warehouse_model.json")
 
