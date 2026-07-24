@@ -98,6 +98,13 @@ from warehouse_row_settings import (
     reset_row_settings_state,
     update_row_settings_state,
 )
+from warehouse_cross_aisles import (
+    apply_cross_aisles_transaction,
+    changed_cross_aisle_count,
+    create_cross_aisle_settings_state,
+    reset_cross_aisle_settings_state,
+    update_cross_aisle_settings_state,
+)
 from warehouse_zone_boundaries import (
     ZONE_LABELS,
     ZONE_ORDER,
@@ -147,6 +154,7 @@ DEFAULT_RENDER_COLOR_SETTINGS = {
     "cell_color": "#DCEBFF",
     "deep_lane_cell_color": "#CFE8D5",
     "aisle_color": "#F2F2F2",
+    "cross_aisle_color": "#DCE6F2",
     "top_road_color": "#FFE8A3",
     "bottom_road_color": "#FFE8A3",
     "exit_color": "#FFCC80",
@@ -385,6 +393,7 @@ def render_color_settings_editor(settings: dict) -> dict:
         colors["cell_color"] = c1.color_picker("Цвет обычных ячеек", colors["cell_color"], key="color_cell")
         colors["deep_lane_cell_color"] = c2.color_picker("Цвет набивных ячеек", colors["deep_lane_cell_color"], key="color_deep_lane")
         colors["aisle_color"] = c3.color_picker("Цвет проездов между рядами", colors["aisle_color"], key="color_aisle")
+        colors["cross_aisle_color"] = c3.color_picker("Цвет поперечных проездов", colors["cross_aisle_color"], key="color_cross_aisle")
         c4, c5, c6 = st.columns(3)
         colors["top_road_color"] = c4.color_picker("Цвет верхнего проезда", colors["top_road_color"], key="color_top_road")
         colors["bottom_road_color"] = c5.color_picker("Цвет нижнего проезда", colors["bottom_road_color"], key="color_bottom_road")
@@ -1537,6 +1546,7 @@ def render_warehouse_settings_tab(model: dict | None) -> None:
         return
     st.caption("Основной способ изменения склада — единый черновик настроек рядов. Карта остаётся режимом просмотра.")
     render_unified_row_settings_editor(model)
+    render_cross_aisle_settings_editor(model)
     model = st.session_state.get("geometry_model", model)
     with st.expander("Настройки проездов", expanded=False):
         render_active_model_aisle_editor(model)
@@ -2131,6 +2141,69 @@ def render_unified_row_settings_editor(model: dict) -> dict:
         st.rerun()
     return model
 
+def render_cross_aisle_settings_editor(model: dict) -> dict:
+    st.subheader("Поперечные проезды внутри рядов")
+    st.caption("Таблица является отдельным черновиком. Карта и модель перестраиваются только после применения.")
+    state_key = "cross_aisle_settings_state"
+    model_id = str(model.get("model_id") or model.get("source_file_hash") or "active")
+    state = st.session_state.get(state_key)
+    if not isinstance(state, dict) or state.get("model_id") != model_id:
+        state = create_cross_aisle_settings_state(model)
+        st.session_state[state_key] = state
+    changed = changed_cross_aisle_count(state)
+    if changed:
+        st.warning(f"Есть несохранённые изменения. Изменено записей: {changed}")
+    else:
+        st.caption("Несохранённых изменений нет. Редактирование строк не запускает пересчёт карты.")
+    revision = int(state.get("editor_revision", 0))
+    draft = pd.DataFrame(copy.deepcopy(state.get("draft", []))).reindex(columns=["row_number", "after_cell_number", "width_cells", "width_m", "comment"])
+    cell_length = float((model.get("settings") or {}).get("cell_length_m", 1.0) or 1.0)
+    if not draft.empty:
+        draft["width_m"] = pd.to_numeric(draft["width_cells"], errors="coerce") * cell_length
+    display = draft.rename(columns={"row_number": "Ряд", "after_cell_number": "После ячейки", "width_cells": "Ширина, ячеек", "width_m": "Ширина, м", "comment": "Комментарий"})
+    with st.form(f"cross_aisle_form_{model_id}_{revision}"):
+        edited = st.data_editor(
+            display,
+            use_container_width=True,
+            hide_index=True,
+            num_rows="dynamic",
+            key=f"cross_aisle_editor_{model_id}_{revision}",
+            disabled=["Ширина, м"],
+            column_config={
+                "Ряд": st.column_config.TextColumn("Ряд"),
+                "После ячейки": st.column_config.TextColumn("После ячейки"),
+                "Ширина, ячеек": st.column_config.NumberColumn("Ширина, ячеек", min_value=1, step=1),
+                "Ширина, м": st.column_config.NumberColumn("Ширина, м", disabled=True, format="%.2f"),
+                "Комментарий": st.column_config.TextColumn("Комментарий"),
+            },
+        )
+        cancel_col, apply_col = st.columns(2)
+        cancel = cancel_col.form_submit_button("Отменить изменения проездов")
+        apply = apply_col.form_submit_button("Применить поперечные проезды", type="primary")
+    records = edited.rename(columns={"Ряд": "row_number", "После ячейки": "after_cell_number", "Ширина, ячеек": "width_cells", "Ширина, м": "width_m", "Комментарий": "comment"}).to_dict(orient="records")
+    submitted = update_cross_aisle_settings_state(state, records)
+    if cancel:
+        st.session_state[state_key] = reset_cross_aisle_settings_state(state)
+        st.rerun()
+    if apply:
+        st.session_state[state_key] = submitted
+        updated_model, errors = apply_cross_aisles_transaction(model, records)
+        if errors:
+            st.error("Поперечные проезды не применены. Исправьте все ошибки:")
+            for error in errors:
+                st.error(error)
+            return model
+        save_geometry_model(updated_model)
+        if RENDER_CACHE_PATH.exists():
+            RENDER_CACHE_PATH.unlink()
+        build_geometry_html_cached.clear()
+        prepare_render_cache_cached.clear()
+        st.session_state["geometry_model"] = updated_model
+        st.session_state[state_key] = create_cross_aisle_settings_state(updated_model)
+        st.rerun()
+    return model
+
+
 def render_active_model_aisle_editor(model: dict) -> dict:
     st.subheader("Настройки проездов между рядами")
     st.caption("Изменение проездов перестраивает только геометрию активной модели по текущим ячейкам и не очищает ручные изменения, размещение товара или приходы.")
@@ -2219,6 +2292,14 @@ def render_geometry_data_tabs(model: dict) -> None:
     with tabs[2]:
         st.dataframe(_localized_dataframe(model.get("aisles", [])), use_container_width=True)
         st.dataframe(_localized_dataframe(model.get("roads", [])), use_container_width=True)
+        cross_aisles = model.get("cross_aisles", [])
+        st.markdown("#### Поперечные проезды")
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Количество", len(cross_aisles))
+        m2.metric("Рядов с проездами", len({str(item.get("row_number", "")) for item in cross_aisles}))
+        m3.metric("Суммарная ширина, м", f"{sum(float(item.get('width_m', 0) or 0) for item in cross_aisles):g}")
+        columns = ["aisle_id", "row_number", "after_cell_number", "width_cells", "width_m", "x_min", "x_max", "y_min", "y_max", "comment"]
+        st.dataframe(pd.DataFrame(cross_aisles).reindex(columns=columns), use_container_width=True, hide_index=True)
     with tabs[3]:
         st.dataframe(_localized_dataframe(model.get("navigation_nodes", [])), use_container_width=True)
         st.dataframe(_localized_dataframe(model.get("navigation_edges", [])), use_container_width=True)
