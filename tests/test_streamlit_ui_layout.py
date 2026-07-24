@@ -28,7 +28,7 @@ def test_geometry_mode_has_dedicated_settings_tab():
     assert "render_warehouse_map_tab(model)" in body
     assert "render_warehouse_settings_tab(model)" in body
     assert "render_receipts_inventory_tab(model)" in body
-    assert "render_analytics_tab(model)" in body
+    assert "render_analytics_fragment(model)" in body
     assert "render_service_tab(saved_model, model)" in body
     assert "st.tabs(" not in body
     assert 'key="warehouse_active_section"' in body
@@ -86,7 +86,7 @@ def test_only_selected_warehouse_section_is_rendered(monkeypatch, selected, expe
     monkeypatch.setattr(app, "render_warehouse_map_tab", lambda model: calls.append("map"))
     monkeypatch.setattr(app, "render_warehouse_settings_tab", lambda model: calls.append("settings"))
     monkeypatch.setattr(app, "render_receipts_inventory_tab", lambda model: calls.append("receipts_inventory"))
-    monkeypatch.setattr(app, "render_analytics_tab", lambda model: calls.append("analytics"))
+    monkeypatch.setattr(app, "render_analytics_fragment", lambda model: calls.append("analytics"))
     monkeypatch.setattr(app, "render_service_tab", lambda saved_model, model: calls.append("service"))
 
     app.render_excel_geometry_warehouse()
@@ -122,9 +122,9 @@ def test_row_and_zone_settings_are_separate_from_map_view():
     map_body = _function_source("render_warehouse_map_tab")
     body = _function_source("render_warehouse_settings_tab")
 
-    assert "render_unified_row_settings_editor(model)" in body
-    assert "render_active_model_aisle_editor" in body
-    assert "render_zone_boundaries_editor" in body
+    assert "render_row_settings_fragment(model)" in body
+    assert "render_aisles_fragment" in body
+    assert "render_zone_boundaries_fragment" in body
     assert "render_unified_row_settings_editor" not in map_body
     assert "render_map_edit_panel" not in map_body
 
@@ -134,8 +134,8 @@ def test_receipts_and_inventory_are_only_in_operations_tab_renderer():
     analytics = _function_source("render_analytics_tab")
     map_tab = _function_source("render_warehouse_map_tab")
 
-    assert "render_receipts_section(model)" in operations
-    assert "render_inventory_placement(model)" in operations
+    assert "render_receipts_fragment(model)" in operations
+    assert "render_inventory_fragment(model)" in operations
     assert "render_receipts_section(model)" not in analytics + map_tab
     assert "render_inventory_placement(model)" not in analytics + map_tab
     assert SOURCE.count("render_receipts_section(model)") == 1
@@ -217,7 +217,7 @@ def test_outbound_picking_is_available_by_the_map_with_guarded_actions():
     picking = _function_source("render_outbound_picking")
 
     assert '"Моделирование сборки"' in map_tab
-    assert "render_outbound_picking(model)" in map_tab
+    assert "render_outbound_fragment(model)" in map_tab
     assert '"Собрать выбранные РО"' in picking
     assert '"Собрать все необработанные РО"' in picking
     assert '"Сбросить результаты сборки"' in picking
@@ -271,8 +271,8 @@ def test_only_selected_map_subsection_is_rendered(monkeypatch, selected, expecte
 
     monkeypatch.setattr(app, "st", fake_st)
     monkeypatch.setattr(app, "measure_step", record_step)
-    monkeypatch.setattr(app, "render_geometry_map_view", lambda model: calls.append("geometry"))
-    monkeypatch.setattr(app, "render_outbound_picking", lambda model: calls.append("outbound"))
+    monkeypatch.setattr(app, "render_map_geometry_fragment", lambda model: calls.append("geometry"))
+    monkeypatch.setattr(app, "render_outbound_fragment", lambda model: calls.append("outbound"))
 
     app.render_warehouse_map_tab({"model_id": "model"})
 
@@ -302,10 +302,10 @@ def test_only_selected_settings_subsection_is_rendered(monkeypatch, selected, ex
 
     monkeypatch.setattr(app, "st", fake_st)
     monkeypatch.setattr(app, "measure_step", record_step)
-    monkeypatch.setattr(app, "render_unified_row_settings_editor", lambda model: calls.append("rows"))
-    monkeypatch.setattr(app, "render_cross_aisle_settings_editor", lambda model: calls.append("cross_aisles"))
-    monkeypatch.setattr(app, "render_active_model_aisle_editor", lambda model: calls.append("aisles"))
-    monkeypatch.setattr(app, "render_zone_boundaries_editor", lambda model: calls.append("zones"))
+    monkeypatch.setattr(app, "render_row_settings_fragment", lambda model: calls.append("rows"))
+    monkeypatch.setattr(app, "render_cross_aisles_fragment", lambda model: calls.append("cross_aisles"))
+    monkeypatch.setattr(app, "render_aisles_fragment", lambda model: calls.append("aisles"))
+    monkeypatch.setattr(app, "render_zone_boundaries_fragment", lambda model: calls.append("zones"))
 
     app.render_warehouse_settings_tab({"model_id": "model"})
 
@@ -334,9 +334,9 @@ def test_only_selected_receipts_subsection_is_rendered(monkeypatch, selected, ex
 
     monkeypatch.setattr(app, "st", fake_st)
     monkeypatch.setattr(app, "measure_step", record_step)
-    monkeypatch.setattr(app, "render_receipts_section", lambda model: calls.append("receipts"))
-    monkeypatch.setattr(app, "render_inventory_placement", lambda model: calls.append("inventory"))
-    monkeypatch.setattr(app, "load_placement_state", lambda model: (calls.append("history") or {"journal": []}, None))
+    monkeypatch.setattr(app, "render_receipts_fragment", lambda model: calls.append("receipts"))
+    monkeypatch.setattr(app, "render_inventory_fragment", lambda model: calls.append("inventory"))
+    monkeypatch.setattr(app, "render_operation_history_fragment", lambda model: calls.append("history"))
 
     app.render_receipts_inventory_tab({"model_id": "model"})
 
@@ -348,10 +348,10 @@ def test_only_selected_receipts_subsection_is_rendered(monkeypatch, selected, ex
 def test_inactive_nested_renderer_error_does_not_break_active_subsection(monkeypatch):
     fake_st = _SubsectionStreamlit("warehouse_map_subsection", "map")
     monkeypatch.setattr(app, "st", fake_st)
-    monkeypatch.setattr(app, "render_geometry_map_view", lambda model: None)
+    monkeypatch.setattr(app, "render_map_geometry_fragment", lambda model: None)
     monkeypatch.setattr(
         app,
-        "render_outbound_picking",
+        "render_outbound_fragment",
         lambda model: (_ for _ in ()).throw(RuntimeError("inactive renderer called")),
     )
 

@@ -1543,6 +1543,71 @@ def render_outbound_picking(model: dict) -> None:
             st.dataframe(pd.DataFrame(execution_log), use_container_width=True)
 
 
+@st.fragment
+def render_map_geometry_fragment(model: dict) -> None:
+    with measure_step("fragment_map_geometry"):
+        render_geometry_map_view(model)
+
+
+@st.fragment
+def render_outbound_fragment(model: dict) -> None:
+    with measure_step("fragment_map_outbound"):
+        render_outbound_picking(model)
+
+
+@st.fragment
+def render_row_settings_fragment(model: dict) -> None:
+    with measure_step("fragment_settings_rows"):
+        render_unified_row_settings_editor(model)
+
+
+@st.fragment
+def render_cross_aisles_fragment(model: dict) -> None:
+    with measure_step("fragment_settings_cross_aisles"):
+        render_cross_aisle_settings_editor(model)
+
+
+@st.fragment
+def render_aisles_fragment(model: dict) -> None:
+    with measure_step("fragment_settings_aisles"):
+        render_active_model_aisle_editor(model)
+
+
+@st.fragment
+def render_zone_boundaries_fragment(model: dict) -> None:
+    with measure_step("fragment_settings_zones"):
+        render_zone_boundaries_editor(model)
+
+
+@st.fragment
+def render_receipts_fragment(model: dict) -> None:
+    with measure_step("fragment_receipts"):
+        render_receipts_section(model)
+
+
+@st.fragment
+def render_inventory_fragment(model: dict) -> None:
+    with measure_step("fragment_inventory"):
+        render_inventory_placement(model)
+
+
+def render_operation_history(model: dict) -> None:
+    placement_state, _ = load_placement_state(model)
+    journal = placement_state.get("journal", [])
+    if journal:
+        st.dataframe(pd.DataFrame(journal), use_container_width=True)
+    else:
+        st.info("История операций пока пуста.")
+    with st.expander("Запросы для выгрузки из 1С"):
+        st.caption("Используйте действующие запросы проекта для подготовки файлов прихода и инвентаризации. Формат выгрузки в этой версии интерфейса не изменён.")
+
+
+@st.fragment
+def render_operation_history_fragment(model: dict) -> None:
+    with measure_step("fragment_history"):
+        render_operation_history(model)
+
+
 def render_warehouse_map_tab(model: dict | None) -> None:
     if not model:
         st.info("Сначала загрузите схему склада на вкладке «Служебное».")
@@ -1558,10 +1623,10 @@ def render_warehouse_map_tab(model: dict | None) -> None:
     )
     if subsection == "map":
         with measure_step("render_subsection_map_geometry"):
-            render_geometry_map_view(model)
+            render_map_geometry_fragment(model)
     elif subsection == "outbound":
         with measure_step("render_subsection_map_outbound"):
-            render_outbound_picking(model)
+            render_outbound_fragment(model)
 
 
 def render_warehouse_settings_tab(model: dict | None) -> None:
@@ -1586,16 +1651,16 @@ def render_warehouse_settings_tab(model: dict | None) -> None:
     if subsection == "rows":
         st.caption("Основной способ изменения склада — единый черновик настроек рядов. Карта остаётся режимом просмотра.")
         with measure_step("render_subsection_settings_rows"):
-            render_unified_row_settings_editor(model)
+            render_row_settings_fragment(model)
     elif subsection == "cross_aisles":
         with measure_step("render_subsection_settings_cross_aisles"):
-            render_cross_aisle_settings_editor(model)
+            render_cross_aisles_fragment(model)
     elif subsection == "aisles":
         with measure_step("render_subsection_settings_aisles"):
-            render_active_model_aisle_editor(st.session_state.get("geometry_model", model))
+            render_aisles_fragment(st.session_state.get("geometry_model", model))
     elif subsection == "zones":
         with measure_step("render_subsection_settings_zones"):
-            render_zone_boundaries_editor(st.session_state.get("geometry_model", model))
+            render_zone_boundaries_fragment(st.session_state.get("geometry_model", model))
 
 
 def render_receipts_inventory_tab(model: dict | None) -> None:
@@ -1613,20 +1678,13 @@ def render_receipts_inventory_tab(model: dict | None) -> None:
     )
     if subsection == "receipts":
         with measure_step("render_subsection_receipts"):
-            render_receipts_section(model)
+            render_receipts_fragment(model)
     elif subsection == "inventory":
         with measure_step("render_subsection_inventory"):
-            render_inventory_placement(model)
+            render_inventory_fragment(model)
     elif subsection == "history":
         with measure_step("render_subsection_history"):
-            placement_state, _ = load_placement_state(model)
-            journal = placement_state.get("journal", [])
-            if journal:
-                st.dataframe(pd.DataFrame(journal), use_container_width=True)
-            else:
-                st.info("История операций пока пуста.")
-            with st.expander("Запросы для выгрузки из 1С"):
-                st.caption("Используйте действующие запросы проекта для подготовки файлов прихода и инвентаризации. Формат выгрузки в этой версии интерфейса не изменён.")
+            render_operation_history_fragment(model)
 
 
 def render_analytics_tab(model: dict | None) -> None:
@@ -1647,6 +1705,12 @@ def render_analytics_tab(model: dict | None) -> None:
     if last_report:
         st.subheader("Результат последней сверки с инвентом")
         st.dataframe(pd.DataFrame(last_report.get("details", [])), use_container_width=True)
+
+
+@st.fragment
+def render_analytics_fragment(model: dict | None) -> None:
+    with measure_step("fragment_analytics"):
+        render_analytics_tab(model)
 
 
 def render_service_tab(saved_model: dict | None, model: dict | None) -> None:
@@ -1782,7 +1846,7 @@ def render_excel_geometry_warehouse() -> None:
             render_receipts_inventory_tab(model)
     elif active_section == "analytics":
         with measure_step("render_section_analytics"):
-            render_analytics_tab(model)
+            render_analytics_fragment(model)
     elif active_section == "service":
         with measure_step("render_section_service"):
             render_service_tab(saved_model, model)
