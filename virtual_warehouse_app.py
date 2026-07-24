@@ -1716,23 +1716,36 @@ def render_excel_geometry_warehouse() -> None:
     if saved_model and "geometry_model" not in st.session_state:
         st.session_state["geometry_model"] = saved_model
     model = st.session_state.get("geometry_model")
-    map_tab, settings_tab, operations_tab, analytics_tab, service_tab = st.tabs([
-        "Карта склада",
-        "Настройки склада",
-        "Приходы и инвент",
-        "Аналитика",
-        "Служебное",
-    ])
-    with map_tab:
-        render_warehouse_map_tab(model)
-    with settings_tab:
-        render_warehouse_settings_tab(model)
-    with operations_tab:
-        render_receipts_inventory_tab(model)
-    with analytics_tab:
-        render_analytics_tab(model)
-    with service_tab:
-        render_service_tab(saved_model, model)
+    section_labels = {
+        "map": "Карта склада",
+        "settings": "Настройки склада",
+        "receipts_inventory": "Приходы и инвент",
+        "analytics": "Аналитика",
+        "service": "Служебное",
+    }
+    active_section = st.radio(
+        "Раздел склада",
+        options=list(section_labels),
+        format_func=section_labels.__getitem__,
+        horizontal=True,
+        key="warehouse_active_section",
+    )
+
+    if active_section == "map":
+        with measure_step("render_section_map"):
+            render_warehouse_map_tab(model)
+    elif active_section == "settings":
+        with measure_step("render_section_settings"):
+            render_warehouse_settings_tab(model)
+    elif active_section == "receipts_inventory":
+        with measure_step("render_section_receipts_inventory"):
+            render_receipts_inventory_tab(model)
+    elif active_section == "analytics":
+        with measure_step("render_section_analytics"):
+            render_analytics_tab(model)
+    elif active_section == "service":
+        with measure_step("render_section_service"):
+            render_service_tab(saved_model, model)
 
 
 def render_geometry_constructor_tab(saved_model: dict | None, *, show_active_model: bool = False) -> None:
