@@ -281,6 +281,13 @@ def build_geometry_html_cached(model_payload: str, scale: float, detailed: bool,
     return build_geometry_html(json.loads(model_payload), scale=scale, detailed=detailed, label_settings=json.loads(label_settings_payload))
 
 
+def invalidate_geometry_render_cache() -> None:
+    """Invalidate only artifacts whose contents are derived from geometry."""
+    RENDER_CACHE_PATH.unlink(missing_ok=True)
+    build_geometry_html_cached.clear()
+    prepare_render_cache_cached.clear()
+
+
 @st.cache_data(show_spinner=False)
 def read_inventory_table_cached(file_bytes: bytes, content_hash: str, sheet_name: str, header_rows: int) -> pd.DataFrame:
     return read_inventory_table(file_bytes, sheet_name, header_rows=header_rows)
@@ -859,6 +866,7 @@ def render_inventory_placement(model: dict) -> dict:
                         r3.metric("Освобождено ячеек", summary.get("Освобождено логических ячеек", 0))
                         with st.expander("Подробная диагностика"):
                             st.dataframe(pd.DataFrame(report.get("details", [])), use_container_width=True)
+                        st.rerun()
             with st.expander("Импорт адресного инвента (служебный сценарий)"):
                 st.caption("Сохраняет прежний сценарий импорта фактических адресов. Используйте его только для первичной загрузки склада.")
                 if st.button("Импортировать адресный инвент", key="inventory_import_button"):
@@ -1378,6 +1386,7 @@ def render_receipts_section(model: dict) -> None:
                 )
                 with st.expander("Подробная диагностика", expanded=False):
                     _render_receipt_placement_diagnostics(basic_diag)
+                st.rerun()
             elif st.session_state.get("last_receipt_placement_diag"):
                 with st.expander("Подробная диагностика последнего добавления прихода", expanded=False):
                     _render_receipt_placement_diagnostics(st.session_state.get("last_receipt_placement_diag"))
@@ -2285,10 +2294,13 @@ def render_unified_row_settings_editor(model: dict) -> dict:
     if reset_submit:
         st.session_state[state_key] = reset_row_settings_state(state)
         st.session_state["apply_state"] = {"status": "cancelled", "message": "Черновик восстановлен из текущей модели."}
-        st.rerun()
+        st.info("Черновик восстановлен из текущей модели.")
         return model
     if apply_submit:
         st.session_state[state_key] = submitted_state
+        if not changed_row_numbers(submitted_state):
+            st.info("Изменений нет")
+            return model
         edited_rows = submitted_state["draft"]
         with measure_step("apply_row_settings"):
             updated_model, messages = apply_row_settings_transaction(model, edited_rows)
@@ -2300,10 +2312,7 @@ def render_unified_row_settings_editor(model: dict) -> dict:
         set_base_boundaries_from_current_rows(updated_model)
         with measure_step("save_geometry_model"):
             save_geometry_model(updated_model)
-        if RENDER_CACHE_PATH.exists():
-            RENDER_CACHE_PATH.unlink()
-        build_geometry_html_cached.clear()
-        prepare_render_cache_cached.clear()
+        invalidate_geometry_render_cache()
         st.session_state["geometry_model"] = updated_model
         st.session_state[state_key] = create_row_settings_state(updated_model)
         st.session_state["apply_state"] = {"status": "applied", "messages": messages}
@@ -2359,9 +2368,13 @@ def render_cross_aisle_settings_editor(model: dict) -> dict:
     submitted = update_cross_aisle_settings_state(state, records)
     if cancel:
         st.session_state[state_key] = reset_cross_aisle_settings_state(state)
-        st.rerun()
+        st.info("Черновик восстановлен из текущей модели.")
+        return model
     if apply:
         st.session_state[state_key] = submitted
+        if not changed_cross_aisle_count(submitted):
+            st.info("Изменений нет")
+            return model
         with measure_step("apply_cross_aisles"):
             updated_model, errors = apply_cross_aisles_transaction(model, records)
         if errors:
@@ -2371,10 +2384,7 @@ def render_cross_aisle_settings_editor(model: dict) -> dict:
             return model
         with measure_step("save_geometry_model"):
             save_geometry_model(updated_model)
-        if RENDER_CACHE_PATH.exists():
-            RENDER_CACHE_PATH.unlink()
-        build_geometry_html_cached.clear()
-        prepare_render_cache_cached.clear()
+        invalidate_geometry_render_cache()
         st.session_state["geometry_model"] = updated_model
         st.session_state[state_key] = create_cross_aisle_settings_state(updated_model)
         st.rerun()
@@ -2528,9 +2538,7 @@ def _save_map_edit_snapshot(model: dict) -> None:
 
 def _persist_map_edit(model: dict, message: str) -> None:
     save_geometry_model(model)
-    if RENDER_CACHE_PATH.exists():
-        RENDER_CACHE_PATH.unlink()
-    prepare_render_cache_cached.clear()
+    invalidate_geometry_render_cache()
     st.session_state["geometry_model"] = model
     st.success(message)
 
