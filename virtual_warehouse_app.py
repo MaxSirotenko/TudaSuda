@@ -1547,9 +1547,21 @@ def render_warehouse_map_tab(model: dict | None) -> None:
     if not model:
         st.info("Сначала загрузите схему склада на вкладке «Служебное».")
         return
-    with st.expander("Моделирование сборки", expanded=False):
-        render_outbound_picking(model)
-    render_geometry_map_view(model)
+    labels = {"map": "Карта склада", "outbound": "Моделирование сборки"}
+    subsection = st.radio(
+        "Подраздел карты склада",
+        list(labels),
+        format_func=labels.get,
+        horizontal=True,
+        key="warehouse_map_subsection",
+        label_visibility="collapsed",
+    )
+    if subsection == "map":
+        with measure_step("render_subsection_map_geometry"):
+            render_geometry_map_view(model)
+    elif subsection == "outbound":
+        with measure_step("render_subsection_map_outbound"):
+            render_outbound_picking(model)
 
 
 def render_warehouse_settings_tab(model: dict | None) -> None:
@@ -1557,36 +1569,64 @@ def render_warehouse_settings_tab(model: dict | None) -> None:
     if not model:
         st.info("Сначала загрузите схему склада на вкладке «Служебное».")
         return
-    st.caption("Основной способ изменения склада — единый черновик настроек рядов. Карта остаётся режимом просмотра.")
-    render_unified_row_settings_editor(model)
-    render_cross_aisle_settings_editor(model)
-    model = st.session_state.get("geometry_model", model)
-    with st.expander("Настройки проездов", expanded=False):
-        render_active_model_aisle_editor(model)
-    with st.expander("Настройки весовых зон", expanded=False):
-        render_zone_boundaries_editor(st.session_state.get("geometry_model", model))
+    labels = {
+        "rows": "Настройки рядов",
+        "cross_aisles": "Поперечные проезды",
+        "aisles": "Межрядные проезды",
+        "zones": "Весовые зоны",
+    }
+    subsection = st.radio(
+        "Подраздел настроек склада",
+        list(labels),
+        format_func=labels.get,
+        horizontal=True,
+        key="warehouse_settings_subsection",
+        label_visibility="collapsed",
+    )
+    if subsection == "rows":
+        st.caption("Основной способ изменения склада — единый черновик настроек рядов. Карта остаётся режимом просмотра.")
+        with measure_step("render_subsection_settings_rows"):
+            render_unified_row_settings_editor(model)
+    elif subsection == "cross_aisles":
+        with measure_step("render_subsection_settings_cross_aisles"):
+            render_cross_aisle_settings_editor(model)
+    elif subsection == "aisles":
+        with measure_step("render_subsection_settings_aisles"):
+            render_active_model_aisle_editor(st.session_state.get("geometry_model", model))
+    elif subsection == "zones":
+        with measure_step("render_subsection_settings_zones"):
+            render_zone_boundaries_editor(st.session_state.get("geometry_model", model))
 
 
 def render_receipts_inventory_tab(model: dict | None) -> None:
     if not model:
         st.info("Для работы с приходами сначала загрузите схему склада на вкладке «Служебное».")
         return
-    st.subheader("Текущее состояние склада")
-    _current_warehouse_state(model)
-    workflow = st.tabs(["1–3. Приход", "4–6. Инвентаризация", "История операций"])
-    with workflow[0]:
-        render_receipts_section(model)
-    with workflow[1]:
-        render_inventory_placement(model)
-    with workflow[2]:
-        placement_state, _ = load_placement_state(model)
-        journal = placement_state.get("journal", [])
-        if journal:
-            st.dataframe(pd.DataFrame(journal), use_container_width=True)
-        else:
-            st.info("История операций пока пуста.")
-        with st.expander("Запросы для выгрузки из 1С"):
-            st.caption("Используйте действующие запросы проекта для подготовки файлов прихода и инвентаризации. Формат выгрузки в этой версии интерфейса не изменён.")
+    labels = {"receipts": "Приход", "inventory": "Инвентаризация", "history": "История операций"}
+    subsection = st.radio(
+        "Подраздел приходов и инвентаризации",
+        list(labels),
+        format_func=labels.get,
+        horizontal=True,
+        key="warehouse_receipts_subsection",
+        label_visibility="collapsed",
+    )
+    if subsection == "receipts":
+        with measure_step("render_subsection_receipts"):
+            render_receipts_section(model)
+    elif subsection == "inventory":
+        with measure_step("render_subsection_inventory"):
+            render_inventory_placement(model)
+    elif subsection == "history":
+        with measure_step("render_subsection_history"):
+            placement_state, _ = load_placement_state(model)
+            journal = placement_state.get("journal", [])
+            if journal:
+                st.dataframe(pd.DataFrame(journal), use_container_width=True)
+            else:
+                st.info("История операций пока пуста.")
+            with st.expander("Запросы для выгрузки из 1С"):
+                st.caption("Используйте действующие запросы проекта для подготовки файлов прихода и инвентаризации. Формат выгрузки в этой версии интерфейса не изменён.")
 
 
 def render_analytics_tab(model: dict | None) -> None:
