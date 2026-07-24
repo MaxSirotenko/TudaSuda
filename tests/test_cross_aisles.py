@@ -1,7 +1,12 @@
 import copy
+from contextlib import nullcontext
+from types import SimpleNamespace
 
+import pandas as pd
 import pytest
+import streamlit as streamlit
 
+import virtual_warehouse_app
 from warehouse_cross_aisles import (
     apply_cross_aisles_transaction,
     create_cross_aisle_settings_state,
@@ -112,6 +117,57 @@ def test_error_keeps_user_draft_and_model_unchanged():
     state = update_cross_aisle_settings_state(create_cross_aisle_settings_state(source), [aisle(width=0)])
     updated, errors = apply_cross_aisles_transaction(source, state["draft"])
     assert errors and updated is source and state["draft"][0]["width_cells"] == 0
+
+
+def test_cross_aisle_editor_uses_compatible_dataframe_types(monkeypatch):
+    captured = []
+
+    class FakeStreamlit:
+        column_config = streamlit.column_config
+
+        def __init__(self):
+            self.session_state = {}
+
+        def __getattr__(self, name):
+            if name == "form":
+                return lambda *args, **kwargs: nullcontext()
+            if name == "columns":
+                button = SimpleNamespace(form_submit_button=lambda *args, **kwargs: False)
+                return lambda count: [button] * count
+            if name == "data_editor":
+                def data_editor(frame, **kwargs):
+                    captured.append(frame.copy())
+                    return frame
+                return data_editor
+            return lambda *args, **kwargs: None
+
+    fake_st = FakeStreamlit()
+    monkeypatch.setattr(virtual_warehouse_app, "st", fake_st)
+    source = model()
+
+    virtual_warehouse_app.render_cross_aisle_settings_editor(source)
+    empty_draft = captured[-1].rename(columns={
+        "Ряд": "row_number",
+        "После ячейки": "after_cell_number",
+        "Ширина, ячеек": "width_cells",
+        "Ширина, м": "width_m",
+    })
+    assert empty_draft.empty
+    assert isinstance(empty_draft["row_number"].dtype, pd.StringDtype)
+    assert isinstance(empty_draft["after_cell_number"].dtype, pd.StringDtype)
+    assert empty_draft["width_cells"].dtype == pd.Int64Dtype()
+
+    fake_st.session_state["cross_aisle_settings_state"] = {
+        "model_id": "test",
+        "editor_revision": 0,
+        "baseline": [],
+        "draft": [aisle()],
+    }
+    virtual_warehouse_app.render_cross_aisle_settings_editor(source)
+    filled_draft = captured[-1]
+    assert filled_draft.loc[0, "Ряд"] == "152"
+    assert filled_draft.loc[0, "После ячейки"] == "2"
+    assert filled_draft.loc[0, "Ширина, м"] == 2.0
 
 
 def test_navigation_nodes_edges_and_visualization_have_no_fake_address():

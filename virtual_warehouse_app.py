@@ -2156,10 +2156,15 @@ def render_cross_aisle_settings_editor(model: dict) -> dict:
     else:
         st.caption("Несохранённых изменений нет. Редактирование строк не запускает пересчёт карты.")
     revision = int(state.get("editor_revision", 0))
-    draft = pd.DataFrame(copy.deepcopy(state.get("draft", []))).reindex(columns=["row_number", "after_cell_number", "width_cells", "width_m", "comment"])
+    draft = pd.DataFrame(
+        copy.deepcopy(state.get("draft", [])),
+        columns=["row_number", "after_cell_number", "width_cells", "width_m", "comment"],
+    )
+    for column in ("row_number", "after_cell_number", "comment"):
+        draft[column] = draft[column].fillna("").astype("string")
+    draft["width_cells"] = pd.to_numeric(draft["width_cells"], errors="coerce").astype("Int64")
     cell_length = float((model.get("settings") or {}).get("cell_length_m", 1.0) or 1.0)
-    if not draft.empty:
-        draft["width_m"] = pd.to_numeric(draft["width_cells"], errors="coerce") * cell_length
+    draft["width_m"] = (draft["width_cells"].astype("Float64") * cell_length).astype("Float64")
     display = draft.rename(columns={"row_number": "Ряд", "after_cell_number": "После ячейки", "width_cells": "Ширина, ячеек", "width_m": "Ширина, м", "comment": "Комментарий"})
     with st.form(f"cross_aisle_form_{model_id}_{revision}"):
         edited = st.data_editor(
