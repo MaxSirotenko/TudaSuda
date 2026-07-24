@@ -1,8 +1,16 @@
 import ast
+from contextlib import contextmanager
 from pathlib import Path
+import sys
 
+import pytest
 
 APP_PATH = Path(__file__).resolve().parents[1] / "virtual_warehouse_app.py"
+sys.path.insert(0, str(APP_PATH.parent))
+
+import virtual_warehouse_app as app
+
+
 SOURCE = APP_PATH.read_text(encoding="utf-8")
 TREE = ast.parse(SOURCE)
 
@@ -22,6 +30,84 @@ def test_geometry_mode_has_dedicated_settings_tab():
     assert "render_receipts_inventory_tab(model)" in body
     assert "render_analytics_tab(model)" in body
     assert "render_service_tab(saved_model, model)" in body
+    assert "st.tabs(" not in body
+    assert 'key="warehouse_active_section"' in body
+    assert "horizontal=True" in body
+
+
+class _SectionNavigationStreamlit:
+    def __init__(self, selected=None):
+        self.session_state = {}
+        if selected is not None:
+            self.session_state["warehouse_active_section"] = selected
+
+    def title(self, _label):
+        pass
+
+    def caption(self, _label):
+        pass
+
+    def radio(self, _label, options, *, format_func, horizontal, key):
+        assert horizontal is True
+        assert [format_func(option) for option in options] == [
+            "Карта склада",
+            "Настройки склада",
+            "Приходы и инвент",
+            "Аналитика",
+            "Служебное",
+        ]
+        self.session_state.setdefault(key, options[0])
+        return self.session_state[key]
+
+
+@pytest.mark.parametrize(
+    ("selected", "expected_renderer", "expected_step"),
+    [
+        (None, "map", "render_section_map"),
+        ("settings", "settings", "render_section_settings"),
+        ("receipts_inventory", "receipts_inventory", "render_section_receipts_inventory"),
+        ("analytics", "analytics", "render_section_analytics"),
+        ("service", "service", "render_section_service"),
+    ],
+)
+def test_only_selected_warehouse_section_is_rendered(monkeypatch, selected, expected_renderer, expected_step):
+    fake_st = _SectionNavigationStreamlit(selected)
+    calls = []
+    steps = []
+
+    @contextmanager
+    def record_step(name):
+        steps.append(name)
+        yield
+
+    monkeypatch.setattr(app, "st", fake_st)
+    monkeypatch.setattr(app, "load_geometry_model", lambda: {"model_id": "saved"})
+    monkeypatch.setattr(app, "measure_step", record_step)
+    monkeypatch.setattr(app, "render_warehouse_map_tab", lambda model: calls.append("map"))
+    monkeypatch.setattr(app, "render_warehouse_settings_tab", lambda model: calls.append("settings"))
+    monkeypatch.setattr(app, "render_receipts_inventory_tab", lambda model: calls.append("receipts_inventory"))
+    monkeypatch.setattr(app, "render_analytics_tab", lambda model: calls.append("analytics"))
+    monkeypatch.setattr(app, "render_service_tab", lambda saved_model, model: calls.append("service"))
+
+    app.render_excel_geometry_warehouse()
+
+    assert calls == [expected_renderer]
+    assert steps == ["load_geometry_model", expected_step]
+    assert fake_st.session_state["warehouse_active_section"] == (selected or "map")
+
+
+def test_inactive_settings_renderer_error_does_not_break_map(monkeypatch):
+    fake_st = _SectionNavigationStreamlit("map")
+    monkeypatch.setattr(app, "st", fake_st)
+    monkeypatch.setattr(app, "load_geometry_model", lambda: {})
+    monkeypatch.setattr(app, "render_warehouse_map_tab", lambda model: None)
+    monkeypatch.setattr(
+        app,
+        "render_warehouse_settings_tab",
+        lambda model: (_ for _ in ()).throw(RuntimeError("settings renderer called")),
+    )
+
+    app.render_excel_geometry_warehouse()
 
 
 def test_geometry_screen_loads_applied_model_without_row_settings_sync():
