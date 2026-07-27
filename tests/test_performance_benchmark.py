@@ -8,6 +8,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import warehouse_performance_benchmark as benchmark
 
 
+def test_synthetic_generator_rejects_inconsistent_counts():
+    for arguments in ((0, 0, 0), (10, 11, 11), (10, 5, 4), (10, 0, 1)):
+        try:
+            benchmark.generate_synthetic_dataset(*arguments)
+        except ValueError:
+            continue
+        raise AssertionError(f"Expected invalid synthetic dimensions to fail: {arguments}")
+
+
 def test_synthetic_generator_is_exact_deterministic_and_does_not_write(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     first = benchmark.generate_synthetic_dataset(123, 17, 25)
@@ -33,6 +42,14 @@ def test_dataset_selection_uses_current_and_falls_back(monkeypatch):
         loader=lambda: (_ for _ in ()).throw(json.JSONDecodeError("bad", "x", 0)),
     )
     assert corrupt[2] == "synthetic_fallback" and "JSONDecodeError" in corrupt[3][0]
+
+
+def test_dataset_selection_resolves_default_loader_at_call_time(monkeypatch):
+    model, _ = benchmark.generate_synthetic_dataset(10, 2, 2)
+    monkeypatch.setattr(benchmark.geometry_model, "load_geometry_model", lambda: model)
+    monkeypatch.setattr(benchmark.placement, "load_placement_state", lambda value: ({"placements": []}, None))
+    selected = benchmark.load_benchmark_dataset("current-or-synthetic", 5, 1, 1)
+    assert selected[2] == "current"
 
 
 def test_small_run_is_serializable_sanitized_and_cache_scenarios_pass(monkeypatch):

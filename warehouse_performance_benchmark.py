@@ -72,9 +72,17 @@ def _summary(values: list[float]) -> dict[str, Any]:
 def generate_synthetic_dataset(cells_count: int = 16_000, occupied_cells: int = 500,
                                placements_count: int = 700) -> tuple[dict, dict]:
     """Create a deterministic representative geometry and placement state."""
-    cells_count = max(1, int(cells_count))
-    occupied_cells = max(0, min(int(occupied_cells), cells_count))
-    placements_count = max(occupied_cells, int(placements_count)) if occupied_cells else 0
+    cells_count = int(cells_count)
+    occupied_cells = int(occupied_cells)
+    placements_count = int(placements_count)
+    if cells_count < 1:
+        raise ValueError("cells_count must be at least 1")
+    if not 0 <= occupied_cells <= cells_count:
+        raise ValueError("occupied_cells must be between 0 and cells_count")
+    if placements_count < occupied_cells:
+        raise ValueError("placements_count must be at least occupied_cells")
+    if occupied_cells == 0 and placements_count:
+        raise ValueError("placements_count must be 0 when occupied_cells is 0")
     row_count = min(200, cells_count)
     per_row, remainder = divmod(cells_count, row_count)
     cells, rows, offset = [], [], 0
@@ -129,7 +137,13 @@ def generate_synthetic_dataset(cells_count: int = 16_000, occupied_cells: int = 
 
 
 def load_benchmark_dataset(mode: str, cells: int, occupied_cells: int, placements_count: int,
-                           loader: Callable[[], dict | None] = geometry_model.load_geometry_model) -> tuple[dict, dict, str, list[str], float]:
+                           loader: Callable[[], dict | None] | None = None) -> tuple[dict, dict, str, list[str], float]:
+    """Load the active model through its production loader, or build a fallback.
+
+    Resolving the default loader at call time also keeps this boundary injectable
+    for read-only checks without retaining a stale imported function reference.
+    """
+    loader = loader or geometry_model.load_geometry_model
     warnings: list[str] = []
     if mode != "synthetic":
         try:
@@ -308,6 +322,8 @@ def run_benchmark(mode: str = "current-or-synthetic", cells: int = 16_000,
 def _cache_assertions(s: dict[str, dict[str, Any]]) -> dict[str, bool]:
     return {"static_warm_hit": s["static_warm"]["underlying_builder_call_count"] == 1,
             "dynamic_warm_hit": s["dynamic_warm"]["direct_builder_call_count"] == 1,
+            "dynamic_warm_snapshot_hit": s["dynamic_warm"]["snapshot_loader_call_count"] <= 1,
+            "dynamic_warm_outbound_projection_hit": s["dynamic_warm"]["outbound_projection_call_count"] <= 1,
             "no_change_hit": s["no_change_rerender"]["additional_static_builder_calls"] == 0 and s["no_change_rerender"]["additional_dynamic_builder_calls"] == 0,
             "placement_change_static_hit": s["placement_only_change"]["static_builder_calls"] == 0 and s["placement_only_change"]["dynamic_builder_calls"] == 1,
             "geometry_change_misses_both": s["geometry_change"]["static_builder_calls"] == 1 and s["geometry_change"]["dynamic_builder_calls"] == 1,
