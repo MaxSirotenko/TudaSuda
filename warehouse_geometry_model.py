@@ -715,7 +715,7 @@ def export_current_model_excel_bytes(model: dict[str, Any]) -> bytes:
     return buffer.getvalue()
 
 
-def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bool = True, label_settings: dict[str, Any] | None = None) -> str:
+def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bool = True, label_settings: dict[str, Any] | None = None, dynamic_state_marker: str | None = None) -> str:
     label_settings = label_settings or {}
     scale = float(scale) * float(label_settings.get("visual_cell_scale", 1.2) or 1.0)
     rows = model.get("rows", [])
@@ -966,7 +966,9 @@ def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bo
             if current_cell_key == selected_cell_key:
                 color = colors["selected_cell_color"]
                 border = "2px solid #E5532D"
-            cell_attrs = f" data-edit-select='cell' data-cell-key='{html.escape(current_cell_key, quote=True)}' data-row-number='{html.escape(str(cell.get('row_number')), quote=True)}'" if edit_mode else ""
+            cell_attrs = f" data-cell-key='{html.escape(current_cell_key, quote=True)}' data-row-number='{html.escape(str(cell.get('row_number')), quote=True)}' data-default-background='{html.escape(str(color), quote=True)}' data-default-border='{html.escape(str(border), quote=True)}'"
+            if edit_mode:
+                cell_attrs += " data-edit-select='cell'"
             rect(cell["x_min"], cell["y_min"], cell["x_max"], cell["y_max"], color, border, "", title, hover_color=colors["hover_cell_color"], extra_attrs=cell_attrs)
             occupied_slots = int(min(round(occupied), len(cell.get("physical_slots", []))))
             for slot in cell.get("physical_slots", []):
@@ -1008,6 +1010,31 @@ def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bo
                 if y_max > y_min:
                     rect(x_min, y_min, x_max, y_max, label_color, label_border, row_label, row_title(row), short_label=row_label, force_label=True, vertical=True, extra_attrs=row_attrs)
     parts.append("</div>")
+    dynamic_script = ""
+    if dynamic_state_marker is not None:
+        dynamic_script = f"""
+<script>
+(function() {{
+  const state = {dynamic_state_marker};
+  for (const [key, value] of Object.entries(state)) {{
+    const cell = document.querySelector(`[data-cell-key="${{CSS.escape(key)}}"]`);
+    if (!cell) continue;
+    cell.dataset.occupancyStatus = value.occupancy_status || '';
+    if (value.fill_color) cell.style.background = value.fill_color;
+    if (value.border) cell.style.border = value.border;
+    if (value.tooltip) cell.title = value.tooltip;
+    if (value.label) {{
+      const label = document.createElement('div');
+      label.className = 'warehouse-dynamic-label';
+      label.textContent = value.label;
+      label.setAttribute('aria-hidden', 'true');
+      label.style.cssText = 'position:absolute;inset:auto 2px 2px 2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:center;font:600 10px Arial;pointer-events:none;color:#1f2937';
+      cell.appendChild(label);
+    }}
+  }}
+}})();
+</script>
+"""
     script = f"""
 <script>
 (function() {{
@@ -1226,5 +1253,5 @@ def build_geometry_html(model: dict[str, Any], scale: float = 18.0, detailed: bo
 }})();
 </script>
 """
-    parts.append(f"</div>{script}")
+    parts.append(f"</div>{dynamic_script}{script}")
     return "".join(parts)
