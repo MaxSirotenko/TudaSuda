@@ -59,6 +59,12 @@ from warehouse_geometry_model import (
     rebuild_geometry_from_cells,
     save_geometry_model,
 )
+from warehouse_geometry_render_layers import (
+    build_geometry_dynamic_payload,
+    build_geometry_static_layer,
+    compose_geometry_layers,
+    safe_json_dumps,
+)
 
 from warehouse_inventory_placement import (
     attach_placements_to_model,
@@ -170,6 +176,10 @@ GEOMETRY_RENDER_DOMAINS = (
     "render_settings",
 )
 GEOMETRY_HTML_CACHE_VERSION = 1
+GEOMETRY_STATIC_CACHE_VERSION = 1
+GEOMETRY_DYNAMIC_CACHE_VERSION = 1
+GEOMETRY_STATIC_DOMAINS = ("geometry", "render_settings")
+GEOMETRY_DYNAMIC_DOMAINS = ("geometry", "placements", "outbound", "render_settings")
 
 DEFAULT_RENDER_LABEL_SETTINGS = {
     "show_row_labels": True,
@@ -337,6 +347,39 @@ def get_geometry_render_revision_token(model: dict) -> tuple:
     return get_revision_token(resolve_model_id(model), GEOMETRY_RENDER_DOMAINS)
 
 
+def get_geometry_static_revision_token(model: dict) -> tuple:
+    return get_revision_token(resolve_model_id(model), GEOMETRY_STATIC_DOMAINS)
+
+
+def get_geometry_dynamic_revision_token(model: dict) -> tuple:
+    return get_revision_token(resolve_model_id(model), GEOMETRY_DYNAMIC_DOMAINS)
+
+
+@st.cache_data(show_spinner=False)
+def build_geometry_static_layer_cached(
+    _model_payload: dict, static_revision_token: tuple, _render_settings: dict,
+    scale: float, detailed: bool, renderer_version: int = GEOMETRY_STATIC_CACHE_VERSION,
+) -> str:
+    return build_geometry_static_layer(
+        _model_payload, scale=scale, detailed=detailed, label_settings=_render_settings,
+    )
+
+
+@st.cache_data(show_spinner=False)
+def build_geometry_dynamic_layer_cached(
+    _dynamic_source: dict, dynamic_revision_token: tuple, _render_settings: dict,
+    renderer_version: int = GEOMETRY_DYNAMIC_CACHE_VERSION,
+) -> dict:
+    model = copy.deepcopy(_dynamic_source["model"])
+    placement_state = copy.deepcopy(_dynamic_source["placement_state"])
+    model = attach_placements_to_model(model, placement_state)
+    if placement_state.get("placements"):
+        snapshot, _ = load_pre_placement_snapshot(model)
+        model = enrich_model_with_placement_diagnostics(model, placement_state, snapshot)
+    model = enrich_model_with_outbound_diagnostics(model, placement_state)
+    return build_geometry_dynamic_payload(model, _render_settings)
+
+
 @st.cache_data(show_spinner=False)
 def build_geometry_html_cached(
     _model_payload: dict,
@@ -360,6 +403,8 @@ def invalidate_geometry_render_cache() -> None:
     """Invalidate only artifacts whose contents are derived from geometry."""
     RENDER_CACHE_PATH.unlink(missing_ok=True)
     build_geometry_html_cached.clear()
+    build_geometry_static_layer_cached.clear()
+    build_geometry_dynamic_layer_cached.clear()
     prepare_render_cache_cached.clear()
 
 
@@ -1845,6 +1890,15 @@ def render_service_tab(saved_model: dict | None, model: dict | None) -> None:
     )
     if enabled:
         st.caption("Результаты текущего измерения появятся после следующего rerun.")
+        layers = st.session_state.get("geometry_layer_diagnostics")
+        if layers:
+            st.markdown("**Слои карты**")
+            st.caption(
+                f"Статика: {layers['static_size_bytes']:,} байт · Динамика: {layers['dynamic_size_bytes']:,} байт · "
+                f"Динамических ячеек: {layers['dynamic_cells_count']:,} · "
+                f"static token: {layers['static_token']} · dynamic token: {layers['dynamic_token']} · "
+                f"версии: {layers['static_cache_version']}/{layers['dynamic_cache_version']}"
+            )
     else:
         st.caption("Профилирование выключено. Его также можно включить через WAREHOUSE_PERF=1.")
     if st.button("Очистить историю измерений", key="performance_clear_history"):
@@ -2967,14 +3021,8 @@ def render_geometry_map_view(model: dict) -> None:
         placement_state, placement_warning = load_placement_state_cached(model)
     if placement_warning:
         st.warning(placement_warning)
-    else:
-        with measure_step("enrich_model_with_placements_and_diagnostics"):
-            model = attach_placements_to_model(model, placement_state)
-            if placement_state.get("placements"):
-                snapshot, _ = load_pre_placement_snapshot(model)
-                model = enrich_model_with_placement_diagnostics(model, placement_state, snapshot)
-                st.caption("На карте показана занятость из сохранённого placements.json, включая рассчитанные приходы.")
-            model = enrich_model_with_outbound_diagnostics(model, placement_state)
+    elif placement_state.get("placements"):
+        st.caption("На карте показана занятость из сохранённого placements.json, включая рассчитанные приходы.")
     _model_summary_metrics(model)
     st.markdown(
         " · ".join(
@@ -2996,34 +3044,41 @@ def render_geometry_map_view(model: dict) -> None:
     model_id = resolve_model_id(model)
     with measure_step("geometry_render_token", {"domains": list(GEOMETRY_RENDER_DOMAINS)}):
         revision_state = load_revision_state(model_id)
-        geometry_token = None if revision_state.get("warning") else get_geometry_render_revision_token(model)
-    render_metadata = {
-        "revision_token": geometry_token,
-        "scale": scale,
-        "detailed": detailed,
-        "cache_key_mode": "revision",
-        "renderer_version": GEOMETRY_HTML_CACHE_VERSION,
-    }
-    with measure_step("build_geometry_html", render_metadata):
-        if geometry_token is None:
+        static_token = None if revision_state.get("warning") else get_geometry_static_revision_token(model)
+        dynamic_token = None if revision_state.get("warning") else get_geometry_dynamic_revision_token(model)
+    static_metadata = {"revision_token": static_token, "scale": scale, "detailed": detailed, "cache_version": GEOMETRY_STATIC_CACHE_VERSION}
+    dynamic_source = {"model": model, "placement_state": placement_state if not placement_warning else {}}
+    with measure_step("build_geometry_static_layer", static_metadata):
+        if static_token is None:
             st.warning(
                 f"Кеш карты отключён для этого рендера: {revision_state['warning']}"
             )
-            html = build_geometry_html(
-                copy.deepcopy(model),
-                scale=scale,
-                detailed=detailed,
-                label_settings=copy.deepcopy(label_settings),
-            )
+            static_layer = build_geometry_static_layer(model, scale, detailed, label_settings)
         else:
-            html = build_geometry_html_cached(
-                model,
-                geometry_token,
-                scale,
-                detailed,
-                label_settings,
-                GEOMETRY_HTML_CACHE_VERSION,
-            )
+            static_layer = build_geometry_static_layer_cached(model, static_token, label_settings, scale, detailed, GEOMETRY_STATIC_CACHE_VERSION)
+    dynamic_metadata = {"revision_token": dynamic_token, "dynamic_cells_count": 0, "cache_version": GEOMETRY_DYNAMIC_CACHE_VERSION}
+    with measure_step("build_geometry_dynamic_layer", dynamic_metadata):
+        if dynamic_token is None:
+            enriched = attach_placements_to_model(copy.deepcopy(model), copy.deepcopy(placement_state))
+            if placement_state.get("placements"):
+                snapshot, _ = load_pre_placement_snapshot(enriched)
+                enriched = enrich_model_with_placement_diagnostics(enriched, placement_state, snapshot)
+            enriched = enrich_model_with_outbound_diagnostics(enriched, placement_state)
+            dynamic_payload = build_geometry_dynamic_payload(enriched, label_settings)
+        else:
+            dynamic_payload = build_geometry_dynamic_layer_cached(dynamic_source, dynamic_token, label_settings, GEOMETRY_DYNAMIC_CACHE_VERSION)
+        dynamic_metadata["dynamic_cells_count"] = len(dynamic_payload)
+    dynamic_size = len(safe_json_dumps(dynamic_payload).encode("utf-8"))
+    compose_metadata = {"static_size_bytes": len(static_layer.encode("utf-8")), "dynamic_size_bytes": dynamic_size, "final_size_bytes": 0}
+    with measure_step("compose_geometry_layers", compose_metadata):
+        html = compose_geometry_layers(static_layer, dynamic_payload)
+        compose_metadata["final_size_bytes"] = len(html.encode("utf-8"))
+    st.session_state["geometry_layer_diagnostics"] = {
+        "static_size_bytes": len(static_layer.encode("utf-8")), "dynamic_size_bytes": dynamic_size,
+        "final_size_bytes": len(html.encode("utf-8")), "dynamic_cells_count": len(dynamic_payload),
+        "static_token": static_token, "dynamic_token": dynamic_token,
+        "static_cache_version": GEOMETRY_STATIC_CACHE_VERSION, "dynamic_cache_version": GEOMETRY_DYNAMIC_CACHE_VERSION,
+    }
     components.html(html, height=980, scrolling=True)
     st.caption(f"Рендер карты: {perf_counter() - render_started:.2f} сек. Модель: data/last_import/warehouse_model.json")
 

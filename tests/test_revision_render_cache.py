@@ -14,6 +14,8 @@ import warehouse_revisions as revisions
 def isolated_cache(tmp_path, monkeypatch):
     monkeypatch.setattr(revisions, "REVISION_PATH", tmp_path / "data_revisions.json")
     app.build_geometry_html_cached.clear()
+    app.build_geometry_static_layer_cached.clear()
+    app.build_geometry_dynamic_layer_cached.clear()
     yield
     app.build_geometry_html_cached.clear()
 
@@ -125,8 +127,9 @@ def test_corrupt_revision_state_bypasses_cached_wrapper(monkeypatch):
     source = Path(app.__file__).read_text(encoding="utf-8")
     tree = ast.parse(source)
     view = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "render_geometry_map_view")
-    assert "geometry_token is None" in ast.unparse(view)
-    assert "build_geometry_html(copy.deepcopy(model)" in ast.unparse(view)
+    assert "static_token is None" in ast.unparse(view)
+    assert "build_geometry_static_layer(model" in ast.unparse(view)
+    assert "build_geometry_dynamic_payload(enriched" in ast.unparse(view)
 
 
 def test_wrapper_and_call_site_do_not_serialize_heavy_payloads():
@@ -158,7 +161,9 @@ def test_invalidation_still_clears_both_geometry_caches(monkeypatch, tmp_path):
     monkeypatch.setattr(app, "RENDER_CACHE_PATH", tmp_path / "render_cache.json")
     app.RENDER_CACHE_PATH.write_text("{}", encoding="utf-8")
     monkeypatch.setattr(app.build_geometry_html_cached, "clear", lambda: cleared.append("html"))
+    monkeypatch.setattr(app.build_geometry_static_layer_cached, "clear", lambda: cleared.append("static"))
+    monkeypatch.setattr(app.build_geometry_dynamic_layer_cached, "clear", lambda: cleared.append("dynamic"))
     monkeypatch.setattr(app.prepare_render_cache_cached, "clear", lambda: cleared.append("render"))
     app.invalidate_geometry_render_cache()
-    assert cleared == ["html", "render"]
+    assert cleared == ["html", "static", "dynamic", "render"]
     assert not app.RENDER_CACHE_PATH.exists()
