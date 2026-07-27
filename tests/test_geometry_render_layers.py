@@ -84,14 +84,11 @@ def test_layer_cache_keys_ignore_heavy_sources_and_split_domains(monkeypatch):
     app.build_geometry_static_layer_cached.clear(); app.build_geometry_dynamic_layer_cached.clear()
     static_calls, dynamic_calls = [], []
     monkeypatch.setattr(app, "build_geometry_static_layer", lambda *a, **k: static_calls.append(1) or DYNAMIC_STATE_MARKER)
-    monkeypatch.setattr(app, "build_geometry_dynamic_payload", lambda *a, **k: dynamic_calls.append(1) or {})
-    monkeypatch.setattr(app, "attach_placements_to_model", lambda model, state: model)
-    monkeypatch.setattr(app, "enrich_model_with_outbound_diagnostics", lambda model, state: model)
-    source = {"model": _model(), "placement_state": {}}
+    monkeypatch.setattr(app, "_build_geometry_dynamic_layer_direct", lambda *a, **k: dynamic_calls.append(1) or {})
     assert app.build_geometry_static_layer_cached(_model(), ("m", 1, 1), {}, 22., True, 1) == DYNAMIC_STATE_MARKER
     assert app.build_geometry_static_layer_cached({"changed": True}, ("m", 1, 1), {"changed": True}, 22., True, 1) == DYNAMIC_STATE_MARKER
-    app.build_geometry_dynamic_layer_cached(source, ("m", 1, 1, 1, 1), {}, 1)
-    app.build_geometry_dynamic_layer_cached({"model": {"changed": True}, "placement_state": {}}, ("m", 1, 1, 1, 1), {"changed": True}, 1)
+    app.build_geometry_dynamic_layer_cached(_model(), {}, ("m", 1, 1, 1, 1), {}, 1)
+    app.build_geometry_dynamic_layer_cached({"changed": True}, {"changed": True}, ("m", 1, 1, 1, 1), {"changed": True}, 1)
     assert static_calls == [1] and dynamic_calls == [1]
 
 

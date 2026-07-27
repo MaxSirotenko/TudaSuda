@@ -85,6 +85,11 @@ def _capacity(cell: dict[str, Any]) -> float:
     return 1.0
 
 
+def placement_cell_capacity(cell: dict[str, Any]) -> float:
+    """Return the capacity fallback used by placement diagnostics and the map."""
+    return _capacity(cell)
+
+
 def _is_receipt_placement(item: dict[str, Any]) -> bool:
     return item.get("source") == "receipt" or bool(item.get("receipt_line_ids")) or bool(item.get("receipt_numbers"))
 
@@ -201,7 +206,7 @@ def _cell_by_key(model: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {_cell_key(cell.get("row_number"), cell.get("cell_number"), cell.get("tier")): cell for cell in model.get("cells", [])}
 
 
-def _category_for_placements(placements: list[dict[str, Any]], fallback_zone: str = "unclassified") -> str:
+def placement_category_for_placements(placements: list[dict[str, Any]], fallback_zone: str = "unclassified") -> str:
     for placement in placements:
         zone = _display(placement.get("calculated_zone")) or _display(placement.get("weight_class"))
         if zone == "fragile":
@@ -240,7 +245,7 @@ def build_occupied_cell_rows(model: dict[str, Any], placement_state: dict[str, A
             after = entry["qty"]
             added = max(after - before_same, 0.0)
             placements = entry["placements"]
-            category = _category_for_placements(placements, _display(cell.get("weight_zone")) or "unclassified")
+            category = placement_category_for_placements(placements, _display(cell.get("weight_zone")) or "unclassified")
             reason_code = next((_display(p.get("placement_reason_code")) for p in placements if p.get("placement_reason_code")), "existing_stock" if before_same > 0 and added == 0 else "fallback")
             reason_text = next((_display(p.get("placement_reason_text")) for p in placements if p.get("placement_reason_text")), placement_reason_text(reason_code))
             source_status = "смешанная занятость" if before_same > 0 and added > 0 else ("остаток" if before_same > 0 else "новый приход")
@@ -318,6 +323,51 @@ def build_zone_rows(model: dict[str, Any], placement_state: dict[str, Any], rece
             "Процент заполненности после": round(after_occ / total_capacity * 100, 2) if total_capacity else 0.0,
         })
     return rows
+
+
+def build_tooltip_for_dynamic_cell(
+    key: str, cell: dict[str, Any], summary: dict[str, Any],
+    before_summary: dict[str, Any] | None = None,
+) -> str:
+    """Build the legacy map tooltip from already resolved sparse state."""
+    before_placements = (before_summary or {}).get("placements", [])
+    rows: list[dict[str, Any]] = []
+    by_sku: dict[str, dict[str, Any]] = {}
+    for placement in summary.get("placements", []):
+        sku = _sku_key(placement)
+        entry = by_sku.setdefault(sku, {"qty": 0.0, "placements": [], "receipt_line_ids": set(), "receipt_numbers": set()})
+        entry["qty"] += _qty(placement)
+        entry["placements"].append(placement)
+        entry["receipt_line_ids"].update(value for value in (placement.get("receipt_line_ids") or []) if value)
+        entry["receipt_numbers"].update(value for value in (placement.get("receipt_numbers") or []) if value)
+    for sku, entry in by_sku.items():
+        before_same = sum(_qty(item) for item in before_placements if _sku_key(item) == sku)
+        after = entry["qty"]
+        added = max(after - before_same, 0.0)
+        placements = entry["placements"]
+        reason_code = next((_display(item.get("placement_reason_code")) for item in placements if item.get("placement_reason_code")), "existing_stock" if before_same > 0 and added == 0 else "fallback")
+        reason = next((_display(item.get("placement_reason_text")) for item in placements if item.get("placement_reason_text")), placement_reason_text(reason_code))
+        source = "смешанная занятость" if before_same > 0 and added > 0 else ("остаток" if before_same > 0 else "новый приход")
+        rows.append({
+            "name": next((_display(item.get("sku_name") or item.get("item_name")) for item in placements if item.get("sku_name") or item.get("item_name")), "Нет данных"),
+            "characteristic": next((_display(item.get("characteristic_name")) for item in placements if item.get("characteristic_name")), ""),
+            "sku": sku, "after": after, "before": before_same, "added": added,
+            "orders": ", ".join(sorted(entry["receipt_numbers"])) or "Нет данных",
+            "lines": ", ".join(sorted(entry["receipt_line_ids"])) or "Нет данных",
+            "source": source, "reason": reason,
+        })
+    lines = [
+        f"Ячейка: {key}", f"Ряд: {_display(cell.get('row_number')) or _display(summary.get('placements', [{}])[0].get('row_number'))}",
+        f"Тип ряда: {_display(cell.get('storage_type')) or 'Нет данных'}",
+        f"Весовая зона: {ZONE_LABELS_RU.get(_display(cell.get('weight_zone')), _display(cell.get('weight_zone')) or 'Нет данных')}",
+        f"Вместимость: {_capacity(cell):g}",
+    ]
+    for row in rows:
+        lines.extend(["—", f"Номенклатура: {row['name']}", f"Характеристика: {row['characteristic'] or 'Нет данных'}",
+                      f"sku_key: {row['sku']}", f"Количество: {row['after']:g}", f"Приходные ордера: {row['orders']}",
+                      f"receipt_line_ids: {row['lines']}", f"Было до: {row['before']:g}", f"Добавлено: {row['added']:g}",
+                      f"Стало после: {row['after']:g}", f"Способ размещения: {row['source']}", f"Причина: {row['reason']}"])
+    return "\n".join(lines[:80])
 
 
 def build_tooltip_by_cell(model: dict[str, Any], placement_state: dict[str, Any], snapshot: dict[str, Any] | None) -> dict[str, str]:
@@ -438,5 +488,5 @@ def enrich_model_with_placement_diagnostics(model: dict[str, Any], placement_sta
         if key in tooltips:
             cell["placement_tooltip"] = tooltips[key]
         if placements:
-            cell["placement_category"] = _category_for_placements(placements, _display(cell.get("weight_zone")) or "unclassified")
+            cell["placement_category"] = placement_category_for_placements(placements, _display(cell.get("weight_zone")) or "unclassified")
     return updated

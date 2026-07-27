@@ -428,6 +428,39 @@ def reset_outbound_execution(model: dict[str, Any]) -> tuple[dict[str, Any] | No
     return placement_state, {"success": True, "message": "Размещения восстановлены из снимка. Загруженные РО сохранены."}
 
 
+def build_outbound_tooltip_context(
+    model: dict[str, Any], placement_state: dict[str, Any],
+) -> dict[str, str]:
+    """Return only the per-cell outbound text consumed by the layered map."""
+    snapshot = _load_json(PRE_OUTBOUND_SNAPSHOT_PATH, {}).get("placement_state", {})
+    log = load_outbound_execution_log(model)
+    before_by_cell: dict[str, int] = {}
+    current_by_cell: dict[str, int] = {}
+    units: dict[str, set[str]] = {}
+    skus: dict[str, set[str]] = {}
+    for source, target in ((snapshot.get("placements", []), before_by_cell), (placement_state.get("placements", []), current_by_cell)):
+        for placement in source:
+            key = placement.get("cell_key", "")
+            target[key] = target.get(key, 0) + _placement_units(placement)
+            units.setdefault(key, set()).add(_text(placement.get("unit_name")) or "не указана")
+            skus.setdefault(key, set()).add(placement_sku_key(placement) or "Нет данных")
+    last_by_cell = {entry.get("cell_key", ""): entry for entry in log}
+    result: dict[str, str] = {}
+    for key in before_by_cell.keys() | current_by_cell.keys() | last_by_cell.keys():
+        before = before_by_cell.get(key, current_by_cell.get(key, 0))
+        current = current_by_cell.get(key, 0)
+        last = last_by_cell.get(key, {})
+        result[key] = (
+            f"\nSKU: {', '.join(sorted(skus.get(key, {'Нет данных'})))}"
+            f"\nЕдиница хранения: {', '.join(sorted(units.get(key, {'не указана'})))}"
+            f"\nЮнитов до моделирования: {before}"
+            f"\nТекущий остаток юнитов: {current}"
+            f"\nСписано юнитов: {before - current}"
+            f"\nПоследний РО: {last.get('outbound_order_number', '—')}"
+        )
+    return result
+
+
 def enrich_model_with_outbound_diagnostics(model: dict[str, Any], placement_state: dict[str, Any]) -> dict[str, Any]:
     updated = copy.deepcopy(model)
     snapshot = _load_json(PRE_OUTBOUND_SNAPSHOT_PATH, {}).get("placement_state", {})

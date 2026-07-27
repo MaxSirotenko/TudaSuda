@@ -129,7 +129,7 @@ def test_corrupt_revision_state_bypasses_cached_wrapper(monkeypatch):
     view = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "render_geometry_map_view")
     assert "static_token is None" in ast.unparse(view)
     assert "build_geometry_static_layer(model" in ast.unparse(view)
-    assert "build_geometry_dynamic_payload(enriched" in ast.unparse(view)
+    assert "_build_geometry_dynamic_layer_direct(model, dynamic_placement_state" in ast.unparse(view)
 
 
 def test_wrapper_and_call_site_do_not_serialize_heavy_payloads():
