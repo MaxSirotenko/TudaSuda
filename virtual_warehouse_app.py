@@ -61,6 +61,7 @@ from warehouse_geometry_model import (
 )
 from warehouse_geometry_render_layers import (
     build_geometry_dynamic_payload,
+    build_geometry_dynamic_payload_from_state,
     build_geometry_static_layer,
     compose_geometry_layers,
     safe_json_dumps,
@@ -135,6 +136,7 @@ from warehouse_zone_boundaries import (
     set_base_boundaries_from_current_rows,
 )
 from warehouse_outbound_orders import (
+    build_outbound_tooltips_by_cell,
     detect_outbound_columns,
     ensure_pre_outbound_snapshot,
     enrich_model_with_outbound_diagnostics,
@@ -177,7 +179,7 @@ GEOMETRY_RENDER_DOMAINS = (
 )
 GEOMETRY_HTML_CACHE_VERSION = 1
 GEOMETRY_STATIC_CACHE_VERSION = 1
-GEOMETRY_DYNAMIC_CACHE_VERSION = 1
+GEOMETRY_DYNAMIC_CACHE_VERSION = 2
 GEOMETRY_STATIC_DOMAINS = ("geometry", "render_settings")
 GEOMETRY_DYNAMIC_DOMAINS = ("geometry", "placements", "outbound", "render_settings")
 
@@ -367,17 +369,26 @@ def build_geometry_static_layer_cached(
 
 @st.cache_data(show_spinner=False)
 def build_geometry_dynamic_layer_cached(
-    _dynamic_source: dict, dynamic_revision_token: tuple, _render_settings: dict,
+    _model: dict, _placement_state: dict, dynamic_revision_token: tuple, _render_settings: dict,
     renderer_version: int = GEOMETRY_DYNAMIC_CACHE_VERSION,
 ) -> dict:
-    model = copy.deepcopy(_dynamic_source["model"])
-    placement_state = copy.deepcopy(_dynamic_source["placement_state"])
-    model = attach_placements_to_model(model, placement_state)
+    return build_geometry_dynamic_layer_direct(_model, _placement_state, _render_settings)
+
+
+def build_geometry_dynamic_layer_direct(
+    model: dict, placement_state: dict, render_settings: dict,
+) -> dict:
+    """Use the same direct algorithm for cached misses and corrupt-token fallback."""
+    snapshot = None
     if placement_state.get("placements"):
-        snapshot, _ = load_pre_placement_snapshot(model)
-        model = enrich_model_with_placement_diagnostics(model, placement_state, snapshot)
-    model = enrich_model_with_outbound_diagnostics(model, placement_state)
-    return build_geometry_dynamic_payload(model, _render_settings)
+        snapshot, _ = load_pre_placement_snapshot({
+            "model_id": model.get("model_id"), "source_file_hash": model.get("source_file_hash"),
+        })
+    outbound_context = {"tooltips": build_outbound_tooltips_by_cell(model, placement_state)}
+    return build_geometry_dynamic_payload_from_state(
+        model, placement_state, snapshot=snapshot,
+        label_settings=render_settings, outbound_context=outbound_context,
+    )
 
 
 @st.cache_data(show_spinner=False)
@@ -1896,6 +1907,10 @@ def render_service_tab(saved_model: dict | None, model: dict | None) -> None:
             st.caption(
                 f"Статика: {layers['static_size_bytes']:,} байт · Динамика: {layers['dynamic_size_bytes']:,} байт · "
                 f"Динамических ячеек: {layers['dynamic_cells_count']:,} · "
+                f"builder: {layers.get('builder_mode', '—')} · placements: {layers.get('placements_count', 0):,} · "
+                f"interesting cells: {layers.get('interesting_cell_keys_count', 0):,} · "
+                f"full model enrichment: {layers.get('full_model_enrichment', '—')} · "
+                f"full model deepcopy: {layers.get('full_model_deepcopy', '—')} · "
                 f"static token: {layers['static_token']} · dynamic token: {layers['dynamic_token']} · "
                 f"версии: {layers['static_cache_version']}/{layers['dynamic_cache_version']}"
             )
@@ -3047,7 +3062,7 @@ def render_geometry_map_view(model: dict) -> None:
         static_token = None if revision_state.get("warning") else get_geometry_static_revision_token(model)
         dynamic_token = None if revision_state.get("warning") else get_geometry_dynamic_revision_token(model)
     static_metadata = {"revision_token": static_token, "scale": scale, "detailed": detailed, "cache_version": GEOMETRY_STATIC_CACHE_VERSION}
-    dynamic_source = {"model": model, "placement_state": placement_state if not placement_warning else {}}
+    render_placement_state = placement_state if not placement_warning else {}
     with measure_step("build_geometry_static_layer", static_metadata):
         if static_token is None:
             st.warning(
@@ -3056,18 +3071,22 @@ def render_geometry_map_view(model: dict) -> None:
             static_layer = build_geometry_static_layer(model, scale, detailed, label_settings)
         else:
             static_layer = build_geometry_static_layer_cached(model, static_token, label_settings, scale, detailed, GEOMETRY_STATIC_CACHE_VERSION)
-    dynamic_metadata = {"revision_token": dynamic_token, "dynamic_cells_count": 0, "cache_version": GEOMETRY_DYNAMIC_CACHE_VERSION}
+    dynamic_metadata = {
+        "revision_token": dynamic_token, "dynamic_cells_count": 0,
+        "placements_count": len(render_placement_state.get("placements", [])),
+        "interesting_cell_keys_count": 0, "builder_mode": "direct_state",
+        "full_model_enrichment": "нет", "full_model_deepcopy": "нет",
+        "cache_version": GEOMETRY_DYNAMIC_CACHE_VERSION,
+    }
     with measure_step("build_geometry_dynamic_layer", dynamic_metadata):
         if dynamic_token is None:
-            enriched = attach_placements_to_model(copy.deepcopy(model), copy.deepcopy(placement_state))
-            if placement_state.get("placements"):
-                snapshot, _ = load_pre_placement_snapshot(enriched)
-                enriched = enrich_model_with_placement_diagnostics(enriched, placement_state, snapshot)
-            enriched = enrich_model_with_outbound_diagnostics(enriched, placement_state)
-            dynamic_payload = build_geometry_dynamic_payload(enriched, label_settings)
+            dynamic_payload = build_geometry_dynamic_layer_direct(model, render_placement_state, label_settings)
         else:
-            dynamic_payload = build_geometry_dynamic_layer_cached(dynamic_source, dynamic_token, label_settings, GEOMETRY_DYNAMIC_CACHE_VERSION)
+            dynamic_payload = build_geometry_dynamic_layer_cached(
+                model, render_placement_state, dynamic_token, label_settings, GEOMETRY_DYNAMIC_CACHE_VERSION,
+            )
         dynamic_metadata["dynamic_cells_count"] = len(dynamic_payload)
+        dynamic_metadata["interesting_cell_keys_count"] = len(dynamic_payload)
     dynamic_size = len(safe_json_dumps(dynamic_payload).encode("utf-8"))
     compose_metadata = {"static_size_bytes": len(static_layer.encode("utf-8")), "dynamic_size_bytes": dynamic_size, "final_size_bytes": 0}
     with measure_step("compose_geometry_layers", compose_metadata):
@@ -3077,6 +3096,9 @@ def render_geometry_map_view(model: dict) -> None:
         "static_size_bytes": len(static_layer.encode("utf-8")), "dynamic_size_bytes": dynamic_size,
         "final_size_bytes": len(html.encode("utf-8")), "dynamic_cells_count": len(dynamic_payload),
         "static_token": static_token, "dynamic_token": dynamic_token,
+        "builder_mode": "direct_state", "placements_count": len(render_placement_state.get("placements", [])),
+        "interesting_cell_keys_count": len(dynamic_payload),
+        "full_model_enrichment": "нет", "full_model_deepcopy": "нет",
         "static_cache_version": GEOMETRY_STATIC_CACHE_VERSION, "dynamic_cache_version": GEOMETRY_DYNAMIC_CACHE_VERSION,
     }
     components.html(html, height=980, scrolling=True)
