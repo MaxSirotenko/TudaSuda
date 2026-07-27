@@ -430,9 +430,22 @@ def reset_outbound_execution(model: dict[str, Any]) -> tuple[dict[str, Any] | No
 
 def enrich_model_with_outbound_diagnostics(model: dict[str, Any], placement_state: dict[str, Any]) -> dict[str, Any]:
     updated = copy.deepcopy(model)
+    tooltips = build_outbound_tooltips_by_cell(model, placement_state)
+    for cell in updated.get("cells", []):
+        key = f"{cell.get('row_number')}|{cell.get('cell_number')}|{cell.get('tier') or '1'}"
+        if key in tooltips:
+            cell["placement_tooltip"] = str(cell.get("placement_tooltip", "")).rstrip() + tooltips[key]
+    return updated
+
+
+def build_outbound_tooltips_by_cell(
+    model: dict[str, Any], placement_state: dict[str, Any],
+) -> dict[str, str]:
+    """Return only the outbound tooltip suffixes needed by the dynamic map."""
     snapshot = _load_json(PRE_OUTBOUND_SNAPSHOT_PATH, {}).get("placement_state", {})
     log = load_outbound_execution_log(model)
     before_by_cell: dict[str, int] = {}
+    current_by_cell: dict[str, int] = {}
     units: dict[str, set[str]] = {}
     skus: dict[str, set[str]] = {}
     for placement in snapshot.get("placements", []):
@@ -440,23 +453,18 @@ def enrich_model_with_outbound_diagnostics(model: dict[str, Any], placement_stat
         before_by_cell[key] = before_by_cell.get(key, 0) + _placement_units(placement)
         units.setdefault(key, set()).add(_text(placement.get("unit_name")) or "не указана")
         skus.setdefault(key, set()).add(placement_sku_key(placement) or "Нет данных")
-    current_by_cell: dict[str, int] = {}
     for placement in placement_state.get("placements", []):
         key = placement.get("cell_key", "")
         current_by_cell[key] = current_by_cell.get(key, 0) + _placement_units(placement)
         units.setdefault(key, set()).add(_text(placement.get("unit_name")) or "не указана")
         skus.setdefault(key, set()).add(placement_sku_key(placement) or "Нет данных")
-    last_by_cell: dict[str, dict[str, Any]] = {}
-    for entry in log:
-        last_by_cell[entry.get("cell_key", "")] = entry
-    for cell in updated.get("cells", []):
-        key = f"{cell.get('row_number')}|{cell.get('cell_number')}|{cell.get('tier') or '1'}"
-        if key not in before_by_cell and key not in current_by_cell and key not in last_by_cell:
-            continue
+    last_by_cell = {entry.get("cell_key", ""): entry for entry in log}
+    result = {}
+    for key in set(before_by_cell) | set(current_by_cell) | set(last_by_cell):
         before = before_by_cell.get(key, current_by_cell.get(key, 0))
         current = current_by_cell.get(key, 0)
         last = last_by_cell.get(key, {})
-        extra = (
+        result[key] = (
             f"\nSKU: {', '.join(sorted(skus.get(key, {'Нет данных'})))}"
             f"\nЕдиница хранения: {', '.join(sorted(units.get(key, {'не указана'})))}"
             f"\nЮнитов до моделирования: {before}"
@@ -464,5 +472,4 @@ def enrich_model_with_outbound_diagnostics(model: dict[str, Any], placement_stat
             f"\nСписано юнитов: {before - current}"
             f"\nПоследний РО: {last.get('outbound_order_number', '—')}"
         )
-        cell["placement_tooltip"] = str(cell.get("placement_tooltip", "")).rstrip() + extra
-    return updated
+    return result

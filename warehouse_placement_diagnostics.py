@@ -213,6 +213,64 @@ def _category_for_placements(placements: list[dict[str, Any]], fallback_zone: st
     return fallback_zone or "unclassified"
 
 
+def placement_category_for_placements(
+    placements: list[dict[str, Any]], fallback_zone: str = "unclassified",
+) -> str:
+    """Public, read-only category rule shared by diagnostic and render paths."""
+    return _category_for_placements(placements, fallback_zone)
+
+
+def build_placement_tooltip_for_cell(
+    cell: dict[str, Any], cell_key: str, summary: dict[str, Any],
+    before_summary: dict[str, Any] | None = None,
+) -> str:
+    """Build the legacy tooltip for one occupied cell without enriching a model."""
+    by_sku: dict[str, dict[str, Any]] = {}
+    for placement in summary.get("placements", []):
+        sku = _sku_key(placement)
+        entry = by_sku.setdefault(
+            sku, {"qty": 0.0, "placements": [], "receipt_line_ids": set(), "receipt_numbers": set()},
+        )
+        entry["qty"] += _qty(placement)
+        entry["placements"].append(placement)
+        entry["receipt_line_ids"].update(value for value in placement.get("receipt_line_ids") or [] if value)
+        entry["receipt_numbers"].update(value for value in placement.get("receipt_numbers") or [] if value)
+
+    lines = [
+        f"Ячейка: {cell_key}",
+        f"Ряд: {_display(cell.get('row_number')) or _display(summary.get('placements', [{}])[0].get('row_number'))}",
+        f"Тип ряда: {_display(cell.get('storage_type')) or 'Нет данных'}",
+        f"Весовая зона: {ZONE_LABELS_RU.get(_display(cell.get('weight_zone')), _display(cell.get('weight_zone')) or 'Нет данных')}",
+        f"Вместимость: {_capacity(cell):g}",
+    ]
+    before_placements = (before_summary or {}).get("placements", [])
+    for sku, entry in by_sku.items():
+        before_same = sum(_qty(item) for item in before_placements if _sku_key(item) == sku)
+        after = entry["qty"]
+        added = max(after - before_same, 0.0)
+        placements = entry["placements"]
+        reason_code = next(
+            (_display(item.get("placement_reason_code")) for item in placements if item.get("placement_reason_code")),
+            "existing_stock" if before_same > 0 and added == 0 else "fallback",
+        )
+        reason_text = next(
+            (_display(item.get("placement_reason_text")) for item in placements if item.get("placement_reason_text")),
+            placement_reason_text(reason_code),
+        )
+        source = "смешанная занятость" if before_same > 0 and added > 0 else ("остаток" if before_same > 0 else "новый приход")
+        lines.extend([
+            "—",
+            f"Номенклатура: {next((_display(item.get('sku_name') or item.get('item_name')) for item in placements if item.get('sku_name') or item.get('item_name')), 'Нет данных')}",
+            f"Характеристика: {next((_display(item.get('characteristic_name')) for item in placements if item.get('characteristic_name')), '') or 'Нет данных'}",
+            f"sku_key: {sku}", f"Количество: {after:g}",
+            f"Приходные ордера: {', '.join(sorted(entry['receipt_numbers'])) or 'Нет данных'}",
+            f"receipt_line_ids: {', '.join(sorted(entry['receipt_line_ids'])) or 'Нет данных'}",
+            f"Было до: {before_same:g}", f"Добавлено: {added:g}", f"Стало после: {after:g}",
+            f"Способ размещения: {source}", f"Причина: {reason_text}",
+        ])
+    return "\n".join(lines[:80])
+
+
 def build_occupied_cell_rows(model: dict[str, Any], placement_state: dict[str, Any], receipts_state: dict[str, Any] | None, snapshot: dict[str, Any] | None) -> list[dict[str, Any]]:
     before_by_cell = (snapshot or {}).get("before_by_cell") or summarize_placements_by_cell((snapshot or {}).get("placements_before", []))
     current_by_cell = summarize_placements_by_cell(placement_state.get("placements", []))
