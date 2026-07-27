@@ -146,6 +146,13 @@ from warehouse_outbound_orders import (
     save_outbound_orders,
     summarize_outbound_orders,
 )
+from warehouse_state_cache import (
+    load_outbound_execution_log_cached,
+    load_outbound_execution_state_cached,
+    load_outbound_orders_cached,
+    load_placement_state_cached,
+    load_receipts_state_cached,
+)
 st.set_page_config(page_title="Симулятор сборки", layout="wide")
 
 APP_BUILD_LABEL = "virtual-excel-only-2026-07-04"
@@ -1070,7 +1077,7 @@ def render_placement_diagnostics_section(model: dict, state: dict) -> None:
     st.subheader("Диагностика размещения")
     st.caption("Раздел анализирует текущие warehouse_model.json, placements.json и receipts.json. Открытие диагностики не запускает размещение и не изменяет сохранённые файлы.")
     with measure_step("load_receipts"):
-        receipts_state, receipts_warning = load_receipts_state(model)
+        receipts_state, receipts_warning = load_receipts_state_cached(model)
     if receipts_warning:
         st.warning(receipts_warning)
         receipts_state = {"receipts": []}
@@ -1290,7 +1297,7 @@ def _render_receipt_placement_diagnostics(diag: dict | None) -> None:
 
 def render_receipts_section(model: dict) -> None:
     st.subheader("Приходы")
-    state, state_warning = load_receipts_state(model)
+    state, state_warning = load_receipts_state_cached(model)
     if state_warning:
         st.warning(state_warning)
     receipts = state.get("receipts", [])
@@ -1423,7 +1430,10 @@ def render_receipts_section(model: dict) -> None:
                 if current_medium_limit <= current_light_limit:
                     st.error("Исправьте границы веса перед расчётом зон товаров.")
                 else:
-                    updated_receipts, zone_diag = calculate_receipt_zones(receipts, current_zone_settings)
+                    state, state_warning = load_receipts_state(model)
+                    if state_warning:
+                        st.warning(state_warning)
+                    updated_receipts, zone_diag = calculate_receipt_zones(state.get("receipts", []), current_zone_settings)
                     current_zone_settings["settings_hash"] = zone_diag.get("settings_hash", current_settings_hash)
                     current_zone_settings["calculated_at"] = pd.Timestamp.now(tz="UTC").isoformat()
                     state["receipts"] = updated_receipts
@@ -1465,6 +1475,9 @@ def render_receipts_section(model: dict) -> None:
                 placement_state, placement_warning = load_placement_state(model)
                 if placement_warning:
                     st.warning(placement_warning)
+                state, state_warning = load_receipts_state(model)
+                if state_warning:
+                    st.warning(state_warning)
                 model = apply_active_boundaries_to_model(model)
                 save_geometry_model(model)
                 save_pre_placement_snapshot(model, placement_state, state, trigger="receipt_placement")
@@ -1497,9 +1510,9 @@ def render_receipts_section(model: dict) -> None:
 
 def _current_warehouse_state(model: dict) -> None:
     with measure_step("load_placements"):
-        placement_state, _ = load_placement_state(model)
+        placement_state, _ = load_placement_state_cached(model)
     with measure_step("load_receipts"):
-        receipts_state, _ = load_receipts_state(model)
+        receipts_state, _ = load_receipts_state_cached(model)
     placements = placement_state.get("placements", [])
     unplaced = placement_state.get("unplaced_inventory", [])
     carryover = [item for item in placements if item.get("source") == "inventory_carryover"]
@@ -1527,9 +1540,9 @@ def _current_warehouse_state(model: dict) -> None:
 
 def render_outbound_picking(model: dict) -> None:
     with measure_step("load_outbound_state"):
-        orders_state = load_outbound_orders(model)
-        execution_state = load_outbound_execution_state(model)
-        execution_log = load_outbound_execution_log(model)
+        orders_state = load_outbound_orders_cached(model)
+        execution_state = load_outbound_execution_state_cached(model)
+        execution_log = load_outbound_execution_log_cached(model)
     rows = orders_state.get("rows", [])
     st.caption("Сборка выполняется последовательно в целых qty_units. Вес, масса и весовые коэффициенты не используются.")
     uploaded = st.file_uploader("Excel с расходными ордерами", type=["xlsx"], key="outbound_orders_upload")
@@ -1594,6 +1607,9 @@ def render_outbound_picking(model: dict) -> None:
     selected_keys = [option_to_key[label] for label in selected_labels]
 
     def execute(keys: list[str]) -> None:
+        current_orders = load_outbound_orders(model)
+        current_execution = load_outbound_execution_state(model)
+        current_log = load_outbound_execution_log(model)
         placement_state, warning = load_placement_state(model)
         if warning:
             st.warning(warning)
@@ -1601,9 +1617,9 @@ def render_outbound_picking(model: dict) -> None:
         updated_placements, updated_execution, updated_log, summary = execute_outbound_orders(
             model,
             placement_state,
-            rows,
-            execution_state,
-            execution_log,
+            current_orders.get("rows", []),
+            current_execution,
+            current_log,
             keys,
         )
         save_placement_state(updated_placements)
@@ -1633,8 +1649,6 @@ def render_outbound_picking(model: dict) -> None:
         else:
             st.error(result["message"])
 
-    execution_state = load_outbound_execution_state(model)
-    execution_log = load_outbound_execution_log(model)
     line_results = execution_state.get("line_results", [])
     summary = outbound_execution_summary(rows, execution_state, line_results)
     metric_columns = st.columns(5)
@@ -1700,7 +1714,7 @@ def render_inventory_fragment(model: dict) -> None:
 
 
 def render_operation_history(model: dict) -> None:
-    placement_state, _ = load_placement_state(model)
+    placement_state, _ = load_placement_state_cached(model)
     journal = placement_state.get("journal", [])
     if journal:
         st.dataframe(pd.DataFrame(journal), use_container_width=True)
@@ -1799,7 +1813,7 @@ def render_analytics_tab(model: dict | None) -> None:
     if not model:
         st.info("Аналитика появится после загрузки модели склада.")
         return
-    state, warning = load_placement_state(model)
+    state, warning = load_placement_state_cached(model)
     if warning:
         st.warning(warning)
     render_placement_diagnostics_section(model, state)
@@ -2950,7 +2964,7 @@ def render_geometry_map_view(model: dict) -> None:
     st.subheader("Карта склада")
     st.caption("Используйте кнопки масштаба, колесо мыши и перетаскивание для навигации по карте. Переключение вкладок не перестраивает склад и не сбрасывает ручные правки.")
     with measure_step("load_placements"):
-        placement_state, placement_warning = load_placement_state(model)
+        placement_state, placement_warning = load_placement_state_cached(model)
     if placement_warning:
         st.warning(placement_warning)
     else:
