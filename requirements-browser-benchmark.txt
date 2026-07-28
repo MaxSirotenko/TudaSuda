@@ -1,0 +1,2 @@
+# Optional dependency used only by browser_benchmark.cmd.
+playwright>=1.50,<2
