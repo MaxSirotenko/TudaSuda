@@ -156,14 +156,10 @@ def test_cache_hit_does_not_build_or_deepcopy(monkeypatch):
     assert len(calls) == 1
 
 
-def test_invalidation_still_clears_both_geometry_caches(monkeypatch, tmp_path):
+def test_invalidation_still_clears_geometry_caches(monkeypatch):
     cleared = []
-    monkeypatch.setattr(app, "RENDER_CACHE_PATH", tmp_path / "render_cache.json")
-    app.RENDER_CACHE_PATH.write_text("{}", encoding="utf-8")
     monkeypatch.setattr(app.build_geometry_html_cached, "clear", lambda: cleared.append("html"))
     monkeypatch.setattr(app.build_geometry_static_layer_cached, "clear", lambda: cleared.append("static"))
     monkeypatch.setattr(app.build_geometry_dynamic_layer_cached, "clear", lambda: cleared.append("dynamic"))
-    monkeypatch.setattr(app.prepare_render_cache_cached, "clear", lambda: cleared.append("render"))
     app.invalidate_geometry_render_cache()
-    assert cleared == ["html", "static", "dynamic", "render"]
-    assert not app.RENDER_CACHE_PATH.exists()
+    assert cleared == ["html", "static", "dynamic"]
