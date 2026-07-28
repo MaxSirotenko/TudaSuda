@@ -20,10 +20,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--occupied-cells", type=int, default=500)
     parser.add_argument("--placements", type=int, default=700)
     parser.add_argument("--warm-iterations", type=int, default=3)
+    parser.add_argument("--import-iterations", type=int, default=5)
     parser.add_argument("--output-dir", type=Path, default=Path("data/performance_benchmarks"))
     args = parser.parse_args(argv)
     try:
-        result = run_benchmark(args.mode, args.cells, args.occupied_cells, args.placements, args.warm_iterations)
+        result = run_benchmark(args.mode, args.cells, args.occupied_cells, args.placements, args.warm_iterations, args.import_iterations)
         paths = write_reports(result, args.output_dir)
     except Exception as exc:
         print(f"Benchmark failed: {exc}", file=sys.stderr)

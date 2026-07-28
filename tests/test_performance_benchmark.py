@@ -128,3 +128,34 @@ def test_windows_launcher_contract():
     source = Path("benchmark_performance.cmd").read_text(encoding="utf-8")
     assert "%~dp0" in source and ".venv\\Scripts\\python.exe" in source
     assert "venv\\Scripts\\python.exe" in source and "%*" in source
+
+
+def test_importtime_parser_ignores_header_normalizes_nested_modules_and_sorts():
+    parsed = benchmark.parse_importtime_output("""import time: self [us] | cumulative | imported package
+import time:       100 |        300 |   package.child
+import time:       250 |        250 | package
+warning: harmless
+""")
+    assert parsed["modules_count"] == 2
+    assert parsed["top_cumulative"][0] == {
+        "module_name": "package.child", "self_time_us": 100, "cumulative_time_us": 300,
+    }
+    assert parsed["top_self"][0]["module_name"] == "package"
+    assert parsed["accounted_self_time_us"] == 350
+
+
+def test_importtime_parser_drops_path_like_names_and_invalid_output_is_warning(monkeypatch):
+    assert benchmark.parse_importtime_output("import time: 1 | 2 | /home/user/private.py")["modules_count"] == 0
+    completed = benchmark.subprocess.CompletedProcess([], 0, "", "ordinary warning")
+    monkeypatch.setattr(benchmark.subprocess, "run", lambda *args, **kwargs: completed)
+    scenario = benchmark._import_breakdown_scenario()
+    assert scenario["status"] == "warning" and "warning" in scenario
+    assert "stderr" not in scenario
+
+
+def test_import_breakdown_distinguishes_traceback_from_warning(monkeypatch):
+    completed = benchmark.subprocess.CompletedProcess([], 1, "", "Traceback (most recent call last):\nValueError")
+    monkeypatch.setattr(benchmark.subprocess, "run", lambda *args, **kwargs: completed)
+    scenario = benchmark._import_breakdown_scenario()
+    assert scenario["status"] == "failed"
+    assert scenario["traceback_present"] is True
