@@ -10,6 +10,7 @@ import copy
 import json
 import os
 import platform
+import re
 import statistics
 import subprocess
 import sys
@@ -202,9 +203,74 @@ def _import_scenario() -> dict[str, Any]:
             "stdout_bytes": len(process.stdout), "stderr_bytes": len(process.stderr)}
 
 
+_IMPORTTIME_LINE = re.compile(r"^import time:\s*(\d+)\s*\|\s*(\d+)\s*\|\s*(.+?)\s*$")
+STARTUP_MODULES = (
+    "warehouse_legacy_excel_ui", "warehouse_excel_parser", "warehouse_visualization",
+    "warehouse_placement", "warehouse_diagnostics", "openpyxl",
+)
+
+
+def parse_importtime_output(stderr: str, top_count: int = 20) -> dict[str, Any]:
+    """Parse aggregate-only importtime rows without retaining stderr or paths."""
+    modules = []
+    for line in stderr.splitlines():
+        match = _IMPORTTIME_LINE.match(line)
+        if not match:
+            continue
+        name = match.group(3).strip()
+        if name == "module name":
+            continue
+        name = name.lstrip(".")
+        if not name or "/" in name or "\\" in name:
+            continue
+        modules.append({"module_name": name, "self_time_us": int(match.group(1)),
+                        "cumulative_time_us": int(match.group(2))})
+    return {
+        "modules_count": len(modules),
+        "accounted_self_time_us": sum(row["self_time_us"] for row in modules),
+        "accounted_cumulative_time_us": sum(row["cumulative_time_us"] for row in modules),
+        "top_cumulative": sorted(modules, key=lambda row: row["cumulative_time_us"], reverse=True)[:top_count],
+        "top_self": sorted(modules, key=lambda row: row["self_time_us"], reverse=True)[:top_count],
+    }
+
+
+def _import_breakdown_scenario() -> dict[str, Any]:
+    started = time.perf_counter_ns()
+    process = subprocess.run(
+        [sys.executable, "-X", "importtime", "-c", "import virtual_warehouse_app"],
+        capture_output=True, text=True,
+    )
+    traceback_present = "Traceback (most recent call last)" in process.stderr
+    parsed = parse_importtime_output(process.stderr)
+    status = "failed" if process.returncode != 0 and traceback_present else ("ok" if parsed["modules_count"] else "warning")
+    result = {"status": status, "wall_time_ms": (time.perf_counter_ns() - started) / 1_000_000,
+              "return_code": process.returncode, "traceback_present": traceback_present, **parsed}
+    if not parsed["modules_count"]:
+        result["warning"] = "Python importtime output could not be parsed."
+    elif process.returncode != 0:
+        result["warning"] = "Import profiling subprocess returned a non-zero code without a traceback."
+    return result
+
+
+def _startup_modules_scenario() -> dict[str, Any]:
+    code = "import json,sys,virtual_warehouse_app; print(json.dumps({name:name in sys.modules for name in " + repr(STARTUP_MODULES) + "}))"
+    process = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    try:
+        loaded = json.loads(process.stdout.strip()) if process.returncode == 0 else {}
+    except json.JSONDecodeError:
+        loaded = {}
+    return {"status": "ok" if len(loaded) == len(STARTUP_MODULES) else "warning",
+            "return_code": process.returncode, "loaded": {name: bool(loaded.get(name)) for name in STARTUP_MODULES}}
+
+
+def _repeated_import_scenario(iterations: int) -> dict[str, Any]:
+    measurements = [_import_scenario()["wall_time_ms"] for _ in range(max(1, iterations))]
+    return _summary(measurements)
+
+
 def run_benchmark(mode: str = "current-or-synthetic", cells: int = 16_000,
                   occupied_cells: int = 500, placements_count: int = 700,
-                  warm_iterations: int = 3) -> dict[str, Any]:
+                  warm_iterations: int = 3, import_iterations: int = 5) -> dict[str, Any]:
     """Run all measurements without invoking any production mutation API."""
     if mode not in {"current", "synthetic", "current-or-synthetic"}:
         raise ValueError(f"Unsupported mode: {mode}")
@@ -212,6 +278,11 @@ def run_benchmark(mode: str = "current-or-synthetic", cells: int = 16_000,
     model, placement_state, source_mode, warnings, load_ms = load_benchmark_dataset(
         mode, cells, occupied_cells, placements_count)
     scenarios: dict[str, dict[str, Any]] = {"application_import": _import_scenario()}
+    scenarios["application_import_repeated"] = _repeated_import_scenario(import_iterations)
+    scenarios["application_import_breakdown"] = _import_breakdown_scenario()
+    scenarios["startup_modules"] = _startup_modules_scenario()
+    if scenarios["application_import_breakdown"].get("warning"):
+        warnings.append(scenarios["application_import_breakdown"]["warning"])
     scenarios["model_loading"] = {"status": "ok", "wall_time_ms": load_ms,
         "operation": "direct_load" if source_mode == "current" else "synthetic_generation",
         "cells_count": len(model.get("cells", [])), "rows_count": len(model.get("rows", [])),
@@ -397,6 +468,13 @@ def render_markdown_report(result: dict[str, Any]) -> str:
 - Static SVG: {s['static_cold']['wall_time_ms']:.3f} ms; tracemalloc peak {s['static_cold']['python_tracemalloc_peak_bytes']} bytes
 - Dynamic payload: {s['dynamic_cold']['wall_time_ms']:.3f} ms; tracemalloc peak {s['dynamic_cold']['python_tracemalloc_peak_bytes']} bytes
 - Layer composition: {s['compose_layers']['wall_time_ms']:.3f} ms; tracemalloc peak {s['compose_layers']['python_tracemalloc_peak_bytes']} bytes
+
+## Разбивка холодного импорта
+- Repeated app import min/median/max: {s['application_import_repeated']['min_ms']:.3f}/{s['application_import_repeated']['median_ms']:.3f}/{s['application_import_repeated']['max_ms']:.3f} ms ({s['application_import_repeated']['iterations']} subprocesses)
+
+| Модуль | Self, мс | Cumulative, мс |
+|---|---:|---:|
+{chr(10).join(f"| {row['module_name']} | {row['self_time_us'] / 1000:.3f} | {row['cumulative_time_us'] / 1000:.3f} |" for row in s['application_import_breakdown']['top_cumulative'])}
 
 ## 5. Warm operations
 - Static: min/median/max {s['static_warm']['min_ms']:.3f}/{s['static_warm']['median_ms']:.3f}/{s['static_warm']['max_ms']:.3f} ms ({s['static_warm']['iterations']} iterations)
