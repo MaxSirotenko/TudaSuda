@@ -204,10 +204,7 @@ def _import_scenario() -> dict[str, Any]:
 
 
 _IMPORTTIME_LINE = re.compile(r"^import time:\s*(\d+)\s*\|\s*(\d+)\s*\|\s*(.+?)\s*$")
-STARTUP_MODULES = (
-    "warehouse_legacy_excel_ui", "warehouse_excel_parser", "warehouse_visualization",
-    "warehouse_placement", "warehouse_diagnostics", "openpyxl",
-)
+STARTUP_MODULES = ("openpyxl",)
 
 
 def parse_importtime_output(stderr: str, top_count: int = 20) -> dict[str, Any]:

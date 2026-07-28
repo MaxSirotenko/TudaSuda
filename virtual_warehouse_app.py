@@ -159,7 +159,6 @@ APP_BUILD_LABEL = "virtual-excel-only-2026-07-04"
 MODEL_VERSION = 1
 LAST_IMPORT_DIR = Path("data/last_import")
 MODEL_PATH = LAST_IMPORT_DIR / "warehouse_model.json"
-RENDER_CACHE_PATH = LAST_IMPORT_DIR / "render_cache.json"
 META_PATH = LAST_IMPORT_DIR / "import_meta.json"
 RENDER_SETTINGS_PATH = LAST_IMPORT_DIR / "render_settings.json"
 
@@ -302,14 +301,6 @@ def file_hash(data: bytes) -> str:
 
 
 @st.cache_data(show_spinner=False)
-def prepare_render_cache_cached(model_payload: dict) -> dict:
-    from warehouse_legacy_excel_ui import model_from_dict
-    from warehouse_visualization import prepare_render_cache
-
-    return prepare_render_cache(model_from_dict(model_payload))
-
-
-@st.cache_data(show_spinner=False)
 def read_cell_table_cached(file_bytes: bytes, content_hash: str, sheet_name: str, header_rows: int) -> pd.DataFrame:
     return read_cell_table(file_bytes, sheet_name, header_rows=header_rows)
 
@@ -389,11 +380,9 @@ def build_geometry_html_cached(
 
 def invalidate_geometry_render_cache() -> None:
     """Invalidate only artifacts whose contents are derived from geometry."""
-    RENDER_CACHE_PATH.unlink(missing_ok=True)
     build_geometry_html_cached.clear()
     build_geometry_static_layer_cached.clear()
     build_geometry_dynamic_layer_cached.clear()
-    prepare_render_cache_cached.clear()
 
 
 @st.cache_data(show_spinner=False)
@@ -517,16 +506,6 @@ def render_map_settings_editor() -> dict:
         save_render_settings(settings)
         update_data_revisions(st.session_state.get("geometry_model"), ["render_settings"], "save_render_settings")
     return settings
-
-
-def save_uploaded_copy(uploaded_file, target_name: str) -> str:
-    if uploaded_file is None:
-        return ""
-    LAST_IMPORT_DIR.mkdir(parents=True, exist_ok=True)
-    target = LAST_IMPORT_DIR / target_name
-    target.write_bytes(uploaded_file.getvalue())
-    return str(target)
-
 
 
 def _is_numeric_text(value: str) -> bool:
@@ -2943,24 +2922,8 @@ def render_geometry_map_view(model: dict) -> None:
 def render_virtual_warehouse_excel() -> None:
     st.sidebar.caption(f"Сборка приложения: {APP_BUILD_LABEL}")
     render_git_release_badge()
-    mode = st.sidebar.radio(
-        "Режим",
-        ["Склад из Excel: ряды + ячейки + проезды", "Виртуальный склад по Excel-схеме"],
-        index=0,
-    )
-    if mode == "Склад из Excel: ряды + ячейки + проезды":
-        render_excel_geometry_warehouse()
-        return
-
-    from warehouse_legacy_excel_ui import render_legacy_excel_warehouse
-
-    render_legacy_excel_warehouse(
-        file_hash=file_hash,
-        write_json_atomic=write_json_atomic,
-        save_uploaded_copy=save_uploaded_copy,
-        update_data_revisions=update_data_revisions,
-        prepare_render_cache_cached=prepare_render_cache_cached,
-    )
+    st.sidebar.caption("Склад из Excel: ряды + ячейки + проезды")
+    render_excel_geometry_warehouse()
 
 
 _VIRTUAL_WAREHOUSE_APP_RENDERED = False

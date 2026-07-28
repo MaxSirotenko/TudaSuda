@@ -59,26 +59,19 @@ def test_reruns_are_not_scoped_or_used_by_fragment_wrappers():
         assert "st.rerun" not in _source(name)
 
 
-def test_geometry_cache_invalidation_is_targeted(monkeypatch, tmp_path):
+def test_geometry_cache_invalidation_is_targeted(monkeypatch):
     app = _load_app()
-    cache_path = tmp_path / "render_cache.json"
-    cache_path.write_text("{}", encoding="utf-8")
     cleared = []
-    monkeypatch.setattr(app, "RENDER_CACHE_PATH", cache_path)
     monkeypatch.setattr(app.build_geometry_html_cached, "clear", lambda: cleared.append("geometry"))
-    monkeypatch.setattr(app.prepare_render_cache_cached, "clear", lambda: cleared.append("render"))
 
     app.invalidate_geometry_render_cache()
 
-    assert not cache_path.exists()
-    assert cleared == ["geometry", "render"]
+    assert cleared == ["geometry"]
 
 
 def test_no_global_streamlit_cache_clear_and_single_invalidation_site():
     assert "st.cache_data.clear" not in SOURCE
-    assert SOURCE.count("RENDER_CACHE_PATH.unlink(") == 1
     assert SOURCE.count("build_geometry_html_cached.clear()") == 1
-    assert SOURCE.count("prepare_render_cache_cached.clear()") == 1
 
 
 def test_cancel_paths_do_not_rerun_or_invalidate_geometry_cache():

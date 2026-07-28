@@ -16,66 +16,55 @@ def _python(code: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run([sys.executable, "-c", code], cwd=ROOT, capture_output=True, text=True)
 
 
-def test_plain_application_import_defers_legacy_dependencies_and_openpyxl():
-    names = ("warehouse_legacy_excel_ui", "warehouse_excel_parser", "warehouse_visualization",
-             "warehouse_placement", "warehouse_diagnostics", "openpyxl")
-    process = _python("import json,sys,virtual_warehouse_app; print(json.dumps({n:n in sys.modules for n in %r}))" % (names,))
-    assert process.returncode == 0, process.stderr
-    assert json.loads(process.stdout.splitlines()[-1]) == {name: False for name in names}
-
-
-def test_legacy_module_is_one_way_and_import_has_no_persisted_side_effects():
-    paths = tuple(ROOT / "data/last_import" / name for name in (
+def _persisted_signatures() -> dict[Path, tuple[bool, str]]:
+    names = (
         "warehouse_model.json", "placements.json", "receipts.json", "outbound_orders.json",
         "outbound_execution_state.json", "outbound_execution_log.json", "data_revisions.json",
-        "placement_diagnostics.json",
-    ))
-    before = {p: (p.exists(), hashlib.sha256(p.read_bytes()).hexdigest() if p.exists() else "") for p in paths}
-    process = _python("import sys,warehouse_legacy_excel_ui; print('virtual_warehouse_app' in sys.modules)")
-    after = {p: (p.exists(), hashlib.sha256(p.read_bytes()).hexdigest() if p.exists() else "") for p in paths}
+        "placement_diagnostics.json", "row_settings.json", "manual_overrides.json",
+        "render_settings.json",
+    )
+    paths = (ROOT / "data/last_import" / name for name in names)
+    return {path: (path.exists(), hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else "") for path in paths}
+
+
+def test_plain_application_import_defers_openpyxl_and_has_no_persisted_side_effects():
+    before = _persisted_signatures()
+    process = _python("import json,sys,virtual_warehouse_app; print(json.dumps({'openpyxl': 'openpyxl' in sys.modules}))")
+    after = _persisted_signatures()
     assert process.returncode == 0, process.stderr
-    assert process.stdout.splitlines()[-1] == "False"
+    assert json.loads(process.stdout.splitlines()[-1]) == {"openpyxl": False}
     assert before == after
 
 
-def test_legacy_module_has_no_top_level_ui_or_application_import():
-    source = (ROOT / "warehouse_legacy_excel_ui.py").read_text(encoding="utf-8")
-    tree = ast.parse(source)
-    assert "virtual_warehouse_app" not in source
-    assert "set_page_config" not in source
-    assert not any(isinstance(node, ast.If) and isinstance(node.test, ast.Compare) for node in tree.body)
-    assert not any(isinstance(node, ast.Expr) and isinstance(node.value, ast.Call) for node in tree.body)
+def test_legacy_ui_and_dependencies_are_removed():
+    removed = (
+        "warehouse_legacy_excel_ui.py", "warehouse_excel_parser.py", "warehouse_model.py",
+        "warehouse_visualization.py", "warehouse_placement.py", "warehouse_diagnostics.py",
+    )
+    assert all(not (ROOT / name).exists() for name in removed)
+    sources = "\n".join(path.read_text(encoding="utf-8") for path in ROOT.glob("*.py"))
+    assert "warehouse_legacy_excel_ui" not in sources
+    assert "render_legacy_excel_warehouse" not in sources
 
 
-def test_excel_sheet_loader_is_lazy_and_closes_workbook(tmp_path):
-    import warehouse_legacy_excel_ui as legacy
-    from openpyxl import Workbook
-
-    path = tmp_path / "sheets.xlsx"
-    workbook = Workbook()
-    workbook.active.title = "Первый"
-    workbook.create_sheet("Второй")
-    workbook.save(path)
-    assert legacy.get_excel_sheet_names(path.read_bytes(), "unique-test-hash") == ["Первый", "Второй"]
-    path.unlink()  # Windows also proves the read-only workbook was closed.
-
-
-def test_dispatcher_preserves_mode_labels_default_and_lazy_import():
+def test_entrypoint_directly_renders_active_geometry_mode_without_mode_selector():
     source = (ROOT / "virtual_warehouse_app.py").read_text(encoding="utf-8")
-    assert '["Склад из Excel: ряды + ячейки + проезды", "Виртуальный склад по Excel-схеме"]' in source
-    assert "index=0" in source
-    assert "from warehouse_legacy_excel_ui import render_legacy_excel_warehouse" in source
-    assert "from openpyxl import load_workbook" not in source
+    tree = ast.parse(source)
+    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "render_virtual_warehouse_excel")
+    body = ast.get_source_segment(source, function) or ""
+    assert "render_excel_geometry_warehouse()" in body
+    assert ".radio(" not in body
+    assert "Виртуальный склад по Excel-схеме" not in source
+    assert "Склад из Excel: ряды + ячейки + проезды" in source
 
 
-def test_apptest_default_and_legacy_modes_open_without_exception():
+def test_apptest_opens_active_geometry_mode_without_exception_or_mode_radio():
     from streamlit.testing.v1 import AppTest
 
+    before = _persisted_signatures()
     app = AppTest.from_file(str(ROOT / "virtual_warehouse_app.py"), default_timeout=20).run()
+    after = _persisted_signatures()
     assert not app.exception
-    mode = next(radio for radio in app.radio if radio.label == "Режим")
-    assert mode.value == "Склад из Excel: ряды + ячейки + проезды"
-    mode.set_value("Виртуальный склад по Excel-схеме").run()
-    assert not app.exception
-    assert any("Загрузите Excel-схему" in item.value for item in app.info)
-    assert "warehouse_legacy_excel_ui" in sys.modules
+    assert not any(radio.label == "Режим" for radio in app.radio)
+    assert any("Склад из Excel: ряды + ячейки + проезды" in item.value for item in app.caption)
+    assert before == after
