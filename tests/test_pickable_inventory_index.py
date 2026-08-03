@@ -77,6 +77,86 @@ def test_duplicates_sum_stock_fields_separately_and_report_metadata_conflict():
     assert result["diagnostics"]["sku_metadata_conflicts"] == 1
 
 
+@pytest.mark.parametrize("raw", [5, 5.0, "5", "5,0"])
+def test_positive_unit_quantity_is_normalized_and_can_be_the_only_stock(raw):
+    placement = _placement(quantity=0, occupied_capacity_pallets=0, qty_units=raw, unit_name="короб")
+    result = build_pickable_inventory_index(_model([_cell()]), {"placements": [placement]})
+    record = next(iter(result["by_sku"].values()))[0]
+    assert record["qty_units"] == 5
+    assert isinstance(record["qty_units"], int)
+    assert record["unit_name"] == "короб"
+    assert record["unit_quantities"] == [{"unit_name": "короб", "qty_units": 5}]
+    assert result["diagnostics"]["placements_with_positive_qty_units"] == 1
+
+
+@pytest.mark.parametrize("raw", [1.5, -1, "bad", float("nan"), float("inf")])
+def test_invalid_unit_quantity_does_not_create_unit_stock(raw):
+    result = build_pickable_inventory_index(
+        _model([_cell()]), {"placements": [_placement(qty_units=raw, unit_name="короб")]}
+    )
+    record = next(iter(result["by_sku"].values()))[0]
+    assert record["qty_units"] is None
+    assert record["unit_name"] == ""
+    assert record["unit_quantities"] == []
+    assert result["diagnostics"]["invalid_qty_units"] == 1
+
+
+def test_zero_unit_quantity_is_not_stock_and_is_diagnosed():
+    result = build_pickable_inventory_index(
+        _model([_cell()]), {"placements": [_placement(qty_units=0, unit_name="короб")]}
+    )
+    record = next(iter(result["by_sku"].values()))[0]
+    assert record["unit_quantities"] == []
+    assert result["diagnostics"]["non_positive_qty_units"] == 1
+
+
+def test_missing_unit_name_is_preserved_as_an_unknown_variant():
+    result = build_pickable_inventory_index(
+        _model([_cell()]), {"placements": [_placement(qty_units=5, unit_name="  ")]}
+    )
+    record = next(iter(result["by_sku"].values()))[0]
+    assert record["unit_quantities"] == [{"unit_name": "", "qty_units": 5}]
+    assert (record["qty_units"], record["unit_name"]) == (5, "")
+    assert result["diagnostics"]["placements_missing_unit_name"] == 1
+
+
+def test_duplicate_units_are_grouped_without_mixing_other_stock_fields():
+    placements = [
+        _placement(quantity=2, occupied_capacity_pallets=1, qty_units=3, unit_name=" Короб "),
+        _placement(quantity=4, occupied_capacity_pallets=2, qty_units=2, unit_name="КОРОБ"),
+    ]
+    result = build_pickable_inventory_index(_model([_cell()]), {"placements": placements})
+    record = next(iter(result["by_sku"].values()))[0]
+    assert (record["quantity"], record["occupied_capacity_pallets"]) == (6.0, 3.0)
+    assert (record["qty_units"], record["unit_name"]) == (5, "Короб")
+    assert record["unit_quantities"] == [{"unit_name": "Короб", "qty_units": 5}]
+
+
+def test_distinct_units_are_kept_sorted_and_make_scalar_ambiguous():
+    placements = [
+        _placement(qty_units=5, unit_name=""),
+        _placement(qty_units=4, unit_name="штука"),
+        _placement(qty_units=3, unit_name="короб"),
+    ]
+    result = build_pickable_inventory_index(_model([_cell()]), {"placements": placements})
+    sku_record = next(iter(result["by_sku"].values()))[0]
+    cell_record = next(iter(result["by_cell"].values()))[0]
+    assert sku_record == cell_record
+    assert (sku_record["qty_units"], sku_record["unit_name"]) == (None, "")
+    assert sku_record["unit_quantities"] == [
+        {"unit_name": "короб", "qty_units": 3},
+        {"unit_name": "штука", "qty_units": 4},
+        {"unit_name": "", "qty_units": 5},
+    ]
+    diagnostics = result["diagnostics"]
+    assert (
+        diagnostics["unit_variants_in_same_cell"],
+        diagnostics["indexed_unit_variants"],
+        diagnostics["cells_with_unit_stock"],
+        diagnostics["skus_with_unit_stock"],
+    ) == (1, 3, 1, 1)
+
+
 @pytest.mark.parametrize("quantity,occupied", [(0, 0), (-1, -2), ("", "bad")])
 def test_non_positive_and_invalid_stock_is_skipped(quantity, occupied):
     result = build_pickable_inventory_index(

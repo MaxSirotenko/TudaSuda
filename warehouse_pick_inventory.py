@@ -34,6 +34,27 @@ def _number(value: Any) -> float:
         return 0.0
 
 
+def _unit_quantity(value: Any) -> tuple[int | None, bool]:
+    """Return an integral unit quantity and whether a value was supplied."""
+
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None, False
+    try:
+        number = float(str(value).strip().replace(",", "."))
+    except (TypeError, ValueError):
+        return None, True
+    if not math.isfinite(number) or number < 0 or not number.is_integer():
+        return None, True
+    return int(number), True
+
+
+def _unit_names(value: Any) -> tuple[str, str]:
+    """Return a stable display name and its private grouping key."""
+
+    display_name = " ".join(str(value).split()) if value is not None else ""
+    return display_name, display_name.casefold().replace("ё", "е")
+
+
 def _number_sort_key(value: Any) -> tuple[int, float | str]:
     text = _text(value)
     try:
@@ -107,6 +128,14 @@ def build_pickable_inventory_index(
         "skipped_unknown_cell": 0,
         "skipped_non_positive_stock": 0,
         "sku_metadata_conflicts": 0,
+        "placements_with_positive_qty_units": 0,
+        "placements_missing_unit_name": 0,
+        "invalid_qty_units": 0,
+        "non_positive_qty_units": 0,
+        "unit_variants_in_same_cell": 0,
+        "indexed_unit_variants": 0,
+        "cells_with_unit_stock": 0,
+        "skus_with_unit_stock": 0,
     }
     aggregated: dict[tuple[str, str], dict[str, Any]] = {}
     sku_metadata: dict[str, dict[str, str]] = {}
@@ -129,9 +158,21 @@ def build_pickable_inventory_index(
 
         quantity = _number(placement.get("quantity"))
         occupied = _number(placement.get("occupied_capacity_pallets"))
-        if quantity <= 0 and occupied <= 0:
+        unit_quantity, unit_quantity_supplied = _unit_quantity(placement.get("qty_units"))
+        positive_unit_quantity = unit_quantity is not None and unit_quantity > 0
+        if unit_quantity_supplied and unit_quantity is None:
+            diagnostics["invalid_qty_units"] += 1
+        elif unit_quantity is not None and unit_quantity <= 0:
+            diagnostics["non_positive_qty_units"] += 1
+        if positive_unit_quantity:
+            diagnostics["placements_with_positive_qty_units"] += 1
+        if quantity <= 0 and occupied <= 0 and not positive_unit_quantity:
             diagnostics["skipped_non_positive_stock"] += 1
             continue
+
+        unit_display_name, unit_key = _unit_names(placement.get("unit_name"))
+        if positive_unit_quantity and not unit_display_name:
+            diagnostics["placements_missing_unit_name"] += 1
 
         stable_metadata = sku_metadata.setdefault(
             sku_key, {field: "" for field in _SKU_METADATA_FIELDS}
@@ -150,6 +191,11 @@ def build_pickable_inventory_index(
             diagnostics["merged_duplicate_records"] += 1
             existing["quantity"] += quantity
             existing["occupied_capacity_pallets"] += occupied
+            if positive_unit_quantity:
+                variant = existing["_unit_quantities"].setdefault(
+                    unit_key, {"unit_name": unit_display_name, "qty_units": 0}
+                )
+                variant["qty_units"] += unit_quantity
             continue
 
         zone = cell.get("weight_zone")
@@ -171,11 +217,37 @@ def build_pickable_inventory_index(
             "x_center": _number(cell.get("x_center")),
             "y_center": _number(cell.get("y_center")),
             "source": _text(placement.get("source")),
+            "_unit_quantities": (
+                {unit_key: {"unit_name": unit_display_name, "qty_units": unit_quantity}}
+                if positive_unit_quantity
+                else {}
+            ),
         }
 
     by_sku: dict[str, list[dict[str, Any]]] = {}
     by_cell: dict[str, list[dict[str, Any]]] = {}
     for record in aggregated.values():
+        variants_by_key = record.pop("_unit_quantities")
+        variants = [
+            variants_by_key[key]
+            for key in sorted(
+                variants_by_key,
+                key=lambda key: (
+                    not bool(variants_by_key[key]["unit_name"]),
+                    key,
+                    variants_by_key[key]["unit_name"],
+                ),
+            )
+        ]
+        record["unit_quantities"] = variants
+        if len(variants) == 1:
+            record["qty_units"] = variants[0]["qty_units"]
+            record["unit_name"] = variants[0]["unit_name"]
+        else:
+            record["qty_units"] = None
+            record["unit_name"] = ""
+        if len(variants) > 1:
+            diagnostics["unit_variants_in_same_cell"] += 1
         record.update(sku_metadata[record["sku_key"]])
         by_sku.setdefault(record["sku_key"], []).append(record)
         by_cell.setdefault(record["cell_key"], []).append(record)
@@ -187,6 +259,15 @@ def build_pickable_inventory_index(
     diagnostics["indexed_records"] = len(aggregated)
     diagnostics["sku_count"] = len(by_sku)
     diagnostics["cell_count"] = len(by_cell)
+    diagnostics["indexed_unit_variants"] = sum(
+        len(record["unit_quantities"]) for record in aggregated.values()
+    )
+    diagnostics["cells_with_unit_stock"] = len(
+        {record["cell_key"] for record in aggregated.values() if record["unit_quantities"]}
+    )
+    diagnostics["skus_with_unit_stock"] = len(
+        {record["sku_key"] for record in aggregated.values() if record["unit_quantities"]}
+    )
     return {
         "model_id": model_id,
         "source_file_hash": source_file_hash,
