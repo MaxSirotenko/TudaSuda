@@ -17,10 +17,21 @@ OUTBOUND_EXECUTION_LOG_PATH = Path("data/last_import/outbound_execution_log.json
 PRE_OUTBOUND_SNAPSHOT_PATH = Path("data/last_import/pre_outbound_snapshot.json")
 
 FIELD_ALIASES = {
-    "outbound_order_number": ["outbound_order_number", "номер ро", "расходный ордер", "номер расходного ордера", "ро"],
-    "created_at": ["created_at", "дата создания", "дата и время", "дата ро"],
+    "outbound_order_ref": ["СсылкаРО", "Ссылка РО", "outbound_order_ref"],
+    "outbound_order_number": ["НомерРО", "Номер РО", "outbound_order_number", "расходный ордер", "номер расходного ордера", "ро"],
+    "created_at": ["ДатаРО", "Дата РО", "created_at", "дата создания", "дата и время"],
+    "distribution_center": ["РЦ", "distribution_center"],
+    "line_number": ["НомерСтроки", "Номер строки", "line_number"],
+    "nomenclature_code": ["КодНоменклатуры", "Код номенклатуры", "nomenclature_code"],
     "nomenclature": ["nomenclature", "номенклатура", "наименование", "товар", "sku_name"],
+    "characteristic_code": ["КодХарактеристики", "Код характеристики", "characteristic_code"],
     "characteristic": ["characteristic", "характеристика", "характеристика номенклатуры", "characteristic_name"],
+    "production_date": ["ДатаПроизводства", "Дата производства", "production_date"],
+    "source_quantity": ["Количество", "source_quantity"],
+    "source_unit_name": ["ЕдиницаИзмерения", "Единица измерения", "source_unit_name"],
+    "quantity_per_box": ["КоличествоВКоробке", "Количество в коробке", "quantity_per_box"],
+    "calculated_box_qty": ["РасчетноеОтгруженоКоробок", "Расчетное отгружено коробок", "calculated_box_qty"],
+    "calculation_control": ["КонтрольРасчета", "Контроль расчета", "calculation_control"],
     "qty_units": ["qty_units", "количество", "количество юнитов", "юниты"],
     "unit_name": ["unit_name", "единица", "единица измерения", "ед. изм."],
     "warehouse": ["warehouse", "склад"],
@@ -48,9 +59,15 @@ def _find_column(columns: list[str], aliases: list[str]) -> str | None:
     for alias in aliases:
         if _label(alias) in normalized:
             return normalized[_label(alias)]
-    for normalized_name, original in normalized.items():
-        if any(_label(alias) in normalized_name for alias in aliases):
-            return original
+    # A fuzzy match is only safe when it identifies exactly one column.  This
+    # prevents the legacy alias "Количество" from matching box-control fields.
+    candidates = {
+        original
+        for normalized_name, original in normalized.items()
+        if any(_label(alias) in normalized_name for alias in aliases)
+    }
+    if len(candidates) == 1:
+        return next(iter(candidates))
     return None
 
 
@@ -90,6 +107,8 @@ def detect_outbound_columns(table: pd.DataFrame) -> dict[str, str | None]:
 
 
 def _parse_units(value: Any) -> tuple[int | None, str]:
+    if isinstance(value, bool):
+        return None, "quantity_not_numeric"
     raw = _text(value)
     if not raw:
         return None, "quantity_missing"
@@ -102,6 +121,16 @@ def _parse_units(value: Any) -> tuple[int | None, str]:
     if not number.is_integer():
         return None, "quantity_fractional"
     return int(number), ""
+
+
+def _json_value(value: Any) -> Any:
+    if value is None or (not isinstance(value, str) and pd.isna(value)):
+        return ""
+    if isinstance(value, (pd.Timestamp, datetime)):
+        return value.isoformat()
+    if hasattr(value, "item"):
+        return value.item()
+    return value
 
 
 def _created_sort_value(value: Any) -> str:
@@ -121,7 +150,9 @@ def outbound_order_key(warehouse: Any, order_number: Any, created_at: Any) -> st
 def normalize_outbound_table(table: pd.DataFrame, mapping: dict[str, str | None]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     rows: list[dict[str, Any]] = []
     diagnostics: list[dict[str, Any]] = []
-    required = ["outbound_order_number", "created_at", "nomenclature", "qty_units", "warehouse"]
+    real_export = bool(mapping.get("calculated_box_qty"))
+    required = ["outbound_order_number", "created_at", "nomenclature", "warehouse"]
+    required.append("calculated_box_qty" if real_export else "qty_units")
     missing = [field for field in required if not mapping.get(field)]
     if missing:
         return [], [{"level": "error", "message": "Не выбраны обязательные колонки: " + ", ".join(missing)}]
@@ -130,8 +161,12 @@ def normalize_outbound_table(table: pd.DataFrame, mapping: dict[str, str | None]
             column = mapping.get(field)
             return source.get(column) if column else ""
 
-        raw_qty = value("qty_units")
+        raw_qty = value("calculated_box_qty" if real_export else "qty_units")
         qty_units, quantity_reason = _parse_units(raw_qty)
+        calculation_control = _text(value("calculation_control"))
+        control_label = _label(calculation_control)
+        if real_export and control_label == "количество в коробке не найдено":
+            qty_units, quantity_reason = 0, "quantity_per_box_missing"
         warehouse = _text(value("warehouse"))
         order_number = _text(value("outbound_order_number"))
         created_at = _created_sort_value(value("created_at"))
@@ -146,17 +181,31 @@ def normalize_outbound_table(table: pd.DataFrame, mapping: dict[str, str | None]
             "qty_units": qty_units,
             "qty_units_raw": _text(raw_qty),
             "quantity_validation_reason": quantity_reason,
-            "unit_name": _text(value("unit_name")),
+            "unit_name": "короб" if real_export else _text(value("unit_name")),
             "warehouse": warehouse,
             "source_index": source_index,
             "order_key": outbound_order_key(warehouse, order_number, created_at),
             "line_status": "not_processed",
         }
+        if real_export:
+            row.update({
+                "outbound_order_ref": _text(value("outbound_order_ref")),
+                "distribution_center": _text(value("distribution_center")),
+                "line_number": _json_value(value("line_number")),
+                "nomenclature_code": _text(value("nomenclature_code")),
+                "characteristic_code": _text(value("characteristic_code")),
+                "production_date": _json_value(value("production_date")),
+                "source_quantity": _json_value(value("source_quantity")),
+                "source_unit_name": _text(value("source_unit_name")),
+                "quantity_per_box": _json_value(value("quantity_per_box")),
+                "calculated_box_qty": _json_value(value("calculated_box_qty")),
+                "calculation_control": calculation_control,
+            })
         rows.append(row)
         if quantity_reason:
             diagnostics.append({"level": "warning", "source_index": source_index, "outbound_order_number": order_number, "reason": quantity_reason})
-        if _label(warehouse) != "вешки":
-            diagnostics.append({"level": "warning", "source_index": source_index, "outbound_order_number": order_number, "reason": "wrong_warehouse"})
+        if real_export and calculation_control and control_label != "количество в коробке не найдено":
+            diagnostics.append({"level": "warning", "source_index": source_index, "outbound_order_number": order_number, "reason": "calculation_control_warning"})
     return rows, diagnostics
 
 
@@ -294,9 +343,6 @@ def _execute_order(model: dict[str, Any], placement_state: dict[str, Any], order
         qty = row.get("qty_units")
         if not isinstance(qty, int) or qty < 0:
             results.append(_line_result(row, line_status="invalid_quantity", failure_reason=row.get("quantity_validation_reason") or "invalid_quantity"))
-            continue
-        if _label(row.get("warehouse")) != "вешки":
-            results.append(_line_result(row, requested_units=qty, line_status="wrong_warehouse", failure_reason="wrong_warehouse"))
             continue
         candidates = [placement for placement in state.get("placements", []) if placement_sku_key(placement) == row.get("sku_key") and _placement_units(placement) > 0]
         requested_unit = _label(row.get("unit_name"))
