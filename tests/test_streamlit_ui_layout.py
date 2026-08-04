@@ -23,12 +23,13 @@ def _function_source(name: str) -> str:
 def test_geometry_mode_has_dedicated_settings_tab():
     body = _function_source("render_excel_geometry_warehouse")
 
-    for label in ("Карта склада", "Настройки склада", "Приходы и инвент", "Аналитика", "Служебное"):
+    for label in ("Карта склада", "Настройки склада", "Приходы и инвент", "Аналитика", "Запросы 1С", "Служебное"):
         assert f'"{label}"' in body
     assert "render_warehouse_map_tab(model)" in body
     assert "render_warehouse_settings_tab(model)" in body
     assert "render_receipts_inventory_tab(model)" in body
     assert "render_analytics_fragment(model)" in body
+    assert "render_1c_queries_tab()" in body
     assert "render_service_tab(saved_model, model)" in body
     assert "st.tabs(" not in body
     assert 'key="warehouse_active_section"' in body
@@ -54,6 +55,7 @@ class _SectionNavigationStreamlit:
             "Настройки склада",
             "Приходы и инвент",
             "Аналитика",
+            "Запросы 1С",
             "Служебное",
         ]
         self.session_state.setdefault(key, options[0])
@@ -67,6 +69,7 @@ class _SectionNavigationStreamlit:
         ("settings", "settings", "render_section_settings"),
         ("receipts_inventory", "receipts_inventory", "render_section_receipts_inventory"),
         ("analytics", "analytics", "render_section_analytics"),
+        ("queries_1c", "queries_1c", "render_section_queries_1c"),
         ("service", "service", "render_section_service"),
     ],
 )
@@ -87,6 +90,7 @@ def test_only_selected_warehouse_section_is_rendered(monkeypatch, selected, expe
     monkeypatch.setattr(app, "render_warehouse_settings_tab", lambda model: calls.append("settings"))
     monkeypatch.setattr(app, "render_receipts_inventory_tab", lambda model: calls.append("receipts_inventory"))
     monkeypatch.setattr(app, "render_analytics_fragment", lambda model: calls.append("analytics"))
+    monkeypatch.setattr(app, "render_1c_queries_tab", lambda: calls.append("queries_1c"))
     monkeypatch.setattr(app, "render_service_tab", lambda saved_model, model: calls.append("service"))
 
     app.render_excel_geometry_warehouse()

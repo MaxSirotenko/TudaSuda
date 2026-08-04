@@ -14,6 +14,8 @@ import streamlit as st
 import streamlit.components.v1 as components
 from streamlit.runtime.scriptrunner import get_script_run_ctx
 
+from queries_1c import load_query_catalog
+
 from warehouse_performance import (
     clear_performance_history,
     finish_performance_run,
@@ -1698,6 +1700,48 @@ def render_analytics_tab(model: dict | None) -> None:
         st.dataframe(pd.DataFrame(last_report.get("details", [])), use_container_width=True)
 
 
+def render_1c_queries_tab() -> None:
+    st.subheader("Запросы 1С")
+    st.caption(
+        "Готовые запросы для ручного запуска в консоли запросов 1С. "
+        "Каталог не выполняет запросы и не изменяет данные приложения."
+    )
+    catalog = load_query_catalog()
+    selected = st.selectbox(
+        "Запрос",
+        catalog,
+        format_func=lambda query: query.title,
+        key="query_1c_selected",
+    )
+    st.markdown(f"### {selected.title}")
+    st.write(selected.description)
+    st.info("Кнопка копирования находится в правом верхнем углу блока с запросом.")
+    st.code(selected.text, language=None, line_numbers=True)
+    st.download_button(
+        "Скачать запрос",
+        data=selected.text.encode("utf-8"),
+        file_name=selected.filename,
+        mime="text/plain; charset=utf-8",
+        key=f"download_query_1c_{selected.slug}",
+    )
+
+    parameters, result_columns = st.columns(2)
+    with parameters:
+        st.markdown("#### Параметры")
+        st.dataframe(
+            pd.DataFrame(selected.parameters, columns=["Параметр", "Описание"]),
+            use_container_width=True,
+            hide_index=True,
+        )
+    with result_columns:
+        st.markdown("#### Результирующие колонки")
+        st.dataframe(
+            pd.DataFrame(selected.result_columns, columns=["Колонка", "Описание"]),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+
 @st.fragment
 def render_analytics_fragment(model: dict | None) -> None:
     with measure_step("fragment_analytics"):
@@ -1835,6 +1879,7 @@ def render_excel_geometry_warehouse() -> None:
         "settings": "Настройки склада",
         "receipts_inventory": "Приходы и инвент",
         "analytics": "Аналитика",
+        "queries_1c": "Запросы 1С",
         "service": "Служебное",
     }
     active_section = st.radio(
@@ -1857,6 +1902,9 @@ def render_excel_geometry_warehouse() -> None:
     elif active_section == "analytics":
         with measure_step("render_section_analytics"):
             render_analytics_fragment(model)
+    elif active_section == "queries_1c":
+        with measure_step("render_section_queries_1c"):
+            render_1c_queries_tab()
     elif active_section == "service":
         with measure_step("render_section_service"):
             render_service_tab(saved_model, model)
