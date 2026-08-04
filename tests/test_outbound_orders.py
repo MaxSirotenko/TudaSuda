@@ -76,7 +76,8 @@ def test_normalization_recognizes_columns_and_ignores_weight_for_quantity():
     assert diagnostics == []
     assert rows[0]["qty_units"] == 3
     assert "weight" not in rows[0]
-    assert set(mapping) == {"outbound_order_number", "created_at", "nomenclature", "characteristic", "qty_units", "unit_name", "warehouse"}
+    assert mapping["qty_units"] == "Количество"
+    assert mapping["calculated_box_qty"] is None
 
 
 def test_new_placement_record_keeps_integer_qty_units_and_never_uses_weight():
@@ -170,14 +171,96 @@ def test_unit_mismatch_does_not_change_stock_and_missing_unit_is_allowed_with_wa
     assert "Единица измерения не указана" in allowed_execution["line_results"][0]["warning"]
 
 
-def test_wrong_warehouse_is_rejected_without_stopping_veshki_order():
-    rows = [_order("RO-1", 2, warehouse="Другой"), _order("RO-2", 1, created="2026-07-20T11:00:00")]
+def test_compound_warehouse_name_is_accepted_during_execution():
+    rows = [_order("RO-1", 2, warehouse="Зона комплектации тестового РЦ")]
     state, execution, log, _ = _execute([_placement("1|1|1", 3)], rows)
 
-    assert execution["line_results"][0]["line_status"] == "wrong_warehouse"
-    assert execution["line_results"][1]["line_status"] == "completed"
-    assert state["placements"][0]["qty_units"] == 2
+    assert execution["line_results"][0]["line_status"] == "completed"
+    assert state["placements"][0]["qty_units"] == 1
     assert len(log) == 1
+
+
+def _real_export_row(**updates):
+    row = {
+        "СсылкаРО": "ref-1", "НомерРО": "RO-1", "ДатаРО": "2026-07-20", "Склад": "Зона комплектации тестового РЦ",
+        "РЦ": "Тестовый РЦ", "НомерСтроки": 4, "КодНоменклатуры": "ITEM-1", "Номенклатура": "Товар A",
+        "КодХарактеристики": "CHAR-1", "Характеристика": "Вариант A", "ДатаПроизводства": "2026-07-01",
+        "ЕдиницаИзмерения": "кг", "Количество": 115.8, "КоличествоВКоробке": 19.3,
+        "РасчетноеОтгруженоКоробок": 6, "КонтрольРасчета": "",
+    }
+    row.update(updates)
+    return row
+
+
+def test_real_export_exact_columns_and_control_values_are_preserved():
+    table = pd.DataFrame([_real_export_row()])
+    before = table.copy(deep=True)
+    mapping = outbound.detect_outbound_columns(table)
+    rows, diagnostics = outbound.normalize_outbound_table(table, mapping)
+
+    assert all(mapping[field] is not None for field in (
+        "outbound_order_ref", "outbound_order_number", "created_at", "warehouse", "distribution_center", "line_number",
+        "nomenclature_code", "nomenclature", "characteristic_code", "characteristic", "production_date",
+        "source_unit_name", "source_quantity", "quantity_per_box", "calculated_box_qty", "calculation_control",
+    ))
+    assert rows[0]["qty_units"] == 6
+    assert rows[0]["unit_name"] == "короб"
+    assert rows[0]["source_quantity"] == 115.8
+    assert rows[0]["source_unit_name"] == "кг"
+    assert rows[0]["quantity_per_box"] == 19.3
+    assert rows[0]["line_number"] == 4 and rows[0]["source_index"] == 1
+    assert diagnostics == []
+    json.dumps(rows, ensure_ascii=False)
+    pd.testing.assert_frame_equal(table, before)
+
+
+def test_calculated_boxes_have_priority_and_are_not_recalculated_in_python():
+    table = pd.DataFrame([_real_export_row(**{"Количество": 100, "КоличествоВКоробке": 10, "РасчетноеОтгруженоКоробок": 7})])
+    mapping = outbound.detect_outbound_columns(table)
+    rows, _ = outbound.normalize_outbound_table(table, mapping)
+
+    assert mapping["source_quantity"] == "Количество"
+    assert mapping["quantity_per_box"] == "КоличествоВКоробке"
+    assert mapping["calculated_box_qty"] == "РасчетноеОтгруженоКоробок"
+    assert rows[0]["qty_units"] == 7
+
+
+@pytest.mark.parametrize("raw", [6, 6.0, "6", "6,0", "6.0"])
+def test_calculated_boxes_accept_integer_representations(raw):
+    table = pd.DataFrame([_real_export_row(**{"РасчетноеОтгруженоКоробок": raw})])
+    rows, _ = outbound.normalize_outbound_table(table, outbound.detect_outbound_columns(table))
+    assert rows[0]["qty_units"] == 6
+
+
+@pytest.mark.parametrize("raw,reason", [
+    (6.5, "quantity_fractional"), (-1, "quantity_negative"), ("bad", "quantity_not_numeric"), ("", "quantity_missing"), (True, "quantity_not_numeric"),
+])
+def test_invalid_calculated_boxes_have_stable_reason(raw, reason):
+    table = pd.DataFrame([_real_export_row(**{"РасчетноеОтгруженоКоробок": raw})])
+    rows, diagnostics = outbound.normalize_outbound_table(table, outbound.detect_outbound_columns(table))
+    assert rows[0]["quantity_validation_reason"] == reason
+    assert diagnostics[0]["reason"] == reason
+
+
+def test_missing_quantity_per_box_control_is_nonfatal_and_unknown_control_warns():
+    table = pd.DataFrame([
+        _real_export_row(**{"РасчетноеОтгруженоКоробок": "", "КонтрольРасчета": "КОЛИЧЕСТВО В КОРОБКЕ НЕ НАЙДЕНО"}),
+        _real_export_row(**{"НомерРО": "RO-2", "КонтрольРасчета": "Проверить исходные данные"}),
+    ])
+    rows, diagnostics = outbound.normalize_outbound_table(table, outbound.detect_outbound_columns(table))
+    assert (rows[0]["qty_units"], rows[0]["unit_name"], rows[0]["quantity_validation_reason"]) == (0, "короб", "quantity_per_box_missing")
+    assert [item["reason"] for item in diagnostics] == ["quantity_per_box_missing", "calculation_control_warning"]
+
+
+def test_real_export_result_builds_box_pick_demand():
+    from warehouse_pick_demands import build_outbound_pick_demands
+
+    table = pd.DataFrame([_real_export_row(**{"РасчетноеОтгруженоКоробок": "7,0"})])
+    rows, _ = outbound.normalize_outbound_table(table, outbound.detect_outbound_columns(table))
+    demand = build_outbound_pick_demands(rows)["orders"][0]["demands"][0]
+    assert demand["requested_units"] == 7
+    assert isinstance(demand["requested_units"], int)
+    assert demand["unit_name"] == "короб"
 
 
 def test_processed_order_cannot_be_applied_twice():
