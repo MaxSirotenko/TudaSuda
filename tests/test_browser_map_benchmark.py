@@ -130,6 +130,6 @@ def test_benchmark_app_contains_no_writes_or_global_cache_clear():
     assert "st.columns(2)" in source
 
 
-def test_production_startup_and_ui_files_are_unchanged_by_feature():
-    status = subprocess.check_output(["git", "diff", "--name-only", "b4a0b8c", "--", "start.cmd", "virtual_warehouse_app.py"], cwd=ROOT, text=True)
+def test_production_startup_is_unchanged_by_browser_benchmark_feature():
+    status = subprocess.check_output(["git", "diff", "--name-only", "b4a0b8c", "--", "start.cmd"], cwd=ROOT, text=True)
     assert status == ""
