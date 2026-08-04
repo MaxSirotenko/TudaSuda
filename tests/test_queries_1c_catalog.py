@@ -21,20 +21,29 @@ INVENTORY_EXPECTED_RESULT_COLUMNS = (
     "Количество", "КоличествоПаллет", "КоличествоВКоробке",
     "РасчетноеКоличествоКоробов", "КонтрольРасчета",
 )
+INVENTORY_RESULTS_EXPECTED_PARAMETERS = ("ДатаНачала", "ДатаОкончания", "Склады")
+INVENTORY_RESULTS_EXPECTED_COLUMNS = (
+    "СсылкаИнвентаризации", "НомерИнвентаризации", "ДатаИнвентаризации", "Склад",
+    "РЦ", "НомерСтроки", "КодНоменклатуры", "Номенклатура",
+    "КодХарактеристики", "Характеристика", "ЕдиницаИзмерения",
+    "ФактическоеКоличество", "УчетноеКоличество", "Расхождение",
+    "КоличествоВКоробке", "РасчетноеКоличествоКоробов", "КонтрольРасчета",
+)
 
 
 def _names(items):
     return tuple(name for name, _description in items)
 
 
-def test_catalog_contains_two_queries_in_display_order():
+def test_catalog_contains_three_queries_in_display_order():
     catalog = load_query_catalog()
 
     assert isinstance(catalog, tuple)
-    assert len(catalog) == 2
+    assert len(catalog) == 3
     assert tuple(query.slug for query in catalog) == (
         "mass_outbound_orders",
         "actual_inventory_by_cells",
+        "inventory_results",
     )
 
 
@@ -75,6 +84,48 @@ def test_catalog_exposes_actual_inventory_query():
         assert period_parameter not in query.text
     assert _names(query.parameters) == INVENTORY_EXPECTED_PARAMETERS
     assert _names(query.result_columns) == INVENTORY_EXPECTED_RESULT_COLUMNS
+
+
+def test_catalog_exposes_draft_inventory_results_query():
+    query = load_query_catalog()[2]
+
+    assert query.slug == "inventory_results"
+    assert query.filename == "inventory_results.query"
+    assert query.text.startswith("ВЫБРАТЬ")
+    for fragment in (
+        "Документ.ИнвентаризацияСклад.Товары",
+        "РегистрСведений.КоличествоВКоробке.СрезПоследних",
+        "ФактическоеКоличество",
+        "УчетноеКоличество",
+        "Расхождение",
+        "РасчетноеКоличествоКоробов",
+        "КонтрольРасчета",
+        "&ДатаНачала",
+        "&ДатаОкончания",
+        "&Склады",
+        "Ссылка.Проведен",
+        "Ссылка.ПометкаУдаления",
+    ):
+        assert fragment in query.text
+    assert (
+        "ВТ_Инвентаризации.ФактическоеКоличество\n"
+        "\t\t\t\t/ ВТ_КоличествоВКоробке.КоличествоВКоробке"
+    ) in query.text
+    for unrelated_source in (
+        "ПоложенияВЯчейках",
+        "ТоварыНаПаллетах",
+        "РасходныйОрдерСклад",
+        "ЗаданиеНаПриемку",
+    ):
+        assert unrelated_source not in query.text
+    assert "МАКСИМУМ(\n\t\tВТ_Инвентаризации.ДатаИнвентаризации" not in query.text
+    metadata = f"{query.title} {query.description}".lower()
+    assert "чернов" in metadata
+    assert "ручной провер" in metadata
+    assert "проверен вручную" not in metadata
+    assert "проверенный запрос" not in metadata
+    assert _names(query.parameters) == INVENTORY_RESULTS_EXPECTED_PARAMETERS
+    assert _names(query.result_columns) == INVENTORY_RESULTS_EXPECTED_COLUMNS
 
 
 def test_query_texts_are_loaded_from_separate_files():
