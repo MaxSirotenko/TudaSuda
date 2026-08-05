@@ -31,4 +31,5 @@ Thumbs.db
 uploads/
 results/
 data/performance_benchmarks/
+data/performance/
 data/browser_performance_benchmarks/
