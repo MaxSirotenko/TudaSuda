@@ -29,21 +29,29 @@ INVENTORY_RESULTS_EXPECTED_COLUMNS = (
     "ФактическоеКоличество", "УчетноеКоличество", "Расхождение",
     "КоличествоВКоробке", "РасчетноеКоличествоКоробов", "КонтрольРасчета",
 )
+DAY_RECEIPTS_EXPECTED_PARAMETERS = ("ДатаНачала", "ДатаОкончания", "Склады")
+DAY_RECEIPTS_EXPECTED_COLUMNS = (
+    "СсылкаПриходногоОрдера", "НомерПриходногоОрдера", "ДатаПриходногоОрдера",
+    "Склад", "РЦ", "НомерСтроки", "КодНоменклатуры", "Номенклатура",
+    "КодХарактеристики", "Характеристика", "КоличествоКоробок", "КоличествоПаллет",
+    "ПриемкаТерминаломЗакончена", "ОжидаемыйПриход", "КонтрольКоличества",
+)
 
 
 def _names(items):
     return tuple(name for name, _description in items)
 
 
-def test_catalog_contains_three_queries_in_display_order():
+def test_catalog_contains_four_queries_in_display_order():
     catalog = load_query_catalog()
 
     assert isinstance(catalog, tuple)
-    assert len(catalog) == 3
+    assert len(catalog) == 4
     assert tuple(query.slug for query in catalog) == (
         "mass_outbound_orders",
         "actual_inventory_by_cells",
         "inventory_results",
+        "day_receipts",
     )
 
 
@@ -126,6 +134,62 @@ def test_catalog_exposes_draft_inventory_results_query():
     assert "проверенный запрос" not in metadata
     assert _names(query.parameters) == INVENTORY_RESULTS_EXPECTED_PARAMETERS
     assert _names(query.result_columns) == INVENTORY_RESULTS_EXPECTED_COLUMNS
+
+
+def test_catalog_exposes_draft_day_receipts_query():
+    query = load_query_catalog()[3]
+
+    assert query.slug == "day_receipts"
+    assert query.filename == "day_receipts.query"
+    assert query.text.startswith("ВЫБРАТЬ")
+    for fragment in (
+        "Документ.ПриходныйОрдерСклад.Товары",
+        "КоличествоКоробок",
+        "КоличествоПаллет",
+        "ПриемкаТерминаломЗакончена",
+        "ОжидаемыйПриход",
+        "КонтрольКоличества",
+        "&ДатаНачала",
+        "&ДатаОкончания",
+        "&Склады",
+        "Ссылка.Проведен",
+        "Ссылка.ПометкаУдаления",
+    ):
+        assert fragment in query.text
+    assert "ПриходныйОрдерТовары.КоличествоКоробок КАК КоличествоКоробок" in query.text
+    for forbidden_fragment in (
+        "КоличествоВКоробке",
+        "ВесИГабаритыУпаковки",
+        "ЦЕЛ(",
+        "РасчетноеКоличествоКоробов",
+        "РасчетноеОтгруженоКоробок",
+        "16:00",
+        "ЧАС(",
+        "ДОБАВИТЬКДАТЕ",
+        "ВРЕМЯ(",
+        "СГРУППИРОВАТЬ ПО",
+        "МАКСИМУМ(",
+        "СрезПоследних",
+        "РасходныйОрдерСклад",
+        "ИнвентаризацияСклад",
+        "ПоложенияВЯчейках",
+        "ТоварыНаПаллетах",
+        "TODO",
+        "...",
+        "Тестовый товар",
+        "Тестовый склад",
+    ):
+        assert forbidden_fragment not in query.text
+    assert _names(query.parameters) == DAY_RECEIPTS_EXPECTED_PARAMETERS
+    assert _names(query.result_columns) == DAY_RECEIPTS_EXPECTED_COLUMNS
+    metadata = f"{query.title} {query.description}".lower()
+    assert "чернов" in metadata
+    assert "проверен вручную" not in metadata
+    assert "проверенный запрос" not in metadata
+    assert "количествокоробок" in metadata
+    assert "16:00" in metadata
+    assert "не группирует" in metadata
+    assert "не выбирает последний" in metadata
 
 
 def test_query_texts_are_loaded_from_separate_files():
