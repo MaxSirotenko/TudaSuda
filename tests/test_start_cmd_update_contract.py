@@ -39,6 +39,19 @@ def test_temp_bootstrap_protects_self_update_before_git_commands():
     assert pos(text, "copy /y \"%~f0\"") < pos(text, "git status --porcelain")
 
 
+def test_bootstrap_does_not_read_temp_variable_in_same_parenthesized_block():
+    text = norm(read_start())
+    assignment = pos(text, 'set "start_cmd_temp=')
+    invocation = pos(text, 'call "%start_cmd_temp%"')
+
+    assert "if not defined start_cmd_bootstrapped (" not in text
+    assert "if defined start_cmd_bootstrapped goto :bootstrapped" in text
+    assert assignment < invocation
+    assert "(" not in text[assignment:invocation]
+    assert 'copy /y "%~f0" "%start_cmd_temp%"' in text
+    assert 'del "%start_cmd_temp%"' in text
+
+
 def test_bootstrap_enters_real_project_root_before_update():
     text = norm(read_start())
     assert "cd /d \"%start_cmd_project_root%\"" in text

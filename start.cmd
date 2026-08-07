@@ -1,21 +1,25 @@
 @echo off
 setlocal EnableExtensions
 
-if not defined START_CMD_BOOTSTRAPPED (
-    set "START_CMD_PROJECT_ROOT=%~dp0"
-    set "START_CMD_BOOTSTRAPPED=1"
-    set "START_CMD_TEMP=%TEMP%\tudasuda_start_%RANDOM%_%RANDOM%.cmd"
-    copy /Y "%~f0" "%START_CMD_TEMP%" >nul 2>&1
-    if errorlevel 1 (
-        echo ERROR: Failed to create a temporary launcher copy in "%TEMP%".
-        echo The application was not started.
-        exit /b 1
-    )
-    call "%START_CMD_TEMP%"
-    set "START_CMD_EXIT_CODE=%ERRORLEVEL%"
-    del "%START_CMD_TEMP%" >nul 2>&1
-    exit /b %START_CMD_EXIT_CODE%
-)
+if defined START_CMD_BOOTSTRAPPED goto :bootstrapped
+
+set "START_CMD_PROJECT_ROOT=%~dp0"
+set "START_CMD_BOOTSTRAPPED=1"
+set "START_CMD_TEMP=%TEMP%\tudasuda_start_%RANDOM%_%RANDOM%.cmd"
+copy /Y "%~f0" "%START_CMD_TEMP%" >nul 2>&1
+if errorlevel 1 goto :bootstrap_copy_failed
+
+call "%START_CMD_TEMP%"
+set "START_CMD_EXIT_CODE=%ERRORLEVEL%"
+del "%START_CMD_TEMP%" >nul 2>&1
+exit /b %START_CMD_EXIT_CODE%
+
+:bootstrap_copy_failed
+echo ERROR: Failed to create a temporary launcher copy in "%TEMP%".
+echo The application was not started.
+exit /b 1
+
+:bootstrapped
 
 if not defined START_CMD_PROJECT_ROOT (
     echo ERROR: START_CMD_PROJECT_ROOT is not defined for the bootstrapped launcher.
