@@ -15,6 +15,7 @@ import streamlit.components.v1 as components
 from streamlit.runtime.scriptrunner import get_script_run_ctx
 
 from queries_1c import load_query_catalog
+from warehouse_outbound_experiment_ui import render_outbound_experiment
 
 from warehouse_performance import (
     clear_performance_history,
@@ -1683,6 +1684,14 @@ def render_receipts_inventory_tab(model: dict | None) -> None:
 def render_analytics_tab(model: dict | None) -> None:
     if not model:
         st.info("Аналитика появится после загрузки модели склада.")
+        return
+    subsection = st.radio(
+        "Подраздел аналитики", ["placement", "outbound_experiment"],
+        format_func={"placement": "Размещение", "outbound_experiment": "CURRENT vs PROPOSED"}.get,
+        horizontal=True, key="warehouse_analytics_subsection", label_visibility="collapsed",
+    )
+    if subsection == "outbound_experiment":
+        render_outbound_experiment(model)
         return
     state, warning = load_placement_state_cached(model)
     if warning:
