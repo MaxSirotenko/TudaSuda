@@ -115,6 +115,38 @@ def test_slotting_scope_validation_duplicates_and_determinism():
     assert first["experiment_input_state_id"] == second["experiment_input_state_id"]
 
 
+def test_conflicting_slotting_rules_are_excluded_without_input_order_priority():
+    def change(values):
+        values[6] = [
+            {"sku_key": "R", "weight_zone": "heavy", "priority_rank": 0},
+            {"sku_key": "R", "weight_zone": "light", "priority_rank": None},
+        ]
+
+    first, diagnostics = build(transform=change)
+    second, _ = build(transform=lambda values: (change(values), values[6].reverse()))
+
+    assert first["pipeline_inputs"]["slotting_rule_state"]["sku_rules"] == []
+    assert diagnostics["slotting_rules"]["conflicting_sku_rows"] == 2
+    assert diagnostics["slotting_rules"]["receipt_sku_keys_without_slotting_rule"] == ["R"]
+    assert first == second
+    assert first["pipeline_inputs_ready"] is True
+
+
+def test_duplicate_slotting_sources_have_deterministic_audit_source():
+    def change(values):
+        values[6] = [
+            {"sku_key": "R", "weight_zone": "light", "source": "z-source"},
+            {"sku_key": "R", "weight_zone": "light", "source": "a-source"},
+        ]
+
+    first, diagnostics = build(transform=change)
+    second, _ = build(transform=lambda values: (change(values), values[6].reverse()))
+
+    assert first == second
+    assert diagnostics["slotting_rules"]["duplicate_rows"] == 1
+    assert first["pipeline_inputs"]["slotting_rule_state"]["sku_rules"][0]["source"] == "a-source"
+
+
 @pytest.mark.parametrize("zone_order", [[], ["heavy"] * 4, ["heavy", "medium", "light", "unassigned"]])
 def test_invalid_zone_order_is_fatal(zone_order):
     state, diagnostics = build(zone_order=zone_order)

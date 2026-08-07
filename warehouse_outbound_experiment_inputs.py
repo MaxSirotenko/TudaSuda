@@ -189,9 +189,10 @@ def build_outbound_experiment_inputs(
     diagnostics["outbound_demands"] = copy.deepcopy(outbound.get("diagnostics", {}))
 
     receipt_skus = {str(row.get("sku_key") or "").strip() for row in batches if isinstance(row, Mapping) and str(row.get("sku_key") or "").strip()}
-    valid_rules: dict[tuple[str, str, int | None], dict[str, Any]] = {}
+    candidate_rules: dict[str, list[dict[str, Any]]] = {}
     slot_diag = {"rows_input": len(slotting_rows), "valid_rules": 0, "invalid_rows": 0,
-                 "duplicate_rows": 0, "slotting_rows_outside_receipt_scope": 0,
+                 "duplicate_rows": 0, "conflicting_sku_rows": 0,
+                 "slotting_rows_outside_receipt_scope": 0,
                  "receipt_skus_without_slotting_rule": 0, "receipt_sku_keys_without_slotting_rule": []}
     for raw in slotting_rows:
         sku = str(raw.get("sku_key") or "").strip(); zone = str(raw.get("weight_zone") or "").strip().casefold()
@@ -200,15 +201,28 @@ def build_outbound_experiment_inputs(
             slot_diag["slotting_rows_outside_receipt_scope"] += 1; continue
         if zone not in DEFAULT_ZONE_ORDER or (rank is not None and (isinstance(rank, bool) or not isinstance(rank, int) or rank < 0)):
             slot_diag["invalid_rows"] += 1; continue
-        key = (sku, zone, rank)
         source = str(raw.get("source") or "experiment_input").strip() or "experiment_input"
         rule_identity = {"receipt_dataset_id": day["dataset_id"], "normalized_warehouse": target,
                          "sku_key": sku, "weight_zone": zone, "priority_rank": rank}
         rule = {"rule_key": _hash(rule_identity), "normalized_warehouse": target, "sku_key": sku,
                 "weight_zone": zone, "priority_rank": rank, "source": source}
-        if key in valid_rules: slot_diag["duplicate_rows"] += 1
-        else: valid_rules[key] = rule
-    rules = sorted(valid_rules.values(), key=lambda x: (x["sku_key"], x["weight_zone"], -1 if x["priority_rank"] is None else x["priority_rank"], x["rule_key"]))
+        candidate_rules.setdefault(sku, []).append(rule)
+
+    rules = []
+    for sku in sorted(candidate_rules):
+        candidates = candidate_rules[sku]
+        semantic_keys = {(rule["weight_zone"], rule["priority_rank"]) for rule in candidates}
+        if len(semantic_keys) != 1:
+            # A SKU must have one unambiguous rule.  Reject every conflicting
+            # candidate rather than using input order as an implicit priority.
+            slot_diag["conflicting_sku_rows"] += len(candidates)
+            continue
+        slot_diag["duplicate_rows"] += len(candidates) - 1
+        # Source is audit metadata, not rule priority.  A stable choice keeps
+        # the state invariant when otherwise-identical input rows are permuted.
+        rules.append(min(candidates, key=lambda rule: (rule["source"], rule["rule_key"])))
+    rules.sort(key=lambda x: (x["sku_key"], x["weight_zone"],
+                              -1 if x["priority_rank"] is None else x["priority_rank"], x["rule_key"]))
     covered = {x["sku_key"] for x in rules}
     missing = sorted(receipt_skus - covered)
     slot_diag.update(valid_rules=len(rules), receipt_skus_without_slotting_rule=len(missing),
