@@ -262,6 +262,26 @@ def test_palletized_receipt_is_not_duplicated_and_missing_rule_keeps_boxes():
     assert result["reasons"] == ["palletization_rule_missing"]
 
 
+def test_same_sku_receipt_batches_keep_pallet_lot_provenance():
+    event = receipt(qty=30)
+    first = event["receipt_batches"][0]
+    first["production_dates"] = ["2026-07-01"]
+    second = copy.deepcopy(first)
+    second.update({"qty_units": 20, "receipt_line_keys": ["r1-line-2"],
+                   "production_dates": ["2026-07-02"]})
+    event["receipt_batches"].append(second)
+
+    after, result = apply_warehouse_event(
+        model(), state(), event, palletization_rule_state=rules(),
+    )
+
+    assert result["pallet_units_created"] == 2
+    assert sorted(lot["production_dates"] for lot in after["stock_lots"]) == [
+        ["2026-07-01"], ["2026-07-02"],
+    ]
+    assert after["summary"]["total_boxes"] == 50
+
+
 def test_explicit_pallet_plan_requires_free_unique_exact_positions():
     cells = [cell("1|1|1"), cell("1|2|1")]; event = receipt(qty=100)
     initial = state(cells=cells); plan = pallet_plan(event, ["1|1|1", "1|2|1"])
