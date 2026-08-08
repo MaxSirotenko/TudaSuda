@@ -8,6 +8,7 @@ import pytest
 from warehouse_business_identity import canonical_sku_key
 from warehouse_event_reducer import apply_warehouse_event, reduce_warehouse_timeline
 from warehouse_event_timeline import build_warehouse_event_timeline
+from warehouse_palletization import build_palletization_rule_state, palletize_receipt_event
 from warehouse_simulation_state import build_initial_simulation_state, validate_simulation_state
 
 
@@ -59,6 +60,19 @@ def timeline(events, ready=True):
 
 def allocation(event, location="1|1|1"):
     return [{"sku_key": event["receipt_batches"][0]["sku_key"], "qty_boxes": event["receipt_batches"][0]["qty_units"], "cell_key": location}]
+
+
+def rules(value=50):
+    return build_palletization_rule_state([{"sku_key": sku(), "boxes_per_pallet": value,
+                                             "source": "nomenclature_master"}])[0]
+
+
+def pallet_plan(event, locations, cells=None):
+    units = palletize_receipt_event(event, rules())["pallet_units"]
+    return [{"pallet_unit_id": unit["pallet_unit_id"], "sku_key": unit["sku_key"],
+             "qty_boxes": unit["initial_boxes"], "cell_key": location,
+             "position_id": f"position:{location}:1", "normalized_warehouse": "вешки"}
+            for unit, location in zip(units, locations)]
 
 
 def test_invalid_initial_timeline_and_warehouse_block_before_events():
@@ -234,3 +248,63 @@ def test_real_timeline_contract_proves_chronological_integration(receipt_first, 
         receipt_allocations_by_event_id={receipt_event["event_id"]: allocation(receipt_event)})
     assert report["shortage_boxes"] == expected_shortage
     assert report["closing_boxes"] == expected_closing == final["summary"]["total_boxes"]
+
+
+def test_palletized_receipt_is_not_duplicated_and_missing_rule_keeps_boxes():
+    initial = state(); event = receipt(qty=100)
+    palletized, result = apply_warehouse_event(model(), initial, event, palletization_rule_state=rules())
+    assert result["pallet_units_created"] == 2
+    assert [p["initial_boxes"] for p in palletized["pallet_units"]] == [50, 50]
+    assert palletized["summary"]["total_boxes"] == 100
+    missing = build_palletization_rule_state([])[0]
+    unresolved, result = apply_warehouse_event(model(), initial, event, palletization_rule_state=missing)
+    assert unresolved["summary"]["total_boxes"] == 100 and unresolved["pallet_units"] == []
+    assert result["reasons"] == ["palletization_rule_missing"]
+
+
+def test_explicit_pallet_plan_requires_free_unique_exact_positions():
+    cells = [cell("1|1|1"), cell("1|2|1")]; event = receipt(qty=100)
+    initial = state(cells=cells); plan = pallet_plan(event, ["1|1|1", "1|2|1"])
+    after, result = apply_warehouse_event(model(cells), initial, event, palletization_rule_state=rules(),
+                                          receipt_pallet_plan=plan)
+    assert result["status"] == "applied" and result["pallets_positioned"] == 2
+    assert {p["status"] for p in after["physical_positions"]} == {"occupied"}
+    assert validate_simulation_state(after, model(cells))["valid"]
+    duplicate = copy.deepcopy(plan); duplicate[1]["position_id"] = duplicate[0]["position_id"]
+    duplicate[1]["cell_key"] = duplicate[0]["cell_key"]
+    assert apply_warehouse_event(model(cells), initial, event, palletization_rule_state=rules(),
+                                 receipt_pallet_plan=duplicate)[1]["status"] == "blocked"
+    occupied = state([opening_lot()], cells=cells)
+    assert apply_warehouse_event(model(cells), occupied, event, palletization_rule_state=rules(),
+                                 receipt_pallet_plan=plan)[1]["status"] == "blocked"
+
+
+def test_unknown_position_and_conflicting_allocation_modes_fail_closed():
+    cells = [cell("2|1|1", deep=True)]
+    initial = state([opening_lot(location="2|1|1")], cells=cells)
+    event = receipt(qty=50); plan = pallet_plan(event, ["2|1|1"])
+    plan[0]["position_id"] = "position:2|1|1:1"
+    assert apply_warehouse_event(model(cells), initial, event, palletization_rule_state=rules(),
+                                 receipt_pallet_plan=plan)[1]["status"] == "blocked"
+    empty = state(cells=cells)
+    result = apply_warehouse_event(model(cells), empty, event, receipt_allocations=allocation(event, "2|1|1"),
+                                   receipt_pallet_plan=plan, palletization_rule_state=rules())[1]
+    assert result["reasons"] == ["conflicting_receipt_allocation_modes"]
+
+
+def test_receipt_60_pick_50_depletes_pallet_and_releases_one_position():
+    cells = [cell("1|1|1"), cell("1|2|1")]; initial = state(cells=cells)
+    event = receipt(qty=60); plan = pallet_plan(event, ["1|1|1", "1|2|1"])
+    received, receipt_result = apply_warehouse_event(model(cells), initial, event,
+        palletization_rule_state=rules(), receipt_pallet_plan=plan)
+    full = next(lot for lot in received["stock_lots"] if lot["qty_boxes"] == 50)
+    pick = [{"demand_key": "o1-d", "stock_lot_id": full["stock_lot_id"], "qty_boxes": 50}]
+    final, result = apply_warehouse_event(model(cells), received, outbound(qty=50), outbound_pick_plan=pick)
+    assert receipt_result["full_pallets_created"] == 1 and receipt_result["partial_pallets_created"] == 1
+    assert final["summary"]["total_boxes"] == 10
+    assert final["summary"]["active_pallet_units"] == 1 and final["summary"]["depleted_pallet_units"] == 1
+    assert result["pallet_units_depleted"] == 1 and result["positions_released"] == 1
+    by_id = {position["position_id"]: position for position in final["physical_positions"]}
+    assert by_id[full["position_id"]]["status"] == "free"
+    assert sum(position["status"] == "occupied" for position in final["physical_positions"]) == 1
+    assert validate_simulation_state(final, model(cells))["valid"]

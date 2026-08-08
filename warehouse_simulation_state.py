@@ -20,7 +20,7 @@ from warehouse_business_identity import (
     validate_box_quantity,
 )
 
-SIMULATION_STATE_VERSION = 2
+SIMULATION_STATE_VERSION = 3
 POSITION_STATUSES = frozenset({"free", "occupied", "unknown"})
 
 LIMITATIONS = [
@@ -98,6 +98,8 @@ def _lot_from_opening(record: Mapping[str, Any], *, located: bool) -> tuple[dict
         "location_confidence": _text(record.get("confidence") or record.get("allocation_confidence")),
         "allocation_method": _text(record.get("allocation_method")),
         "source_placement_id": _text(record.get("placement_id")) or None,
+        "pallet_unit_id": None,
+        "position_id": None,
         "pallet_count": None,
         "pallet_count_status": "unknown",
     }
@@ -111,7 +113,7 @@ def _lot_from_opening(record: Mapping[str, Any], *, located: bool) -> tuple[dict
 def _state_identity(state: Mapping[str, Any]) -> dict[str, Any]:
     return {key: state.get(key) for key in (
         "simulation_state_version", "model_id", "target_normalized_warehouse", "simulation_time",
-        "stock_lots", "physical_positions", "cell_occupancy", "unresolved_stock", "applied_event_ids",
+        "stock_lots", "pallet_units", "physical_positions", "cell_occupancy", "unresolved_stock", "applied_event_ids",
     )}
 
 
@@ -129,15 +131,35 @@ def summarize_simulation_state(state: Mapping[str, Any]) -> dict[str, Any]:
     unknown = [lot for lot in lots if lot.get("location_status") == "unknown"]
     normal = [cell for cell in occupancy if cell.get("storage_type") != "deep_lane"]
     deep = [cell for cell in occupancy if cell.get("storage_type") == "deep_lane"]
+    pallets = state.get("pallet_units", []) or []
+    palletized_boxes = sum(unit.get("remaining_boxes", 0) for unit in pallets
+                           if unit.get("physical_status") == "active")
+    total_boxes = sum(lot.get("qty_boxes", 0) for lot in lots)
     return {
         "stock_lots": len(lots), "sku_count": len({lot.get("sku_key") for lot in lots}),
-        "total_boxes": sum(lot.get("qty_boxes", 0) for lot in lots),
+        "total_boxes": total_boxes,
         "located_stock_lots": len(located), "located_boxes": sum(lot["qty_boxes"] for lot in located),
         "unknown_location_stock_lots": len(unknown), "unknown_location_boxes": sum(lot["qty_boxes"] for lot in unknown),
         "physical_positions_total": len(positions),
         "positions_occupied": sum(p.get("status") == "occupied" for p in positions),
         "positions_free": sum(p.get("status") == "free" for p in positions),
         "positions_unknown": sum(p.get("status") == "unknown" for p in positions),
+        "physical_positions_occupied": sum(p.get("status") == "occupied" for p in positions),
+        "physical_positions_free": sum(p.get("status") == "free" for p in positions),
+        "physical_positions_unknown": sum(p.get("status") == "unknown" for p in positions),
+        "pallet_units_total": len(pallets),
+        "active_pallet_units": sum(p.get("physical_status") == "active" for p in pallets),
+        "depleted_pallet_units": sum(p.get("physical_status") == "depleted" for p in pallets),
+        "unassigned_pallet_units": sum(p.get("physical_status") == "active" and p.get("location_status") == "unassigned" for p in pallets),
+        "exact_positioned_pallet_units": sum(p.get("physical_status") == "active" and p.get("location_status") == "located" for p in pallets),
+        "full_pallet_units": sum(not p.get("is_partial") for p in pallets),
+        "partial_pallet_units": sum(bool(p.get("is_partial")) for p in pallets),
+        "palletized_boxes": palletized_boxes,
+        "palletized_stock_boxes": palletized_boxes,
+        "unpalletized_boxes": total_boxes - palletized_boxes,
+        "non_palletized_stock_boxes": total_boxes - palletized_boxes,
+        "palletization_rule_coverage_boxes_percent": (100.0 * palletized_boxes / total_boxes) if total_boxes else 100.0,
+        "positions_released_total": state.get("positions_released_total", 0),
         "normal_cells_occupied": sum(c.get("exact_occupied_positions") == 1 for c in normal),
         "normal_cells_free": sum(c.get("exact_occupied_positions") == 0 for c in normal),
         "deep_lane_cells_total": len(deep),
@@ -154,6 +176,7 @@ def summarize_simulation_state(state: Mapping[str, Any]) -> dict[str, Any]:
 def rebuild_simulation_state_views(model: Mapping[str, Any], state: Mapping[str, Any]) -> dict[str, Any]:
     """Derive occupancy and unresolved-stock views from active lots, without mutation."""
     lots = list(state.get("stock_lots", []) or [])
+    pallets = list(state.get("pallet_units", []) or [])
     cells = sorted((model.get("cells", []) or []), key=_cell_key)
     cell_by_key = {_cell_key(cell): cell for cell in cells}
     by_cell: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
@@ -168,6 +191,8 @@ def rebuild_simulation_state_views(model: Mapping[str, Any], state: Mapping[str,
             else:
                 by_cell[lot["cell_key"]].append(lot)
     has_unknown = any(lot.get("location_status") == "unknown" for lot in lots)
+    active_positioned = {p.get("position_id"): p for p in pallets
+                         if p.get("physical_status") == "active" and p.get("location_status") == "located"}
     positions, occupancies = [], []
     for cell in cells:
         key, cell_lots = _cell_key(cell), by_cell.get(_cell_key(cell), [])
@@ -199,7 +224,25 @@ def rebuild_simulation_state_views(model: Mapping[str, Any], state: Mapping[str,
         if conflict:
             diagnostics["multiple_stock_lots_single_position"] += 1
             configuration_errors.append({"reason": "multiple_stock_lots_single_position", "cell_key": key})
-        if cell_lots and deep:
+        exact_lots = [lot for lot in cell_lots if lot.get("pallet_unit_id") and lot.get("position_id")]
+        legacy_lots = [lot for lot in cell_lots if not (lot.get("pallet_unit_id") and lot.get("position_id"))]
+        exact_positions = {lot.get("position_id") for lot in exact_lots}
+        legacy_receipt_allocation = any(lot.get("source") == "receipt_event" and not lot.get("position_id")
+                                        for lot in cell_lots)
+        if legacy_receipt_allocation and not deep:
+            status, minimum, maximum, exact, occupancy_status = "unknown", 0, 1, None, "unknown"
+        elif deep and legacy_lots:
+            minimum = len(exact_positions) + 1
+            if minimum > capacity:
+                configuration_errors.append({"reason": "physical_position_capacity_exceeded", "cell_key": key})
+                conflict = True
+                minimum = capacity
+            status, maximum, exact, occupancy_status = "unknown", capacity, None, "mixed_exact_unknown"
+        elif deep and exact_lots:
+            status = "exact"
+            minimum = maximum = exact = len(exact_positions)
+            occupancy_status = "occupied" if exact else "free"
+        elif cell_lots and deep:
             status, minimum, maximum, exact, occupancy_status = "unknown", 1, capacity, None, "unknown_count"
         elif cell_lots:
             status, minimum, maximum, exact, occupancy_status = "occupied", 1, 1, 1, "occupied"
@@ -210,10 +253,25 @@ def rebuild_simulation_state_views(model: Mapping[str, Any], state: Mapping[str,
         if status == "unknown":
             diagnostics["occupancy_not_authoritative"] += 1
         for index, _ in sorted(slots):
-            positions.append({"position_id": f"position:{key}:{index}", "cell_key": key, "slot_index": index,
+            position_id = f"position:{key}:{index}"
+            occupant = active_positioned.get(position_id)
+            if occupant:
+                position_status = "occupied"
+            elif deep and legacy_lots:
+                position_status = "unknown"
+            elif status == "exact":
+                position_status = "free"
+            else:
+                position_status = status
+            occupied_ids = sorted(lot["stock_lot_id"] for lot in cell_lots
+                                  if lot.get("position_id") == position_id)
+            if position_status == "occupied" and not occupied_ids and not deep:
+                occupied_ids = sorted(lot["stock_lot_id"] for lot in cell_lots)
+            positions.append({"position_id": position_id, "cell_key": key, "slot_index": index,
                 "depth_index": index if deep else None, "row_number": cell.get("row_number"),
-                "cell_number": cell.get("cell_number"), "tier": cell.get("tier") or "1", "status": status,
-                "occupied_stock_lot_ids": sorted(lot["stock_lot_id"] for lot in cell_lots) if status == "occupied" else []})
+                "cell_number": cell.get("cell_number"), "tier": cell.get("tier") or "1", "status": position_status,
+                "occupied_stock_lot_ids": occupied_ids if position_status == "occupied" else [],
+                "pallet_unit_id": occupant.get("pallet_unit_id") if occupant else None})
         occupancies.append({"cell_key": key, "storage_type": "deep_lane" if deep else "normal",
             "capacity_pallet_positions": max(capacity, 0), "stock_lot_ids": sorted(lot["stock_lot_id"] for lot in cell_lots),
             "qty_boxes": sum(lot["qty_boxes"] for lot in cell_lots), "occupancy_status": occupancy_status,
@@ -222,7 +280,8 @@ def rebuild_simulation_state_views(model: Mapping[str, Any], state: Mapping[str,
             "occupancy_conflict": conflict})
     positions.sort(key=lambda item: item["position_id"])
     unresolved = [{"stock_lot_id": lot["stock_lot_id"], "sku_key": lot["sku_key"], "qty_boxes": lot["qty_boxes"],
-                   "reason": "unknown_location"} for lot in lots if lot.get("location_status") == "unknown"]
+                   "reason": lot.get("unresolved_reason") or "unknown_location"}
+                  for lot in lots if lot.get("location_status") == "unknown"]
     physical_ready = not has_unknown and not any(p["status"] == "unknown" for p in positions) and not any(
         diagnostics[name] for name in ("unknown_cell_reference", "physical_slot_contract_invalid", "multiple_stock_lots_single_position"))
     return {"physical_positions": positions, "cell_occupancy": occupancies, "unresolved_stock": unresolved,
@@ -235,6 +294,7 @@ def refresh_simulation_state(model: Mapping[str, Any], state: Mapping[str, Any])
     import copy
     result = copy.deepcopy(dict(state))
     result["stock_lots"] = sorted(result.get("stock_lots", []), key=lambda lot: (lot["stock_lot_id"], _canonical_json(lot)))
+    result["pallet_units"] = sorted(result.get("pallet_units", []), key=lambda pallet: pallet["pallet_unit_id"])
     view = rebuild_simulation_state_views(model, result)
     result["physical_positions"] = view["physical_positions"]
     result["cell_occupancy"] = view["cell_occupancy"]
@@ -301,9 +361,10 @@ def build_initial_simulation_state(
         "simulation_state_version": SIMULATION_STATE_VERSION, "simulation_state_id": "",
         "model_id": model.get("model_id"), "source_file_hash": model.get("source_file_hash"),
         "target_normalized_warehouse": warehouse, "simulation_time": simulation_time,
-        "stock_lots": lots, "physical_positions": positions, "cell_occupancy": occupancies,
+        "stock_lots": lots, "pallet_units": [], "physical_positions": positions, "cell_occupancy": occupancies,
         "unresolved_stock": view["unresolved_stock"],
         "applied_event_ids": [],
+        "positions_released_total": 0,
         "stock_conservation": {"opening_boxes_input": opening_boxes, "cumulative_receipt_boxes": 0,
                                "cumulative_picked_boxes": 0, "expected_stock_boxes": opening_boxes,
                                "stock_boxes_state": state_boxes,
@@ -342,7 +403,10 @@ def validate_simulation_state(state: Mapping[str, Any], model: Mapping[str, Any]
             error("invalid_box_quantity", stock_lot_id=lot.get("stock_lot_id"))
         if normalize_unit_name(lot.get("unit_name")) != CANONICAL_BOX_UNIT or lot.get("unit_name") != CANONICAL_BOX_UNIT:
             error("unsupported_unit", stock_lot_id=lot.get("stock_lot_id"))
-        if lot.get("pallet_count") == 0 or lot.get("pallet_count_status") != "unknown":
+        linked = bool(lot.get("pallet_unit_id"))
+        valid_pallet_count = ((lot.get("pallet_count") is None and lot.get("pallet_count_status") == "unknown")
+                              or (linked and lot.get("pallet_count") == 1 and lot.get("pallet_count_status") == "exact"))
+        if not valid_pallet_count:
             error("invalid_pallet_count_authority", stock_lot_id=lot.get("stock_lot_id"))
         if lot.get("location_status") == "located" and model_cells is not None and lot.get("cell_key") not in model_cells:
             error("unknown_cell_reference", cell_key=lot.get("cell_key"))
@@ -357,6 +421,51 @@ def validate_simulation_state(state: Mapping[str, Any], model: Mapping[str, Any]
             error("unknown_cell_reference", cell_key=position.get("cell_key"))
         if any(lot_id not in lot_ids for lot_id in position.get("occupied_stock_lot_ids", []) or []):
             error("invalid_occupied_stock_lot_reference", position_id=position.get("position_id"))
+    position_by_id = {position.get("position_id"): position for position in positions}
+    pallets = state.get("pallet_units", []) or []
+    pallet_ids = [pallet.get("pallet_unit_id") for pallet in pallets]
+    if len(pallet_ids) != len(set(pallet_ids)):
+        error("duplicate_pallet_unit_id")
+    pallet_by_id = {pallet.get("pallet_unit_id"): pallet for pallet in pallets}
+    active_positions: list[str] = []
+    for pallet in pallets:
+        pallet_id = pallet.get("pallet_unit_id")
+        if not str(pallet.get("sku_key", "")).startswith("sku:v2:"):
+            error("invalid_pallet_unit_sku", pallet_unit_id=pallet_id)
+        capacity, capacity_error = validate_box_quantity(pallet.get("capacity_boxes"), positive=True)
+        initial, initial_error = validate_box_quantity(pallet.get("initial_boxes"), positive=True)
+        remaining = pallet.get("remaining_boxes")
+        if capacity_error or initial_error or initial > capacity:
+            error("invalid_pallet_unit_capacity", pallet_unit_id=pallet_id)
+        if (not isinstance(remaining, int) or isinstance(remaining, bool) or
+                (not initial_error and not 0 <= remaining <= initial)):
+            error("invalid_pallet_unit_remaining_boxes", pallet_unit_id=pallet_id)
+            continue
+        expected_status = "active" if remaining > 0 else "depleted"
+        if pallet.get("physical_status") != expected_status:
+            error("invalid_pallet_unit_physical_status", pallet_unit_id=pallet_id)
+        if pallet.get("location_status") == "located" and remaining > 0:
+            position = position_by_id.get(pallet.get("position_id"))
+            if not position:
+                error("invalid_pallet_position", pallet_unit_id=pallet_id)
+            else:
+                active_positions.append(pallet["position_id"])
+                if position.get("cell_key") != pallet.get("cell_key"):
+                    error("pallet_position_cell_mismatch", pallet_unit_id=pallet_id)
+                if position.get("status") != "occupied":
+                    error("active_pallet_at_non_occupied_position", pallet_unit_id=pallet_id)
+    if len(active_positions) != len(set(active_positions)):
+        error("multiple_active_pallets_same_position")
+    for lot in lots:
+        pallet_id = lot.get("pallet_unit_id")
+        if not pallet_id:
+            continue
+        pallet = pallet_by_id.get(pallet_id)
+        if not pallet:
+            error("invalid_stock_lot_pallet_reference", stock_lot_id=lot.get("stock_lot_id"))
+        elif (lot.get("sku_key") != pallet.get("sku_key") or lot.get("qty_boxes") != pallet.get("remaining_boxes")
+              or lot.get("position_id") != pallet.get("position_id") or lot.get("cell_key") != pallet.get("cell_key")):
+            error("stock_lot_pallet_link_mismatch", stock_lot_id=lot.get("stock_lot_id"))
     occupancy = state.get("cell_occupancy", []) or []
     if len([cell.get("cell_key") for cell in occupancy]) != len({cell.get("cell_key") for cell in occupancy}):
         error("duplicate_cell_occupancy")
@@ -403,4 +512,9 @@ def validate_simulation_state(state: Mapping[str, Any], model: Mapping[str, Any]
             or conservation.get("stock_boxes_state") != total
             or conservation.get("stock_conservation_ok") != (expected == total)):
         error("stock_conservation_metadata_mismatch")
+    palletized = sum(pallet.get("remaining_boxes", 0) for pallet in pallets
+                     if pallet.get("physical_status") == "active")
+    linked_total = sum(lot.get("qty_boxes", 0) for lot in lots if lot.get("pallet_unit_id"))
+    if palletized != linked_total or palletized > total:
+        error("pallet_stock_conservation_mismatch")
     return {"valid": not errors, "errors": errors}

@@ -16,6 +16,7 @@ from warehouse_business_identity import (
 from warehouse_simulation_state import (
     compute_simulation_state_id, refresh_simulation_state, validate_simulation_state,
 )
+from warehouse_palletization import palletize_receipt_event
 
 SAME_TIMESTAMP_POLICIES = frozenset({"event_id_order", "receipts_first", "outbound_first"})
 LIMITATIONS = [
@@ -23,8 +24,8 @@ LIMITATIONS = [
     "receipt_cell_is_never_selected_by_reducer",
     "multiple_outbound_locations_require_explicit_pick_plan",
     "unknown_location_stock_is_not_automatically_pickable",
-    "boxes_are_not_converted_to_pallets",
-    "deep_lane_depth_and_pallet_release_are_not_inferred",
+    "receipt_positions_require_explicit_pallet_plan",
+    "deep_lane_front_is_not_inferred",
     "routing_and_replenishment_are_not_modeled",
 ]
 
@@ -46,7 +47,7 @@ def _result(event: Mapping[str, Any], state: Mapping[str, Any], *, status: str,
             reasons: list[str], receipt: int = 0, requested: int = 0,
             picked: int = 0, shortage: int = 0, after: Mapping[str, Any] | None = None,
             demand_results: list[dict[str, Any]] | None = None,
-            depleted_lot_ids: list[str] | None = None) -> dict[str, Any]:
+            depleted_lot_ids: list[str] | None = None, **metrics: Any) -> dict[str, Any]:
     final = after or state
     result = {"event_id": event.get("event_id"), "event_type": event.get("event_type"),
               "occurred_at": event.get("occurred_at"), "status": status,
@@ -58,6 +59,7 @@ def _result(event: Mapping[str, Any], state: Mapping[str, Any], *, status: str,
         result["demand_results"] = demand_results
     if depleted_lot_ids:
         result["depleted_stock_lot_ids"] = sorted(depleted_lot_ids)
+    result.update(metrics)
     return result
 
 
@@ -105,6 +107,98 @@ def _receipt_lot(event: Mapping[str, Any], batch: Mapping[str, Any], allocation:
             "allocation_method": "explicit_receipt_allocation" if allocation else "",
             "source_placement_id": None, "location_confidence": "explicit" if allocation else "unknown",
             "pallet_count": None, "pallet_count_status": "unknown"}
+
+
+def _pallet_lot(event: Mapping[str, Any], batch: Mapping[str, Any], pallet: Mapping[str, Any],
+                *, unresolved_reason: str | None = None) -> dict[str, Any]:
+    pallet_id = pallet.get("pallet_unit_id")
+    identity = {"pallet_unit_id": pallet_id, "sku_key": pallet.get("sku_key"),
+                "source_event_id": event["event_id"]}
+    located = pallet.get("location_status") == "located"
+    return {
+        "stock_lot_id": _hash(identity), "sku_key": pallet["sku_key"],
+        "nomenclature": _text(batch.get("nomenclature") or batch.get("sku_name")),
+        "characteristic": _text(batch.get("characteristic") or batch.get("characteristic_name")),
+        "qty_boxes": pallet["remaining_boxes"], "unit_name": CANONICAL_BOX_UNIT,
+        "location_status": "located" if located else "unknown",
+        "cell_key": pallet.get("cell_key"), "position_id": pallet.get("position_id"),
+        "pallet_unit_id": pallet_id, "location_role": "unassigned", "production_dates": [],
+        "source": "receipt_event", "source_event_id": event["event_id"],
+        "allocation_method": "explicit_receipt_pallet_plan" if located else "",
+        "source_placement_id": None, "location_confidence": "explicit" if located else "unknown",
+        "unresolved_reason": unresolved_reason, "pallet_count": 1, "pallet_count_status": "exact",
+    }
+
+
+def _apply_palletized_receipt(
+    model: Mapping[str, Any], state: Mapping[str, Any], event: Mapping[str, Any],
+    rule_state: Mapping[str, Any], plan: list[dict[str, Any]] | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    batches = event.get("receipt_batches")
+    if not isinstance(batches, list) or not batches:
+        return _blocked(event, state, "invalid_receipt_batches")
+    for batch in batches:
+        quantity, error = (validate_box_quantity(batch.get("qty_units"), positive=True)
+                           if isinstance(batch, Mapping) else (None, "invalid"))
+        if (not isinstance(batch, Mapping) or not _valid_sku(batch) or error
+                or normalize_unit_name(batch.get("unit_name")) != CANONICAL_BOX_UNIT
+                or canonical_sku_key(batch) != batch.get("sku_key")):
+            return _blocked(event, state, "invalid_receipt_batch")
+    result = palletize_receipt_event(event, rule_state)
+    pallets = copy.deepcopy(result["pallet_units"])
+    unresolved = result["unresolved_batches"]
+    positions = {position["position_id"]: position for position in state.get("physical_positions", []) or []}
+    if plan is not None:
+        if not isinstance(plan, list) or unresolved:
+            return _blocked(event, state, "invalid_receipt_pallet_plan")
+        units = {unit["pallet_unit_id"]: unit for unit in pallets}
+        seen_units: set[str] = set(); seen_positions: set[str] = set()
+        for row in plan:
+            unit = units.get(_text(row.get("pallet_unit_id"))) if isinstance(row, Mapping) else None
+            position = positions.get(_text(row.get("position_id"))) if isinstance(row, Mapping) else None
+            quantity, error = validate_box_quantity(row.get("qty_boxes"), positive=True) if isinstance(row, Mapping) else (None, "invalid")
+            if (not unit or not position or error or unit["pallet_unit_id"] in seen_units
+                    or position["position_id"] in seen_positions
+                    or row.get("sku_key") != unit["sku_key"] or quantity != unit["initial_boxes"]
+                    or row.get("cell_key") != position.get("cell_key") or position.get("status") != "free"
+                    or normalize_warehouse(row.get("normalized_warehouse")) != state["target_normalized_warehouse"]):
+                return _blocked(event, state, "invalid_receipt_pallet_plan")
+            seen_units.add(unit["pallet_unit_id"]); seen_positions.add(position["position_id"])
+            unit.update({"position_id": position["position_id"], "cell_key": position["cell_key"],
+                         "location_status": "located"})
+        if seen_units != set(units):
+            return _blocked(event, state, "invalid_receipt_pallet_plan")
+    batches_by_sku = {batch["sku_key"]: batch for batch in event.get("receipt_batches", []) or []}
+    new = copy.deepcopy(dict(state))
+    new.setdefault("pallet_units", []).extend(pallets)
+    for pallet in pallets:
+        reason = None if pallet["location_status"] == "located" else "physical_pallet_placement_missing"
+        new["stock_lots"].append(_pallet_lot(event, batches_by_sku[pallet["sku_key"]], pallet,
+                                             unresolved_reason=reason))
+    # Missing/conflicting authority preserves boxes as non-palletized stock.
+    for index, item in enumerate(unresolved):
+        batch = batches_by_sku[item["sku_key"]]
+        lot = _receipt_lot(event, {**batch, "qty_units": item["qty_boxes"]}, None, index)
+        lot["unresolved_reason"] = item["reason"]
+        new["stock_lots"].append(lot)
+    total = sum(validate_box_quantity(batch["qty_units"], positive=True)[0] for batch in batches)
+    new["stock_conservation"]["cumulative_receipt_boxes"] += total
+    new["simulation_time"] = event["occurred_at"]
+    new["applied_event_ids"] = sorted([*new.get("applied_event_ids", []), event["event_id"]])
+    new = refresh_simulation_state(model, new)
+    reasons = sorted({item["reason"] for item in unresolved})
+    if pallets and plan is None:
+        reasons.append("physical_pallet_placement_missing")
+    full = sum(not unit["is_partial"] for unit in pallets)
+    partial = len(pallets) - full
+    return new, _result(
+        event, state, status="partial" if reasons else "applied", reasons=reasons,
+        receipt=total, after=new, palletization_status=result["palletization_status"],
+        pallet_units_created=len(pallets), full_pallets_created=full,
+        partial_pallets_created=partial,
+        pallets_positioned=sum(unit["location_status"] == "located" for unit in pallets),
+        pallets_unassigned=sum(unit["location_status"] == "unassigned" for unit in pallets),
+    )
 
 
 def _apply_receipt(model: Mapping[str, Any], state: Mapping[str, Any], event: Mapping[str, Any],
@@ -186,6 +280,8 @@ def _apply_outbound(model: Mapping[str, Any], state: Mapping[str, Any], event: M
         normalized.append(item); demand_by_key[key] = item
     lots = copy.deepcopy(list(state.get("stock_lots", [])))
     lot_by_id = {lot["stock_lot_id"]: lot for lot in lots}
+    pallets = copy.deepcopy(list(state.get("pallet_units", [])))
+    pallet_by_id = {pallet["pallet_unit_id"]: pallet for pallet in pallets}
     picks: defaultdict[str, list[tuple[str, int]]] = defaultdict(list)
     if plan is not None:
         if not isinstance(plan, list):
@@ -205,6 +301,7 @@ def _apply_outbound(model: Mapping[str, Any], state: Mapping[str, Any], event: M
                 value > demand_by_key[key]["requested_units"] for key, value in demand_totals.items()):
             return _blocked(event, state, "invalid_outbound_pick_plan")
     reasons: list[str] = []; demand_results = []; picked_total = 0; requested_total = 0
+    touched: set[str] = set(); depleted_pallets: set[str] = set(); released_positions: set[str] = set()
     for demand in normalized:
         requested = demand["requested_units"]; requested_total += requested
         demand_picks = picks[demand["demand_key"]]
@@ -220,12 +317,24 @@ def _apply_outbound(model: Mapping[str, Any], state: Mapping[str, Any], event: M
         picked = sum(quantity for _, quantity in demand_picks)
         for lot_id, quantity in demand_picks:
             lot_by_id[lot_id]["qty_boxes"] -= quantity
+            pallet_id = lot_by_id[lot_id].get("pallet_unit_id")
+            if pallet_id:
+                pallet = pallet_by_id[pallet_id]
+                pallet["remaining_boxes"] -= quantity
+                touched.add(pallet_id)
+                if pallet["remaining_boxes"] == 0:
+                    pallet["physical_status"] = "depleted"
+                    depleted_pallets.add(pallet_id)
+                    if pallet.get("position_id"):
+                        released_positions.add(pallet["position_id"])
         shortage = requested - picked; picked_total += picked
         demand_results.append({"demand_key": demand["demand_key"], "sku_key": demand["sku_key"],
                                "requested_boxes": requested, "picked_boxes": picked, "shortage_boxes": shortage,
                                "pick_allocations": [{"stock_lot_id": lot_id, "qty_boxes": quantity} for lot_id, quantity in demand_picks]})
     depleted = [lot["stock_lot_id"] for lot in lots if lot["qty_boxes"] == 0]
     new = copy.deepcopy(dict(state)); new["stock_lots"] = [lot for lot in lots if lot["qty_boxes"] > 0]
+    new["pallet_units"] = pallets
+    new["positions_released_total"] = new.get("positions_released_total", 0) + len(released_positions)
     new["stock_conservation"]["cumulative_picked_boxes"] += picked_total
     new["simulation_time"] = event["occurred_at"]
     new["applied_event_ids"] = sorted([*new.get("applied_event_ids", []), event["event_id"]])
@@ -234,11 +343,15 @@ def _apply_outbound(model: Mapping[str, Any], state: Mapping[str, Any], event: M
     status = "partial" if reasons else "applied"
     return new, _result(event, state, status=status, reasons=reasons, requested=requested_total,
                         picked=picked_total, shortage=shortage_total, after=new,
-                        demand_results=demand_results, depleted_lot_ids=depleted)
+                        demand_results=demand_results, depleted_lot_ids=depleted,
+                        pallet_units_touched=len(touched), pallet_units_depleted=len(depleted_pallets),
+                        positions_released=len(released_positions))
 
 
 def apply_warehouse_event(model: dict[str, Any], state: dict[str, Any], event: dict[str, Any], *,
                           receipt_allocations: list[dict[str, Any]] | None = None,
+                          receipt_pallet_plan: list[dict[str, Any]] | None = None,
+                          palletization_rule_state: dict[str, Any] | None = None,
                           outbound_pick_plan: list[dict[str, Any]] | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
     """Apply one event to a copied state, returning the new state and audit result."""
     if not isinstance(event, Mapping) or not _text(event.get("event_id")):
@@ -258,6 +371,12 @@ def apply_warehouse_event(model: dict[str, Any], state: dict[str, Any], event: d
     if before:
         return _blocked(event, state, "event_before_simulation_time")
     if event.get("event_type") == "receipt":
+        if receipt_allocations is not None and receipt_pallet_plan is not None:
+            return _blocked(event, state, "conflicting_receipt_allocation_modes")
+        if receipt_pallet_plan is not None and palletization_rule_state is None:
+            return _blocked(event, state, "palletization_rule_state_required")
+        if palletization_rule_state is not None:
+            return _apply_palletized_receipt(model, state, event, palletization_rule_state, receipt_pallet_plan)
         return _apply_receipt(model, state, event, receipt_allocations)
     if event.get("event_type") == "outbound_order":
         return _apply_outbound(model, state, event, outbound_pick_plan)
@@ -279,6 +398,8 @@ def _base_report(state: Mapping[str, Any], timeline: Mapping[str, Any]) -> dict[
 
 def reduce_warehouse_timeline(model: dict[str, Any], initial_state: dict[str, Any], timeline_state: dict[str, Any], *,
                               receipt_allocations_by_event_id: dict[str, list[dict[str, Any]]] | None = None,
+                              receipt_pallet_plans_by_event_id: dict[str, list[dict[str, Any]]] | None = None,
+                              palletization_rule_state: dict[str, Any] | None = None,
                               outbound_pick_plans_by_event_id: dict[str, list[dict[str, Any]]] | None = None,
                               same_timestamp_policy: str | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
     """Execute timeline time groups in their chronology, stopping on fatal findings."""
@@ -302,7 +423,8 @@ def reduce_warehouse_timeline(model: dict[str, Any], initial_state: dict[str, An
             report["blocked_reason"] = "invalid_same_timestamp_policy"; return state, report
     elif same_timestamp_policy is not None and same_timestamp_policy not in SAME_TIMESTAMP_POLICIES:
         report["blocked_reason"] = "invalid_same_timestamp_policy"; return state, report
-    allocations = receipt_allocations_by_event_id or {}; plans = outbound_pick_plans_by_event_id or {}
+    allocations = receipt_allocations_by_event_id or {}; pallet_plans = receipt_pallet_plans_by_event_id or {}
+    plans = outbound_pick_plans_by_event_id or {}
     for group in groups:
         events = copy.deepcopy(group.get("events", []) or [])
         if len(events) > 1:
@@ -312,6 +434,8 @@ def reduce_warehouse_timeline(model: dict[str, Any], initial_state: dict[str, An
         for event in events:
             state, result = apply_warehouse_event(model, state, event,
                 receipt_allocations=copy.deepcopy(allocations.get(event["event_id"])) if event["event_id"] in allocations else None,
+                receipt_pallet_plan=copy.deepcopy(pallet_plans.get(event["event_id"])) if event["event_id"] in pallet_plans else None,
+                palletization_rule_state=copy.deepcopy(palletization_rule_state),
                 outbound_pick_plan=copy.deepcopy(plans.get(event["event_id"])) if event["event_id"] in plans else None)
             report["event_results"].append(result)
             if result["status"] == "blocked":
