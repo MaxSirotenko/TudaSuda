@@ -7,8 +7,10 @@ from collections import Counter, defaultdict
 from collections.abc import Mapping
 from typing import Any
 
+from warehouse_placement_zones import ASSIGNABLE_PLACEMENT_ZONE_IDS, DEFAULT_PLACEMENT_ZONE_ORDER
+
 BOX_UNIT = "короб"
-ZONES = ("heavy", "medium", "light", "fragile")
+ZONES = ASSIGNABLE_PLACEMENT_ZONE_IDS
 LIMITATIONS = [
     "proposed_placements_cover_day_receipts_only", "opening_stock_is_preserved_and_not_moved",
     "opening_stock_must_be_pre_filtered_to_target_warehouse", "one_physical_model_warehouse_per_call",
@@ -167,7 +169,7 @@ def build_proposed_receipt_placements(model: dict[str, Any], day_receipt_state: 
     if warehouses and _filled(declared_target) and declared_target != warehouses[0]: errors.append("target_normalized_warehouse_mismatch")
     if _filled(model.get("model_id")) and _filled(opening.get("model_id")) and model.get("model_id") != opening.get("model_id"): errors.append("opening_stock_model_id_mismatch")
     errors.sort()
-    order = rules_state.get("zone_order") if isinstance(rules_state.get("zone_order"), list) else list(ZONES)
+    order = rules_state.get("zone_order") if isinstance(rules_state.get("zone_order"), list) else list(DEFAULT_PLACEMENT_ZONE_ORDER)
     order = [z for z in order if z in ZONES] + [z for z in ZONES if z not in order]; zone_pos = {z: i for i, z in enumerate(order)}
     cell_sort = lambda x: (_natural(x.get("row_order")), _natural(x.get("physical_index")), _natural(x.get("row_number")), _natural(x.get("cell_number")), _natural(x.get("tier")), _natural(x.get("cell_key")))
     free_by_zone = {z: sorted((c for c in cells.values() if c["weight_zone"] == z and c["cell_key"] not in occupied), key=cell_sort) for z in ZONES}

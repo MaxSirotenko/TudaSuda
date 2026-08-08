@@ -87,6 +87,24 @@ def test_sync_rows_to_cells_base_cells_and_row_settings():
     assert setting["weight_zone"] == "heavy"
 
 
+@pytest.mark.parametrize("zone", [
+    "heavy", "medium", "medium_light", "light", "fragile", "bulky",
+    "small_and_bulky", "show_boxes", "unassigned", "Объёмное",
+])
+def test_row_settings_accept_and_store_canonical_zones_without_changing_storage_type(zone):
+    model = _model()
+    edited = _edited(model)
+    edited[0]["weight_zone"] = zone
+    edited[0]["row_storage_type"] = "deep_lane"
+    edited[0]["cell_capacity_pallets"] = 2
+    updated, messages = apply_row_settings_transaction(model, edited)
+    assert not any(message.startswith("Ошибка:") for message in messages)
+    expected = "bulky" if zone == "Объёмное" else zone
+    assert updated["rows"][0]["weight_zone"] == expected
+    assert updated["rows"][0]["row_storage_type"] == "deep_lane"
+    assert updated["cells"][0]["storage_type"] == "deep_lane"
+
+
 def test_apply_multiple_rows_transaction_and_direction_serialization():
     model = _model()
     edited = _edited(model)

@@ -12,9 +12,14 @@ from typing import Any
 from warehouse_opening_stock_reconciliation import reconcile_opening_stock
 from warehouse_pick_demands import build_outbound_pick_demands
 from warehouse_business_identity import normalize_warehouse
+from warehouse_placement_zones import (
+    DEFAULT_PLACEMENT_ZONE_ORDER,
+    is_assignable_placement_zone,
+    normalize_placement_zone,
+)
 
 
-DEFAULT_ZONE_ORDER = ["heavy", "medium", "light", "fragile"]
+DEFAULT_ZONE_ORDER = list(DEFAULT_PLACEMENT_ZONE_ORDER)
 PIPELINE_INPUT_KEYS = (
     "model", "day_receipt_state", "start_placement_state", "end_placement_state",
     "opening_stock_state", "slotting_rule_state", "outbound_demand_state",
@@ -151,7 +156,8 @@ def build_outbound_experiment_inputs(
         if not isinstance(value, list) or any(not isinstance(row, Mapping) for row in value): errors.append(code)
 
     zones = list(DEFAULT_ZONE_ORDER) if zone_order is None else copy.deepcopy(zone_order)
-    if not isinstance(zones, list) or len(zones) != 4 or set(zones) != set(DEFAULT_ZONE_ORDER):
+    if (not isinstance(zones, list) or len(zones) != len(DEFAULT_ZONE_ORDER)
+            or set(zones) != set(DEFAULT_ZONE_ORDER)):
         errors.append("invalid_zone_order")
     if not isinstance(gate_config, Mapping):
         errors.append("invalid_gate_config"); gate = {}
@@ -190,11 +196,11 @@ def build_outbound_experiment_inputs(
                  "slotting_rows_outside_receipt_scope": 0,
                  "receipt_skus_without_slotting_rule": 0, "receipt_sku_keys_without_slotting_rule": []}
     for raw in slotting_rows:
-        sku = str(raw.get("sku_key") or "").strip(); zone = str(raw.get("weight_zone") or "").strip().casefold()
+        sku = str(raw.get("sku_key") or "").strip(); zone = normalize_placement_zone(raw.get("weight_zone"))
         rank = raw.get("priority_rank")
         if sku not in receipt_skus:
             slot_diag["slotting_rows_outside_receipt_scope"] += 1; continue
-        if zone not in DEFAULT_ZONE_ORDER or (rank is not None and (isinstance(rank, bool) or not isinstance(rank, int) or rank < 0)):
+        if not is_assignable_placement_zone(zone) or (rank is not None and (isinstance(rank, bool) or not isinstance(rank, int) or rank < 0)):
             slot_diag["invalid_rows"] += 1; continue
         source = str(raw.get("source") or "experiment_input").strip() or "experiment_input"
         rule_identity = {"receipt_dataset_id": day["dataset_id"], "normalized_warehouse": target,

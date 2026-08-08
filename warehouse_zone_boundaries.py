@@ -2,8 +2,17 @@ from __future__ import annotations
 
 from typing import Any
 
-ZONE_ORDER = ["heavy", "medium", "light", "fragile"]
-ZONE_LABELS = {"heavy": "Тяжёлое", "medium": "Среднее", "light": "Лёгкое", "fragile": "Хрупкое", "unassigned": "Не назначено"}
+from warehouse_placement_zones import (
+    DEFAULT_PLACEMENT_ZONE_ORDER,
+    get_placement_zone_label,
+    validate_placement_zone,
+)
+
+# The existing boundary calculator remains scoped to its four historical
+# segments.  The IDs themselves come from the canonical placement contract;
+# extending this physical algorithm is intentionally outside this PR.
+ZONE_ORDER = [DEFAULT_PLACEMENT_ZONE_ORDER[index] for index in (0, 1, 3, 4)]
+ZONE_LABELS = {zone: get_placement_zone_label(zone) for zone in (*ZONE_ORDER, "unassigned")}
 STATUS_COVERED = "Потребность покрыта"
 STATUS_INSUFFICIENT = "Недостаточно вместимости"
 STATUS_BLOCKED = "Граница заблокирована фактическим остатком"
@@ -34,17 +43,7 @@ def _number_key(value: Any) -> tuple[int, Any]:
 
 
 def normalize_zone(value: Any) -> str:
-    text = _display(value).lower().replace("ё", "е")
-    text = "".join(text.split())
-    if text in {"heavy", "тяжелое", "тяжелый"}:
-        return "heavy"
-    if text in {"medium", "среднее", "средний"}:
-        return "medium"
-    if text in {"light", "легкое", "легкий"}:
-        return "light"
-    if text in {"fragile", "хрупкое", "хрупкий"}:
-        return "fragile"
-    return "unassigned"
+    return validate_placement_zone(value)
 
 
 def ordered_rows(model: dict[str, Any]) -> list[dict[str, Any]]:
