@@ -6,9 +6,11 @@ from typing import Any
 
 import pandas as pd
 
+from warehouse_placement_zones import PLACEMENT_ZONE_IDS, normalize_placement_zone
+
 VALID_DIRECTIONS = {"bottom_to_top", "top_to_bottom"}
 VALID_STORAGE_TYPES = {"normal", "deep_lane"}
-VALID_ZONES = {"heavy", "medium", "light", "fragile", "unassigned"}
+VALID_ZONES = set(PLACEMENT_ZONE_IDS)
 SYNC_FIELDS = ["row_number", "row_order", "cell_direction", "weight_zone", "initial_weight_zone", "row_storage_type", "deep_lane_width", "capacity_pallets", "row_group", "side", "comment", "base_cell_width_m", "base_row_width_m", "top_offset_cells", "bottom_offset_cells", "top_offset_m", "bottom_offset_m"]
 CELL_SYNC_FIELDS = ["row_order", "cell_direction", "weight_zone", "row_group", "side", "comment"]
 
@@ -83,7 +85,9 @@ def build_row_settings_draft(model: dict[str, Any]) -> pd.DataFrame:
             "row_number": row_number,
             "row_order": _float(row.get("row_order") or _row_fallback(model, row_number, "row_order", len(rows) + 1), len(rows) + 1),
             "cell_direction": row.get("cell_direction") or _row_fallback(model, row_number, "cell_direction", "bottom_to_top"),
-            "weight_zone": row.get("weight_zone") or _row_fallback(model, row_number, "weight_zone", "unassigned"),
+            "weight_zone": normalize_placement_zone(
+                row.get("weight_zone") or _row_fallback(model, row_number, "weight_zone", "unassigned")
+            ),
             "row_storage_type": storage,
             "cell_capacity_pallets": cell_capacity,
             "cells_count": len(row_cells) or int(_float(row.get("cells_count"), 0)),
@@ -351,7 +355,7 @@ def _validate_edited_rows(model: dict[str, Any], edited_rows: list[dict[str, Any
         if edited.get("row_storage_type") not in VALID_STORAGE_TYPES:
             errors.append(f"Ошибка: ряд {row_number}: некорректный тип ряда.")
 
-        if edited.get("weight_zone", "unassigned") not in VALID_ZONES:
+        if normalize_placement_zone(edited.get("weight_zone")) not in VALID_ZONES:
             errors.append(f"Ошибка: ряд {row_number}: некорректная весовая зона.")
 
         for field, label in (
@@ -563,10 +567,7 @@ def apply_row_settings_transaction(
                 "cell_direction",
                 "bottom_to_top",
             ),
-            "weight_zone": edited.get(
-                "weight_zone",
-                "unassigned",
-            ),
+            "weight_zone": normalize_placement_zone(edited.get("weight_zone")),
             "row_storage_type": storage,
             "deep_lane_width": capacity,
             "row_group": _display(edited.get("row_group")),

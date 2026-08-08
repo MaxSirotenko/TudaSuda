@@ -115,6 +115,19 @@ def test_slotting_scope_validation_duplicates_and_determinism():
     assert first["experiment_input_state_id"] == second["experiment_input_state_id"]
 
 
+@pytest.mark.parametrize("zone", [
+    "heavy", "medium", "medium_light", "light", "fragile", "bulky",
+    "small_and_bulky", "show_boxes",
+])
+def test_slotting_accepts_every_canonical_assignable_zone(zone):
+    state, diagnostics = build(
+        transform=lambda values: values[6].__setitem__(0, {"sku_key": "R", "weight_zone": zone})
+    )
+    rule = state["pipeline_inputs"]["slotting_rule_state"]["sku_rules"][0]
+    assert rule["weight_zone"] == zone
+    assert diagnostics["slotting_rules"]["invalid_rows"] == 0
+
+
 def test_conflicting_slotting_rules_are_excluded_without_input_order_priority():
     def change(values):
         values[6] = [

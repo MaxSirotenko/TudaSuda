@@ -8,13 +8,16 @@ import json
 from collections.abc import Mapping
 from typing import Any
 
+from warehouse_placement_zones import ASSIGNABLE_PLACEMENT_ZONE_IDS, DEFAULT_PLACEMENT_ZONE_ORDER
+
 from warehouse_inventory_placement import cell_key as canonical_cell_key
 from warehouse_physical_graph import find_shortest_path
 from warehouse_pick_inventory import build_pickable_inventory_index
 from warehouse_pick_working_stock import build_pick_working_stock
 
 
-ZONES = {"heavy", "medium", "light", "fragile"}
+ZONES = set(ASSIGNABLE_PLACEMENT_ZONE_IDS)
+LEGACY_EXPERIMENT_ZONES = {DEFAULT_PLACEMENT_ZONE_ORDER[index] for index in (0, 1, 3, 4)}
 BOX_UNITS = {"короб", "короба", "коробов"}
 LIMITATIONS = [
     "replay_uses_same_opening_stock_for_both_scenarios",
@@ -312,7 +315,8 @@ def replay_outbound_scenarios(model: dict[str, Any], physical_graph_state: dict[
         if not isinstance(graph.get(field), list): errors.append(f"invalid_graph_{field}")
     if not rules.get("replay_rule_state_id"): errors.append("replay_rule_state_id_missing")
     zone_order = rules.get("zone_order") if isinstance(rules.get("zone_order"), list) else []
-    if len(zone_order) != 4 or set(zone_order) != ZONES: errors.append("invalid_zone_order")
+    if set(zone_order) not in (ZONES, LEGACY_EXPERIMENT_ZONES) or len(zone_order) != len(set(zone_order)):
+        errors.append("invalid_zone_order")
     target = _normalized(rules.get("target_normalized_warehouse")); gate_key = _text(rules.get("gate_key"))
     links = [x for x in graph.get("gate_links", []) or [] if isinstance(x, Mapping) and _text(x.get("gate_key")) == gate_key
              and x.get("status", "valid") in {"valid", "mapped", "ok", None, ""}]

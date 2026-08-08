@@ -13,6 +13,8 @@ from typing import Any
 
 import pandas as pd
 
+from warehouse_placement_zones import validate_placement_zone
+
 GEOMETRY_MODEL_VERSION = 1
 GEOMETRY_MODEL_PATH = Path("data/last_import/warehouse_model.json")
 GEOMETRY_META_PATH = Path("data/last_import/import_meta.json")
@@ -244,7 +246,7 @@ def _row_order_map(row_config: pd.DataFrame | None) -> dict[str, dict[str, Any]]
             "row_group": _display_value(row.get("row_group")),
             "side": _display_value(row.get("side")),
             "comment": _display_value(row.get("comment")),
-            "weight_zone": _display_value(row.get("weight_zone")) if _display_value(row.get("weight_zone")) in {"heavy", "medium", "light", "fragile", "unassigned"} else "unassigned",
+            "weight_zone": validate_placement_zone(row.get("weight_zone")),
             "top_offset_cells": max(0, int(_safe_float(row.get("top_offset_cells"), 0))),
             "bottom_offset_cells": max(0, int(_safe_float(row.get("bottom_offset_cells"), 0))),
         }
