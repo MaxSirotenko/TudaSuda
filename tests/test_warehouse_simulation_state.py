@@ -56,7 +56,7 @@ def build(cells=None, placements=None, unknown=None, opening_changes=None):
 
 def test_empty_state_and_ordinary_and_deep_position_registries():
     state, diagnostics = build()
-    assert state["simulation_state_version"] == 1
+    assert state["simulation_state_version"] == 2
     assert state["target_normalized_warehouse"] == "вешки"
     assert state["summary"]["total_boxes"] == 0
     assert [p["position_id"] for p in state["physical_positions"]] == [
@@ -70,8 +70,11 @@ def test_located_and_unknown_boxes_are_conserved_and_unknown_pallet_is_not_zero(
     placed = item(qty=100, cell_key="1|1|1", placement_id="p1", qty_pallets=0,
                   occupancy_not_authoritative=True, allocation_method="exact_single_cell")
     state, diagnostics = build([normal()], placements=[placed], unknown=[item("B", 50)])
-    assert state["stock_conservation"] == {"opening_boxes_input": 150, "stock_boxes_state": 150,
-                                            "stock_conservation_ok": True}
+    assert state["stock_conservation"] == {
+        "opening_boxes_input": 150, "cumulative_receipt_boxes": 0,
+        "cumulative_picked_boxes": 0, "expected_stock_boxes": 150,
+        "stock_boxes_state": 150, "stock_conservation_ok": True,
+    }
     assert state["summary"]["located_boxes"] == 100
     assert state["summary"]["unknown_location_boxes"] == 50
     assert all(lot["pallet_count"] is None and lot["pallet_count_status"] == "unknown" for lot in state["stock_lots"])
