@@ -12,6 +12,7 @@ from typing import Any
 import pandas as pd
 
 from warehouse_placement_diagnostics import placement_reason_text
+from warehouse_business_identity import canonical_sku_key
 
 PLACEMENTS_PATH = Path("data/last_import/placements.json")
 
@@ -74,21 +75,7 @@ def normalize_weight_class(value: Any) -> str:
 
 
 def make_sku_key(item: dict[str, Any]) -> str:
-    sku_code = _display_value(item.get("sku_code"))
-    sku_name = _display_value(item.get("sku_name") or item.get("item_name"))
-    characteristic_code = _display_value(item.get("characteristic_code"))
-    characteristic_name = _display_value(item.get("characteristic_name") or item.get("characteristic"))
-    if sku_code and characteristic_code:
-        return f"code:{sku_code}|char_code:{characteristic_code}"
-    if sku_code and characteristic_name:
-        return f"code:{sku_code}|char_name:{characteristic_name}"
-    if sku_name and characteristic_name:
-        return f"name:{sku_name}|char_name:{characteristic_name}"
-    if sku_name:
-        return f"name:{sku_name}"
-    if sku_code:
-        return f"code:{sku_code}"
-    return ""
+    return canonical_sku_key(item)
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -641,7 +628,8 @@ def _parse_inventory_qty(row: dict[str, Any]) -> tuple[float | None, str]:
 
 
 def _inventory_row_sku_key(row: dict[str, Any]) -> str:
-    return _display_value(row.get("sku_key")) or make_sku_key(row)
+    canonical = make_sku_key(row)
+    return canonical or _display_value(row.get("sku_key"))
 
 
 def _inventory_date(inventory_rows: list[dict[str, Any]], inventory_date: str | None) -> str:

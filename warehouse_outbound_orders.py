@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+from warehouse_business_identity import canonical_sku_key
 
 
 OUTBOUND_ORDERS_PATH = Path("data/last_import/outbound_orders.json")
@@ -72,11 +73,7 @@ def _find_column(columns: list[str], aliases: list[str]) -> str | None:
 
 
 def make_outbound_sku_key(nomenclature: Any, characteristic: Any = "") -> str:
-    name = _text(nomenclature)
-    char = _text(characteristic)
-    if not name:
-        return ""
-    return f"name:{name}|char_name:{char}" if char else f"name:{name}"
+    return canonical_sku_key({"nomenclature": nomenclature, "characteristic": characteristic})
 
 
 def placement_sku_key(placement: dict[str, Any]) -> str:
@@ -177,7 +174,9 @@ def normalize_outbound_table(table: pd.DataFrame, mapping: dict[str, str | None]
             "created_at": created_at,
             "nomenclature": nomenclature,
             "characteristic": characteristic,
-            "sku_key": make_outbound_sku_key(nomenclature, characteristic),
+            "sku_key": canonical_sku_key({"nomenclature": nomenclature, "characteristic": characteristic,
+                                           "nomenclature_code": value("nomenclature_code"),
+                                           "characteristic_code": value("characteristic_code")}),
             "qty_units": qty_units,
             "qty_units_raw": _text(raw_qty),
             "quantity_validation_reason": quantity_reason,

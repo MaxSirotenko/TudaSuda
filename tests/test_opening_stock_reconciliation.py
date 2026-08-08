@@ -53,11 +53,11 @@ def test_inputs_are_not_modified_and_runs_are_deterministic():
     assert first == second
 
 
-def test_sku_key_is_built_with_outbound_helper_and_explicit_key_is_preserved():
+def test_sku_key_is_built_with_outbound_helper_and_legacy_key_is_aliased():
     state, _ = run([inventory()], [location()])
     assert state["placements"][0]["sku_key"] == make_outbound_sku_key("A", "red")
     state, _ = run([inventory(sku_key="explicit")], [location(sku_key="explicit")])
-    assert state["placements"][0]["sku_key"] == "explicit"
+    assert state["placements"][0]["sku_key"] == make_outbound_sku_key("A", "red")
 
 
 def test_duplicate_inventory_rows_are_merged_with_sorted_indexes():

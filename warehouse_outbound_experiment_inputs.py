@@ -6,12 +6,12 @@ import copy
 import hashlib
 import json
 import math
-import re
 from collections.abc import Mapping
 from typing import Any
 
 from warehouse_opening_stock_reconciliation import reconcile_opening_stock
 from warehouse_pick_demands import build_outbound_pick_demands
+from warehouse_business_identity import normalize_warehouse
 
 
 DEFAULT_ZONE_ORDER = ["heavy", "medium", "light", "fragile"]
@@ -38,11 +38,6 @@ LIMITATIONS = [
     "builder_does_not_persist_state",
     "builder_does_not_modify_inputs",
 ]
-
-
-def normalize_warehouse(value: Any) -> str:
-    """Return the shared exact-match warehouse representation."""
-    return re.sub(r"\s+", " ", str(value or "").strip()).casefold().replace("ё", "е")
 
 
 def _hash(value: Any) -> str:

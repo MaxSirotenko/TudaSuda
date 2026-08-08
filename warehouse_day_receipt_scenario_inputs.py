@@ -7,6 +7,7 @@ import json
 import re
 from collections.abc import Mapping
 from typing import Any
+from warehouse_business_identity import normalize_warehouse
 
 BOX_UNIT = "короб"
 BOX_UNITS = {"короб", "короба", "коробов"}
@@ -19,7 +20,7 @@ def _text(value: Any) -> str:
 
 
 def _normalize_warehouse(value: Any) -> str:
-    return _text(value).casefold().replace("ё", "е")
+    return normalize_warehouse(value)
 
 
 def _parse_date(value: Any) -> str | None:
