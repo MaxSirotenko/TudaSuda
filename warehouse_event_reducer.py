@@ -122,7 +122,9 @@ def _pallet_lot(event: Mapping[str, Any], batch: Mapping[str, Any], pallet: Mapp
         "qty_boxes": pallet["remaining_boxes"], "unit_name": CANONICAL_BOX_UNIT,
         "location_status": "located" if located else "unknown",
         "cell_key": pallet.get("cell_key"), "position_id": pallet.get("position_id"),
-        "pallet_unit_id": pallet_id, "location_role": "unassigned", "production_dates": [],
+        "pallet_unit_id": pallet_id, "location_role": "unassigned",
+        "production_dates": sorted({_text(value) for value in
+                                    (batch.get("production_dates") or []) if _text(value)}),
         "source": "receipt_event", "source_event_id": event["event_id"],
         "allocation_method": "explicit_receipt_pallet_plan" if located else "",
         "source_placement_id": None, "location_confidence": "explicit" if located else "unknown",
@@ -168,12 +170,20 @@ def _apply_palletized_receipt(
                          "location_status": "located"})
         if seen_units != set(units):
             return _blocked(event, state, "invalid_receipt_pallet_plan")
+    batches_by_provenance = {
+        (batch["sku_key"], tuple(sorted({_text(value) for value in
+            (batch.get("source_receipt_line_keys") or batch.get("receipt_line_keys") or [])
+            if _text(value)}))): batch
+        for batch in event.get("receipt_batches", []) or []
+    }
     batches_by_sku = {batch["sku_key"]: batch for batch in event.get("receipt_batches", []) or []}
     new = copy.deepcopy(dict(state))
     new.setdefault("pallet_units", []).extend(pallets)
     for pallet in pallets:
         reason = None if pallet["location_status"] == "located" else "physical_pallet_placement_missing"
-        new["stock_lots"].append(_pallet_lot(event, batches_by_sku[pallet["sku_key"]], pallet,
+        provenance_key = (pallet["sku_key"], tuple(pallet.get("source_receipt_line_keys") or []))
+        batch = batches_by_provenance.get(provenance_key, batches_by_sku[pallet["sku_key"]])
+        new["stock_lots"].append(_pallet_lot(event, batch, pallet,
                                              unresolved_reason=reason))
     # Missing/conflicting authority preserves boxes as non-palletized stock.
     for index, item in enumerate(unresolved):
