@@ -8,7 +8,7 @@ from typing import Any
 
 import pandas as pd
 
-from warehouse_outbound_orders import make_outbound_sku_key
+from warehouse_business_identity import build_canonical_sku_identity
 
 FIELDS = {
     "receipt_ref": "СсылкаПриходногоОрдера",
@@ -187,7 +187,14 @@ def build_day_receipts_import(table: pd.DataFrame, mapping: dict[str, str | None
             return src[col] if col else None
         receipt_ref, receipt_number, receipt_date, warehouse = val("receipt_ref"), val("receipt_number"), val("receipt_date"), val("warehouse")
         document_key = f"ref:{_norm(receipt_ref)}" if _text(receipt_ref) else f"sha256:{_hash([receipt_number, receipt_date, warehouse])}"
-        sku_key = _text(val("sku_key")) if mapping.get("sku_key") else make_outbound_sku_key(val("nomenclature"), val("characteristic"))
+        identity = build_canonical_sku_identity({
+            "sku_key": val("sku_key") if mapping.get("sku_key") else "",
+            "nomenclature_code": val("nomenclature_code"), "nomenclature": val("nomenclature"),
+            "characteristic_code": val("characteristic_code"), "characteristic": val("characteristic"),
+        })
+        sku_key = identity["sku_key"]
+        if "legacy_sku_key_mismatch" in identity["diagnostics"]:
+            diag["legacy_sku_key_mismatch"] = diag.get("legacy_sku_key_mismatch", 0) + 1
         terminal, expected = _bool(val("terminal_receipt_completed")), _bool(val("expected_receipt"))
         qty, qty_reason = _box_qty(val("source_box_quantity"))
         control = _norm(val("quantity_control"))

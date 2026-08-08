@@ -10,7 +10,7 @@ import hashlib
 import math
 from typing import Any
 
-from warehouse_outbound_orders import make_outbound_sku_key
+from warehouse_business_identity import build_canonical_sku_identity, normalize_unit_name
 
 
 def _text(value: Any) -> str:
@@ -18,7 +18,7 @@ def _text(value: Any) -> str:
 
 
 def _box_unit(value: Any) -> bool:
-    return _text(value).casefold().replace("ё", "е") in {"короб", "короба", "коробов"}
+    return normalize_unit_name(value) == "короб"
 
 
 def _positive_integer(value: Any) -> tuple[int | None, str | None]:
@@ -117,11 +117,18 @@ def reconcile_opening_stock(
     diagnostics["inventory_rows_total"] = len(inventory_rows or [])
     excluded: list[dict[str, Any]] = []
     inventory: dict[str, dict[str, Any]] = {}
+    legacy_aliases: dict[str, str] = {}
 
     for row in inventory_rows or []:
         nomenclature = _text(row.get("nomenclature") or row.get("sku_name"))
         characteristic = _text(row.get("characteristic") or row.get("characteristic_name"))
-        sku_key = _text(row.get("sku_key")) or make_outbound_sku_key(nomenclature, characteristic)
+        identity = build_canonical_sku_identity(row)
+        sku_key = identity["sku_key"]
+        legacy_key = _text(row.get("sku_key"))
+        if legacy_key and sku_key:
+            legacy_aliases[legacy_key] = sku_key
+        if "legacy_sku_key_mismatch" in identity["diagnostics"]:
+            diagnostics["legacy_sku_key_mismatch"] = diagnostics.get("legacy_sku_key_mismatch", 0) + 1
         base = {
             "sku_key": sku_key, "sku_code": _text(row.get("nomenclature_code") or row.get("sku_code")),
             "sku_name": nomenclature, "nomenclature": nomenclature,
@@ -164,7 +171,8 @@ def reconcile_opening_stock(
     hints: dict[str, dict[str, dict[str, Any]]] = {}
     diagnostics["location_records_total"] = len(actual_placement_state.get("placements", []) or [])
     for record in actual_placement_state.get("placements", []) or []:
-        sku_key, cell_key = _text(record.get("sku_key")), _text(record.get("cell_key"))
+        raw_sku_key = _text(record.get("sku_key"))
+        sku_key, cell_key = legacy_aliases.get(raw_sku_key, raw_sku_key), _text(record.get("cell_key"))
         if not sku_key:
             continue
         cell = cells.get(cell_key)

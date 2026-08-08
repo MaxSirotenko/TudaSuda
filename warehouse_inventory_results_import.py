@@ -10,7 +10,7 @@ from typing import Any
 
 import pandas as pd
 
-from warehouse_outbound_orders import make_outbound_sku_key
+from warehouse_business_identity import canonical_sku_key
 
 CANONICAL_COLUMNS: dict[str, tuple[str, ...]] = {
     "inventory_ref": ("СсылкаИнвентаризации", "inventory_ref"),
@@ -158,7 +158,10 @@ def _document_key(row: pd.Series, mapping: dict[str, str | None]) -> str:
 def _base_row(row: pd.Series, mapping: dict[str, str | None], source_index: Any) -> dict[str, Any]:
     nomenclature = _text(_cell(row, mapping, "nomenclature"))
     characteristic = _text(_cell(row, mapping, "characteristic"))
-    sku_key = _text(_cell(row, mapping, "sku_key")) or make_outbound_sku_key(nomenclature, characteristic)
+    sku_key = canonical_sku_key({"sku_key": _cell(row, mapping, "sku_key"),
+                                 "nomenclature": nomenclature, "characteristic": characteristic,
+                                 "nomenclature_code": _cell(row, mapping, "nomenclature_code"),
+                                 "characteristic_code": _cell(row, mapping, "characteristic_code")})
     return {
         "document_key": _document_key(row, mapping), "inventory_ref": _text(_cell(row, mapping, "inventory_ref")),
         "inventory_number": _text(_cell(row, mapping, "inventory_number")), "inventory_date": _json_value(_cell(row, mapping, "inventory_date")),

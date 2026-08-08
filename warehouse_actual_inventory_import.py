@@ -16,7 +16,7 @@ from typing import Any
 import pandas as pd
 
 from warehouse_inventory_placement import cell_key
-from warehouse_outbound_orders import make_outbound_sku_key
+from warehouse_business_identity import canonical_sku_key
 
 
 FIELD_ALIASES = {
@@ -229,7 +229,7 @@ def build_actual_inventory_placement_state(
         record = _source_record(row, columns, source_index)
         if not record["production_date"]:
             diagnostics["empty_production_date_rows"] += 1
-        sku_key = make_outbound_sku_key(record["nomenclature"], record["characteristic"])
+        sku_key = canonical_sku_key(record)
         boxes, box_reason = _integer(record["calculated_box_qty"])
         control = _label(record["calculation_control"])
         reason = ""

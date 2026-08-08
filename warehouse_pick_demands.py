@@ -6,7 +6,11 @@ import json
 import re
 from typing import Any
 
-from warehouse_inventory_placement import make_sku_key
+from warehouse_business_identity import (
+    build_canonical_sku_identity,
+    find_canonical_identity_collisions,
+    normalize_unit_name,
+)
 from warehouse_outbound_orders import outbound_order_key
 
 
@@ -72,8 +76,12 @@ def build_outbound_pick_demands(order_rows: list[dict[str, Any]]) -> dict[str, A
         "order_metadata_conflicts": 0,
         "unit_variants_for_same_sku": 0,
         "quantity_reason_counts": {},
+        "legacy_sku_key_mismatch": 0,
+        "unsupported_unit": 0,
+        "sku_identity_conflict": 0,
     }
     orders_by_key: dict[str, dict[str, Any]] = {}
+    conflicting_keys = {item["sku_key"] for item in find_canonical_identity_collisions(order_rows)}
 
     for row in order_rows:
         number = _text(row.get("outbound_order_number"))
@@ -111,12 +119,18 @@ def build_outbound_pick_demands(order_rows: list[dict[str, Any]]) -> dict[str, A
         sku_name = _first_text(row, "sku_name", "nomenclature", "item_name")
         characteristic_code = _text(row.get("characteristic_code"))
         characteristic_name = _first_text(row, "characteristic_name", "characteristic")
-        sku_key = _text(row.get("sku_key")) or make_sku_key({
+        identity = build_canonical_sku_identity({
+            "sku_key": row.get("sku_key"),
             "sku_code": sku_code,
             "sku_name": sku_name,
             "characteristic_code": characteristic_code,
             "characteristic_name": characteristic_name,
         })
+        sku_key = identity["sku_key"]
+        diagnostics["legacy_sku_key_mismatch"] += "legacy_sku_key_mismatch" in identity["diagnostics"]
+        if sku_key in conflicting_keys:
+            diagnostics["sku_identity_conflict"] += 1
+            continue
         if not sku_key:
             diagnostics["skipped_missing_sku"] += 1
             continue
@@ -146,8 +160,11 @@ def build_outbound_pick_demands(order_rows: list[dict[str, Any]]) -> dict[str, A
             "characteristic_name": characteristic_name,
         }, diagnostics, "sku_metadata_conflicts")
 
-        display_unit = _text(row.get("unit_name"))
-        normalized_unit = _unit_key(row.get("unit_name"))
+        normalized_unit = normalize_unit_name(row.get("unit_name"))
+        if normalized_unit is None:
+            diagnostics["unsupported_unit"] += 1
+            continue
+        display_unit = normalized_unit
         merge_key = (sku_key, normalized_unit)
         demands = order["demands_by_merge_key"]
         if merge_key in demands:
