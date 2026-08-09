@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import pandas as pd
 
-from warehouse_actual_inventory_import import build_actual_inventory_placement_state
+from warehouse_actual_inventory_import import (
+    build_actual_inventory_placement_state, cross_check_physical_opening_stock,
+)
 from warehouse_simulation_state import build_initial_simulation_state, validate_simulation_state
 
 
@@ -82,3 +84,16 @@ def test_master_capacity_controls_status_and_mismatch_does_not_redistribute():
     assert state["pallet_units"][0]["capacity_boxes"] == 10
     assert state["pallet_units"][0]["is_partial"] is True
     assert state["readiness"]["opening_stock_business_ready"] is False
+
+
+def test_absent_and_supplied_empty_inventory_controls_are_distinct():
+    opening, _, _, _ = initial([row()])
+    absent, absent_diag = cross_check_physical_opening_stock(opening, None)
+    empty, empty_diag = cross_check_physical_opening_stock(opening, [])
+    assert absent_diag["inventory_totals_control_status"] == "not_supplied"
+    assert absent_diag.get("inventory_total_mismatch_details") is None
+    assert absent["physical_opening_readiness"]["opening_stock_business_ready"] is True
+    assert empty_diag["inventory_totals_control_status"] == "supplied_but_no_valid_rows"
+    assert empty_diag["inventory_control_diagnostic"] == "inventory_control_supplied_but_no_valid_rows"
+    assert empty_diag.get("inventory_total_mismatch_details") is None
+    assert empty["physical_opening_readiness"]["opening_stock_business_ready"] is False

@@ -27,6 +27,7 @@ from warehouse_outbound_orders import (
     detect_outbound_columns, get_outbound_sheet_names, normalize_outbound_table,
     read_outbound_table,
 )
+from warehouse_business_identity import normalize_warehouse
 from warehouse_placement_zones import get_assignable_placement_zones, get_placement_zone_label
 from warehouse_state_cache import load_outbound_orders_cached, load_receipts_state_cached
 from warehouse_scenario_comparison_ui import render_scenario_comparison
@@ -113,9 +114,40 @@ def experiment_inputs_ready(*, day_receipt_state: Any, start_state: Any, end_sta
                             opening_inventory_rows: Any, outbound_rows: Any, gate_confirmed: bool) -> bool:
     """UI readiness only; absent slotting is deliberately not a blocker."""
     # Receipts and END are optional validation inputs in the V1 opening-stock replay.
-    del day_receipt_state, end_state
+    del day_receipt_state, end_state, opening_inventory_rows
     return bool(isinstance(start_state, Mapping) and start_state.get("placements")
-                and opening_inventory_rows and outbound_rows and gate_confirmed)
+                and outbound_rows and gate_confirmed)
+
+
+def start_warehouses(start_state: Mapping[str, Any] | None) -> list[str]:
+    """Return distinct normalized START warehouses without alias inference."""
+    return sorted({warehouse for row in (start_state or {}).get("placements", [])
+                   if (warehouse := normalize_warehouse(
+                       row.get("normalized_warehouse") or row.get("warehouse")))})
+
+
+def select_start_warehouse(warehouses: list[str], explicit: Any = None) -> tuple[str | None, str | None]:
+    """Auto-select one factual scope and require a choice when several exist."""
+    normalized = normalize_warehouse(explicit)
+    if len(warehouses) == 1:
+        return warehouses[0], None
+    if len(warehouses) > 1 and normalized not in warehouses:
+        return None, "multiple_start_warehouses_require_selection"
+    return (normalized or None), (None if normalized else "start_warehouse_not_available")
+
+
+def validate_outbound_scope(rows: Any, warehouse: Any, operational_date: Any) -> list[str]:
+    """Validate exact warehouse/day scope without silently selecting another day."""
+    target = normalize_warehouse(warehouse)
+    if not rows:
+        return ["outbound_rows_not_supplied"]
+    warehouse_rows = [row for row in rows if normalize_warehouse(row.get("warehouse")) == target]
+    if not warehouse_rows:
+        return ["start_outbound_warehouse_scope_mismatch"]
+    day = str(operational_date or "")[:10]
+    if not any(str(row.get("created_at") or "")[:10] == day for row in warehouse_rows):
+        return ["selected_operational_date_has_no_accepted_outbound_orders"]
+    return []
 
 
 def _hash_bytes(data: bytes) -> str:
@@ -184,17 +216,32 @@ def render_outbound_experiment(model: dict[str, Any]) -> None:
     """Render the authoritative SimulationState CURRENT/PROPOSED benchmark."""
     st.subheader("Авторитетный CURRENT vs PROPOSED")
     st.caption("V1: начальный остаток → расходные ордера; приход внутри дня не моделируется. END — только независимая валидация.")
+    st.markdown("**Минимум для первого расчёта**")
+    st.caption("START / остатки по ячейкам · РО · ворота · геометрия склада, уже загруженная в проект")
+    st.markdown("**Дополнительный контроль**")
+    st.caption("inventory-results · END snapshot · receipts")
+    start_state, start_diag, start_hash, start_sheet = _excel_upload(
+        "Фактическое размещение / остаток по ячейкам — НАЧАЛО дня", "experiment_start", get_actual_inventory_sheet_names,
+        read_actual_inventory_table, detect_actual_inventory_columns, build_actual_inventory_placement_state, model)
     receipt_state, receipt_diag, receipt_hash, receipt_sheet = _excel_upload(
-        "Дневной приход", "experiment_receipts", get_day_receipts_sheet_names,
+        "Дневной приход — не используется в V1 benchmark", "experiment_receipts", get_day_receipts_sheet_names,
         read_day_receipts_table, detect_day_receipts_columns, build_day_receipts_import)
-    operational_date = selected_warehouse = None
+    operational_date = None
     day_state: dict[str, Any] = {}
+    warehouses = start_warehouses(start_state)
+    selected_warehouse = None
+    if len(warehouses) == 1:
+        selected_warehouse = warehouses[0]
+        st.caption(f"Склад START выбран автоматически: {selected_warehouse}")
+    elif len(warehouses) > 1:
+        selected_warehouse = st.selectbox("Склад START", warehouses, index=None,
+                                          placeholder="Выберите один склад", key="experiment_start_warehouse")
+    elif start_state:
+        st.error("START не содержит нормализованного склада.")
     if receipt_state:
         accepted = receipt_state.get("accepted_rows", [])
         dates = sorted({str(row.get("receipt_date"))[:10] for row in accepted if row.get("receipt_date")})
-        warehouses = sorted({str(row.get("warehouse")) for row in accepted if row.get("warehouse")})
         operational_date = st.selectbox("Операционный день", dates, key="experiment_day") if dates else None
-        selected_warehouse = st.selectbox("Склад", warehouses, key="experiment_warehouse") if warehouses else None
         if operational_date and selected_warehouse:
             day_state, day_diag = build_day_receipt_scenario_inputs(
                 receipt_state, operational_date=operational_date, selected_warehouses=[selected_warehouse])
@@ -202,13 +249,8 @@ def render_outbound_experiment(model: dict[str, Any]) -> None:
     else:
         st.info("Дневной приход не обязателен для V1 benchmark.")
         operational_date = st.date_input("Операционный день", key="benchmark_day_without_receipts")
-        selected_warehouse = st.text_input("Склад", key="benchmark_warehouse_without_receipts").strip() or None
-
-    start_state, start_diag, start_hash, start_sheet = _excel_upload(
-        "Фактическое размещение — НАЧАЛО дня", "experiment_start", get_actual_inventory_sheet_names,
-        read_actual_inventory_table, detect_actual_inventory_columns, build_actual_inventory_placement_state, model)
     end_state, end_diag, end_hash, end_sheet = _excel_upload(
-        "Фактическое размещение — КОНЕЦ дня (необязательно, только валидация)", "experiment_end", get_actual_inventory_sheet_names,
+        "END snapshot — необязательно, только валидация", "experiment_end", get_actual_inventory_sheet_names,
         read_actual_inventory_table, detect_actual_inventory_columns, build_actual_inventory_placement_state, model)
     for title, diag in (("START", start_diag), ("END", end_diag)):
         if diag:
@@ -217,10 +259,10 @@ def render_outbound_experiment(model: dict[str, Any]) -> None:
                        f"ячеек {diag.get('accepted_cell_count', 0)}; unmatched {diag.get('unmatched_rows', 0)}; excluded {diag.get('excluded_rows', 0)}")
 
     inventory_state, _, inventory_hash, inventory_sheet = _excel_upload(
-        "Инвентаризация / остаток на начало дня", "experiment_inventory", get_inventory_results_sheet_names,
+        "Инвентаризация / независимый контроль количества — необязательно", "experiment_inventory", get_inventory_results_sheet_names,
         read_inventory_results_table, detect_inventory_results_columns, build_inventory_results_import)
     inventory_keys: list[str] = []
-    opening_rows: list[dict[str, Any]] = []
+    opening_rows: list[dict[str, Any]] | None = None
     if inventory_state:
         docs = [d for d in inventory_state.get("documents", []) if not selected_warehouse or d.get("warehouse") == selected_warehouse]
         options = [d["document_key"] for d in docs]
@@ -251,6 +293,10 @@ def render_outbound_experiment(model: dict[str, Any]) -> None:
             table = read_outbound_table(data, outbound_sheet)
             outbound_rows, outbound_diag = normalize_outbound_table(table, detect_outbound_columns(table))
             if outbound_diag: st.json(outbound_diag)
+
+    scope_errors = validate_outbound_scope(outbound_rows, selected_warehouse, operational_date)
+    for error in scope_errors:
+        st.error(error)
 
     classifications = {r.get("sku_key"): r.get("calculated_zone") for r in loaded_receipts.get("receipts", [])
                        if r.get("calculated_zone") in CODE_TO_ZONE}
@@ -292,4 +338,5 @@ def render_outbound_experiment(model: dict[str, Any]) -> None:
         classification_rows=loaded_classifications, outbound_rows=outbound_rows,
         gate_state={"model_id": model.get("model_id"), "gates": [gate_config]} if gate_confirmed else None,
         end_snapshot=end_state,
+        inventory_control_supplied=inventory_state is not None,
     )
