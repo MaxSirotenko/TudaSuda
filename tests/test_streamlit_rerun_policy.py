@@ -33,7 +33,7 @@ def test_local_fragment_interactions_have_no_explicit_rerun():
     assert "st.rerun" not in analytics
     assert rows.count("st.rerun()") == 1
     assert cross_aisles.count("st.rerun()") == 1
-    assert 'st.info("Изменений нет")' in rows
+    assert 'st.info("Вы ничего не изменили.")' in rows
     assert 'st.info("Изменений нет")' in cross_aisles
 
 
