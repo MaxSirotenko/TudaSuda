@@ -425,6 +425,11 @@ def _cross_check_inventory_totals(
     if inventory_rows is None:
         diagnostics["inventory_totals_control_status"] = "not_supplied"
         return
+    if not inventory_rows:
+        diagnostics["inventory_totals_control_status"] = "supplied_but_no_valid_rows"
+        diagnostics["inventory_control_diagnostic"] = "inventory_control_supplied_but_no_valid_rows"
+        state["physical_opening_readiness"]["opening_stock_business_ready"] = False
+        return
     physical: dict[str, int] = {}
     control: dict[str, int] = {}
     for row in state["placements"]:

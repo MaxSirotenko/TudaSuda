@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import copy
 
+import pandas as pd
+
 from warehouse_business_identity import canonical_sku_key
+from warehouse_actual_inventory_import import build_actual_inventory_placement_state
 from warehouse_scenario_comparison_ui import (
     build_comparison_baseline,
     build_comparison_signature,
@@ -112,3 +115,60 @@ def test_distance_table_uses_distance_language_and_service_columns():
     assert rows[0]["Статус"] == "Улучшился"
     assert rows[0]["Экономия, м"] == 8
     assert rows[0]["Собрано CURRENT"] == rows[0]["Собрано PROPOSED"] == 4
+
+
+def _factual_baseline_inputs():
+    model = {"model_id": "physical", "cells": [{
+        "cell_key": "1|1|1", "row_number": "1", "cell_number": "1", "tier": "1",
+        "storage_type": "normal", "capacity_pallets": 1,
+    }]}
+    table = pd.DataFrame([{"Склад": "  WH ", "РЦ": "DC", "Паллета": "PAL-1", "Ряд": 1,
+        "НомерЯчейки": 1, "Ярус": 1, "Номенклатура": "A", "Характеристика": "X",
+        "ДатаПроизводства": "2026-08-09", "Количество": 40, "КоличествоПаллет": 1,
+        "КоличествоВКоробке": 10, "РасчетноеКоличествоКоробов": 4,
+        "КонтрольРасчета": "Расчет выполнен"}])
+    start, _ = build_actual_inventory_placement_state(model, table)
+    return model, start
+
+
+def test_factual_start_without_inventory_control_builds_authoritative_current():
+    model, start = _factual_baseline_inputs()
+    baseline, diagnostics = build_comparison_baseline(
+        model, start, None, normalized_warehouse="WH", operational_date="2026-08-09")
+    assert baseline is not None
+    assert diagnostics["opening_stock"]["inventory_totals_control_status"] == "not_supplied"
+    assert diagnostics["opening_stock"].get("inventory_total_mismatch_details") is None
+    assert baseline["readiness"]["opening_stock_business_ready"] is True
+
+
+def test_optional_control_agreement_and_disagreement_preserve_physical_start():
+    model, start = _factual_baseline_inputs()
+    sku = start["placements"][0]["sku_key"]
+    control = {"sku_key": sku, "nomenclature": "A", "characteristic": "X",
+               "qty_units": 4, "warehouse": "WH"}
+    ready, ready_diag = build_comparison_baseline(
+        model, start, [control], normalized_warehouse="WH", operational_date="2026-08-09")
+    blocked, blocked_diag = build_comparison_baseline(
+        model, start, [control | {"qty_units": 5}], normalized_warehouse="WH", operational_date="2026-08-09")
+    assert ready is not None and ready_diag["opening_stock"]["inventory_totals_control_status"] == "agrees"
+    assert blocked is not None and blocked["readiness"]["opening_stock_business_ready"] is False
+    assert blocked_diag["opening_stock"]["inventory_total_mismatch_details"][0]["delta_boxes"] == -1
+
+
+def test_supplied_empty_control_has_dedicated_diagnostic_without_fake_mismatches():
+    model, start = _factual_baseline_inputs()
+    baseline, diagnostics = build_comparison_baseline(
+        model, start, [], normalized_warehouse="WH", operational_date="2026-08-09",
+        inventory_control_supplied=True)
+    assert baseline is None
+    assert diagnostics["configuration_errors"] == ["inventory_control_supplied_but_no_valid_rows"]
+    assert "inventory_total_mismatch_details" not in diagnostics["opening_stock"]
+
+
+def test_non_factual_start_without_inventory_control_is_not_promoted():
+    model, start, _, _ = _fixture()
+    baseline, diagnostics = build_comparison_baseline(
+        model, start, None, normalized_warehouse="Вешки", operational_date="2026-08-09")
+    assert baseline is not None
+    assert baseline["readiness"]["opening_stock_business_ready"] is False
+    assert diagnostics["opening_stock"]["legacy_redistribution_used"] is True

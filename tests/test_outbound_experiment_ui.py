@@ -29,6 +29,43 @@ def test_missing_slotting_does_not_block_otherwise_ready_inputs():
         opening_inventory_rows=[{}], outbound_rows=[{}], gate_confirmed=True)
 
 
+def test_optional_inputs_do_not_block_but_start_orders_and_gate_remain_mandatory():
+    ready = dict(day_receipt_state=None, end_state=None, opening_inventory_rows=None)
+    assert ui.experiment_inputs_ready(**ready, start_state={"placements": [{}]},
+                                      outbound_rows=[{}], gate_confirmed=True)
+    assert not ui.experiment_inputs_ready(**ready, start_state=None, outbound_rows=[{}], gate_confirmed=True)
+    assert not ui.experiment_inputs_ready(**ready, start_state={"placements": [{}]},
+                                          outbound_rows=[], gate_confirmed=True)
+    assert not ui.experiment_inputs_ready(**ready, start_state={"placements": [{}]},
+                                          outbound_rows=[{}], gate_confirmed=False)
+
+
+def test_start_warehouse_selection_is_normalized_and_never_merges_scopes():
+    state = {"placements": [{"warehouse": " WH  "}, {"normalized_warehouse": "WH"}]}
+    assert ui.start_warehouses(state) == ["wh"]
+    assert ui.select_start_warehouse(["wh"]) == ("wh", None)
+    assert ui.select_start_warehouse(["a", "b"]) == (
+        None, "multiple_start_warehouses_require_selection")
+    assert ui.select_start_warehouse(["a", "b"], " B ") == ("b", None)
+
+
+def test_outbound_scope_reports_warehouse_and_exact_date_failures():
+    rows = [{"warehouse": "A", "created_at": "2026-08-09T10:00:00"}]
+    assert ui.validate_outbound_scope(rows, "B", "2026-08-09") == [
+        "start_outbound_warehouse_scope_mismatch"]
+    assert ui.validate_outbound_scope(rows, "A", "2026-08-10") == [
+        "selected_operational_date_has_no_accepted_outbound_orders"]
+    assert ui.validate_outbound_scope(rows, " a ", "2026-08-09") == []
+
+
+def test_ui_copy_keeps_end_and_receipts_optional_and_one_headline_path():
+    source = Path(ui.__file__).read_text(encoding="utf-8")
+    assert "END snapshot — необязательно, только валидация" in source
+    assert "Дневной приход — не используется в V1 benchmark" in source
+    assert "Инвентаризация / независимый контроль количества — необязательно" in source
+    assert "run_outbound_distance_experiment" not in source
+
+
 def test_effect_sign_and_none_percent_are_not_recalculated():
     assert ui.describe_distance_effect(12) == "Улучшение"
     assert ui.describe_distance_effect(-12) == "Ухудшение"

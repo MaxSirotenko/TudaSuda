@@ -152,24 +152,38 @@ def summarize_scenario_ui_metrics(
 
 
 def build_comparison_baseline(
-    model: dict[str, Any], start_state: dict[str, Any], opening_rows: list[dict[str, Any]],
+    model: dict[str, Any], start_state: dict[str, Any], opening_rows: list[dict[str, Any]] | None,
     *, normalized_warehouse: str, operational_date: Any,
+    inventory_control_supplied: bool | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
-    """Build CURRENT through the existing warehouse-scoped reconciliation seam."""
+    """Build CURRENT from factual START; inventory totals are only a control."""
     target = normalize_warehouse(normalized_warehouse)
-    if not target or not operational_date or not model or not start_state or not opening_rows:
+    if not target or not operational_date or not model or not start_state:
         return None, {"configuration_errors": ["comparison_inputs_not_ready"]}
     scoped_start, scope_diagnostics = filter_actual_placement_state_by_warehouse(start_state, target)
     scoped_inventory = [
-        dict(row) for row in opening_rows
+        dict(row) for row in (opening_rows or [])
         if normalize_warehouse(row.get("normalized_warehouse") or row.get("warehouse")) == target
     ]
+    control_supplied = opening_rows is not None if inventory_control_supplied is None else inventory_control_supplied
     factual = any(row.get("source_pallet_ref") for row in scoped_start.get("placements", []))
     if factual:
-        opening_stock, reconciliation = cross_check_physical_opening_stock(scoped_start, scoped_inventory)
+        if control_supplied and not scoped_inventory:
+            return None, {"start_scope": scope_diagnostics, "opening_stock": {
+                "inventory_totals_control_status": "supplied_but_no_valid_rows",
+            }, "configuration_errors": ["inventory_control_supplied_but_no_valid_rows"]}
+        opening_stock, reconciliation = cross_check_physical_opening_stock(
+            scoped_start, scoped_inventory if control_supplied else None)
     else:
         opening_stock, reconciliation = reconcile_opening_stock(model, scoped_inventory, scoped_start)
         reconciliation["legacy_redistribution_used"] = True
+        opening_stock["physical_opening_readiness"] = {
+            "stock_quantity_authoritative": False,
+            "stock_location_authoritative": False,
+            "normal_pallet_footprint_authoritative": False,
+            "deep_lane_depth_authoritative": False,
+            "opening_stock_business_ready": False,
+        }
     baseline, simulation = build_initial_simulation_state(
         model, opening_stock, target_normalized_warehouse=target,
         simulation_time=str(operational_date),
@@ -277,11 +291,12 @@ def _show_distance_comparison(comparison: Mapping[str, Any]) -> None:
 
 def render_scenario_comparison(
     model: dict[str, Any], *, operational_date: Any, selected_warehouse: Any,
-    start_state: dict[str, Any] | None, opening_rows: list[dict[str, Any]],
+    start_state: dict[str, Any] | None, opening_rows: list[dict[str, Any]] | None,
     classification_rows: Sequence[Mapping[str, Any]] | None,
     outbound_rows: Sequence[Mapping[str, Any]] | None = None,
     gate_state: dict[str, Any] | None = None,
     end_snapshot: dict[str, Any] | None = None,
+    inventory_control_supplied: bool | None = None,
 ) -> None:
     """Render the independent placement preview before the outbound replay UI."""
     st.divider()
@@ -289,7 +304,7 @@ def render_scenario_comparison(
     target = normalize_warehouse(selected_warehouse)
     baseline, baseline_diagnostics = build_comparison_baseline(
         model, start_state or {}, opening_rows, normalized_warehouse=target,
-        operational_date=operational_date,
+        operational_date=operational_date, inventory_control_supplied=inventory_control_supplied,
     )
     sku_zone_rows = build_sku_zone_rows(classification_rows)
     opening_skus = {lot.get("sku_key") for lot in (baseline or {}).get("stock_lots", []) if lot.get("sku_key")}
@@ -297,7 +312,7 @@ def render_scenario_comparison(
     coverage = round(100 * len(covered) / len(opening_skus), 1) if opening_skus else 0.0
     readiness = {
         "START placement": bool(start_state and start_state.get("placements")),
-        "Opening inventory": bool(opening_rows), "Warehouse": bool(target),
+        "Inventory control (optional)": opening_rows is not None, "Warehouse": bool(target),
         "Baseline SimulationState": baseline is not None,
     }
     st.write(" · ".join(f"{'✓' if ready else '✗'} {name}" for name, ready in readiness.items())
@@ -307,6 +322,16 @@ def render_scenario_comparison(
         with st.expander("Диагностика baseline"):
             st.json(baseline_diagnostics)
         return
+
+    physical = dict((start_state or {}).get("physical_opening_readiness", {}))
+    physical.update(baseline.get("readiness", {}))
+    st.caption("Готовность фактического START")
+    st.json({key: physical.get(key) for key in (
+        "stock_quantity_authoritative", "stock_location_authoritative",
+        "normal_pallet_footprint_authoritative", "opening_stock_business_ready",
+        "estimated_opening_allocation", "exact_normal_pallets", "unresolved_boxes",
+        "deep_lane_depth_authoritative",
+    )})
 
     st.markdown("### Правила PROPOSED")
     weight_zones = st.checkbox("Весовые зоны", key=f"{SESSION_PREFIX}_weight_zones")
