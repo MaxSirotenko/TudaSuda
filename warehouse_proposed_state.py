@@ -147,6 +147,8 @@ def apply_proposed_placement_plan(
         lot = proposed_lots[lot_ids[0]]
         lot["cell_key"] = target_cell
         lot["location_status"] = "located"
+        if stock_role in {"picking", "storage"}:
+            lot["location_role"] = stock_role
         if unit_type == "pallet":
             pallet = proposed_pallets[pallet_id]
             pallet.update(position_id=target_id, cell_key=target_cell, location_status="located")

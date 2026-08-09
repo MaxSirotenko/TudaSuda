@@ -4,6 +4,7 @@ import copy
 
 from warehouse_simulation_distance_comparison import compare_simulation_outbound_replay
 from warehouse_simulation_outbound_replay import replay_outbound_on_simulation_states
+from warehouse_placement_rules import build_placement_rule_set
 
 
 def fixture():
@@ -87,3 +88,67 @@ def test_different_shortage_cannot_create_false_saving_but_same_shortage_is_comp
     same_comparison, _ = compare_simulation_outbound_replay(same)
     assert same_comparison["coverage"]["strict_comparable_orders"] == 1
     assert same_comparison["full_day_effect_valid"] is False
+
+
+def test_explicit_replenishment_moves_whole_pallet_and_keeps_distances_separate():
+    model, gate, demand = fixture()
+    demand["orders"][0]["demands"][0]["requested_units"] = 15
+    proposed = {
+        "simulation_state_id": "role-state", "applied_event_ids": ["factual"],
+        "stock_lots": [
+            {"stock_lot_id": "pick-lot", "sku_key": "sku", "cell_key": "near", "position_id": "pick-pos",
+             "location_status": "located", "location_role": "picking", "pallet_unit_id": "pick-pal", "qty_boxes": 10},
+            {"stock_lot_id": "store-lot", "sku_key": "sku", "cell_key": "far", "position_id": "store-pos",
+             "location_status": "located", "location_role": "storage", "pallet_unit_id": "store-pal", "qty_boxes": 20},
+        ],
+        "pallet_units": [
+            {"pallet_unit_id": "pick-pal", "physical_status": "active", "location_status": "located",
+             "placement_role": "picking", "position_id": "pick-pos", "cell_key": "near", "remaining_boxes": 10},
+            {"pallet_unit_id": "store-pal", "physical_status": "active", "location_status": "located",
+             "placement_role": "storage", "position_id": "store-pos", "cell_key": "far", "remaining_boxes": 20},
+        ],
+        "physical_positions": [
+            {"position_id": "pick-pos", "cell_key": "near", "status": "occupied"},
+            {"position_id": "store-pos", "cell_key": "far", "status": "occupied"},
+        ],
+    }
+    rules, validation = build_placement_rule_set({"picking_storage": True, "replenishment": True})
+    assert validation["valid"]
+    original = copy.deepcopy(proposed)
+    replay, diagnostics = replay_outbound_on_simulation_states(
+        model, proposed, proposed, demand, gate, placement_rule_set=rules)
+    result = replay["proposed"]
+    assert [event["picked_boxes"] for event in result["orders"][0]["pick_events"]] == [10, 5]
+    assert result["summary"]["initial_boxes"] == 30
+    assert result["summary"]["picked_boxes"] == 15 and result["summary"]["final_boxes"] == 15
+    assert result["summary"]["conservation_valid"] is True
+    assert result["summary"]["replenishment_event_count"] == 1
+    assert result["summary"]["total_movement_distance_m"] == (
+        result["summary"]["picker_distance_m"] + result["summary"]["replenishment_distance_m"])
+    assert replay["current"]["summary"]["replenishment_distance_m"] == 0
+    event = result["replenishment_events"][0]
+    assert event["pallet_unit_id"] == "store-pal" and event["boxes"] == 20
+    working = result["working_state"]
+    moved = next(p for p in working["pallet_units"] if p["pallet_unit_id"] == "store-pal")
+    moved_lot = next(l for l in working["stock_lots"] if l["stock_lot_id"] == "store-lot")
+    assert (moved["position_id"], moved["cell_key"], moved["placement_role"], moved["remaining_boxes"]) == ("pick-pos", "near", "picking", 15)
+    assert (moved_lot["position_id"], moved_lot["cell_key"], moved_lot["location_role"], moved_lot["qty_boxes"]) == ("pick-pos", "near", "picking", 15)
+    assert next(p for p in working["physical_positions"] if p["position_id"] == "store-pos")["status"] == "free"
+    assert diagnostics["proposed"]["replenishment_fallbacks"] == []
+    assert proposed == original
+
+
+def test_unsupported_replenishment_falls_back_to_direct_pick_with_diagnostic():
+    model, gate, demand = fixture(); demand["orders"][0]["demands"][0]["requested_units"] = 15
+    proposed = state("far", 20)
+    proposed["stock_lots"][0]["location_role"] = "storage"  # no authoritative pallet link
+    proposed["stock_lots"].append({"stock_lot_id": "pick", "sku_key": "sku", "cell_key": "near",
+        "position_id": "pick-pos", "location_status": "located", "location_role": "picking", "qty_boxes": 10})
+    proposed["physical_positions"] = [{"position_id": "pick-pos", "cell_key": "near", "status": "occupied"}]
+    rules = build_placement_rule_set({"picking_storage": True, "replenishment": True})[0]
+    replay, diagnostics = replay_outbound_on_simulation_states(model, proposed, proposed, demand, gate,
+                                                               placement_rule_set=rules)
+    assert replay["proposed"]["orders"][0]["shortage_boxes"] == 0
+    assert replay["proposed"]["summary"]["replenishment_event_count"] == 0
+    assert replay["proposed"]["summary"]["replenishment_distance_m"] == 0
+    assert diagnostics["proposed"]["replenishment_fallbacks"][0]["code"] == "unsupported_replenishment_direct_pick_fallback"

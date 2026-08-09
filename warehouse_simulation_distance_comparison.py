@@ -98,6 +98,23 @@ def compare_simulation_outbound_replay(
                "improved_orders": improved, "worsened_orders": worsened, "equal_orders": equal,
                "improved_orders_percent": improved / count * 100 if count else 0.0,
                "worsened_orders_percent": worsened / count * 100 if count else 0.0}
+    proposed_summary = replay_state.get("proposed", {}).get("summary", {})
+    replenishment_distance = float(proposed_summary.get("replenishment_distance_m") or 0)
+    current_movement = current_total
+    proposed_movement = proposed_total + replenishment_distance
+    metrics.update({
+        "current_picker_distance_m": current_total,
+        "proposed_picker_distance_m": proposed_total,
+        "picker_distance_saved_m": saved_total,
+        "picker_distance_saved_percent": saved_total / current_total * 100 if current_total else 0.0,
+        "proposed_replenishment_distance_m": replenishment_distance,
+        "current_total_movement_distance_m": current_movement,
+        "proposed_total_movement_distance_m": proposed_movement,
+        "total_movement_delta_m": proposed_movement - current_movement,
+        "replenishment_event_count": int(proposed_summary.get("replenishment_event_count") or 0),
+        "replenishment_fallback_count": int(proposed_summary.get("replenishment_fallback_count") or 0),
+        "replenishment_modeled_coverage_percent": float(proposed_summary.get("replenishment_modeled_coverage_percent", 100.0)),
+    })
     coverage = {"orders_total": total, "strict_comparable_orders": count, "non_comparable_orders": total - count,
                 "route_orders": sum(_valid_distance(o) for o in current_orders),
                 "order_comparability_percent": count / total * 100 if total else 100.0,

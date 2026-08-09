@@ -25,7 +25,7 @@ from warehouse_placement_zones import (
 from warehouse_physical_graph import build_physical_warehouse_graph, find_shortest_path
 
 PROPOSED_PLACEMENT_PLAN_VERSION = 5
-_SUPPORTED_RULES = frozenset({"weight_zones", "velocity", "adjacency", "base_sku_capacity", "picking_storage"})
+_SUPPORTED_RULES = frozenset({"weight_zones", "velocity", "adjacency", "base_sku_capacity", "picking_storage", "replenishment"})
 
 
 def _canonical_json(value: Any) -> str:
