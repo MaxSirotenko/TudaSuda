@@ -1,0 +1,100 @@
+from __future__ import annotations
+
+import copy
+
+from warehouse_business_identity import canonical_sku_key
+from warehouse_scenario_comparison_ui import (
+    build_comparison_baseline,
+    build_comparison_signature,
+    build_sku_zone_rows,
+    build_weight_zone_rule_config,
+    summarize_scenario_ui_metrics,
+)
+from warehouse_proposed_scenario import build_proposed_scenario
+
+
+def _fixture():
+    cells = [
+        {"cell_key": str(index), "row_number": str(index), "cell_number": "1", "tier": "1",
+         "row_order": index, "physical_index": index, "weight_zone": zone,
+         "storage_type": "normal", "capacity_pallets": 1}
+        for index, zone in ((1, "heavy"), (2, "light"))
+    ]
+    model = {"model_id": "comparison-model", "source_file_hash": "source", "cells": cells}
+
+    def sku(name):
+        return canonical_sku_key({"nomenclature": name, "characteristic": "x"})
+
+    start = {"placements": [
+        {"sku_key": sku("A"), "nomenclature": "A", "characteristic": "x", "quantity": 10,
+         "qty_boxes": 10, "cell_key": "1", "warehouse": "Вешки"},
+        {"sku_key": sku("B"), "nomenclature": "B", "characteristic": "x", "quantity": 10,
+         "qty_boxes": 10, "cell_key": "2", "warehouse": "Вешки"},
+        {"sku_key": sku("FOREIGN"), "nomenclature": "FOREIGN", "characteristic": "x", "quantity": 5,
+         "qty_boxes": 5, "cell_key": "1", "warehouse": "Другой"},
+    ]}
+    inventory = [
+        {"sku_key": sku(name), "nomenclature": name, "characteristic": "x", "qty_units": 10,
+         "unit_name": "короб", "warehouse": "Вешки"}
+        for name in ("A", "B")
+    ]
+    classifications = [
+        {"sku_key": sku("A"), "calculated_zone": "light"},
+        {"sku_key": sku("B"), "calculated_zone": "heavy"},
+    ]
+    return model, start, inventory, classifications
+
+
+def test_signature_is_deterministic_and_covers_rules_and_baseline():
+    common = dict(model_id="m", baseline_state_id="s", operational_date="2026-08-09",
+                  normalized_warehouse="Вешки", sku_zone_rows=[{"sku_key": "b", "target_zone": "light"},
+                                                                 {"sku_key": "a", "target_zone": "heavy"}])
+    first = build_comparison_signature(**common, rule_config=build_weight_zone_rule_config(False))
+    reordered = dict(common, sku_zone_rows=list(reversed(common["sku_zone_rows"])))
+    assert first == build_comparison_signature(**reordered, rule_config=build_weight_zone_rule_config(False))
+    assert first != build_comparison_signature(**common, rule_config=build_weight_zone_rule_config(True))
+    assert first != build_comparison_signature(**(common | {"baseline_state_id": "changed"}),
+                                                rule_config=build_weight_zone_rule_config(False))
+
+
+def test_classification_adapter_uses_canonical_contract_and_never_physical_zone():
+    rows = build_sku_zone_rows([
+        {"sku_key": "a", "calculated_zone": "Средне-лёгкое", "weight_zone": "heavy"},
+        {"sku_key": "b", "calculated_zone": "show_boxes"},
+        {"sku_key": "c", "calculated_zone": "unassigned"},
+        {"sku_key": "d", "calculated_zone": "not-a-zone"},
+    ])
+    assert rows == [
+        {"sku_key": "a", "target_zone": "medium_light", "source": "loaded_receipt_classification"},
+        {"sku_key": "b", "target_zone": "show_boxes", "source": "loaded_receipt_classification"},
+    ]
+
+
+def test_off_on_off_always_uses_immutable_baseline_and_exact_warehouse_scope():
+    model, start, inventory, classifications = _fixture()
+    originals = copy.deepcopy((model, start, inventory))
+    baseline, diagnostics = build_comparison_baseline(
+        model, start, inventory, normalized_warehouse="Вешки", operational_date="2026-08-09")
+    assert not diagnostics["configuration_errors"]
+    assert all(lot["nomenclature"] != "FOREIGN" for lot in baseline["stock_lots"])
+    zones = build_sku_zone_rows(classifications)
+    first, _ = build_proposed_scenario(model, baseline, build_weight_zone_rule_config(False), sku_zone_rows=zones)
+    moved, _ = build_proposed_scenario(model, baseline, build_weight_zone_rule_config(True), sku_zone_rows=zones)
+    third, _ = build_proposed_scenario(model, baseline, build_weight_zone_rule_config(False), sku_zone_rows=zones)
+    assert first["proposed_state_id"] == baseline["simulation_state_id"] == third["proposed_state_id"]
+    assert moved["proposed_state_id"] != baseline["simulation_state_id"]
+    assert moved["summary"]["units_moved"] == 2
+    assert (model, start, inventory) == originals
+
+
+def test_metrics_report_missing_zone_without_location_inference():
+    model, start, inventory, classifications = _fixture()
+    baseline, _ = build_comparison_baseline(
+        model, start, inventory, normalized_warehouse="Вешки", operational_date="2026-08-09")
+    one_zone = build_sku_zone_rows(classifications[:1])
+    scenario, _ = build_proposed_scenario(
+        model, baseline, build_weight_zone_rule_config(True), sku_zone_rows=one_zone)
+    metrics = summarize_scenario_ui_metrics(scenario, baseline, one_zone)
+    assert metrics["missing_zone_skus"] == 1
+    assert metrics["missing_zone_placements"] == 1
+    assert metrics["fixed_units"] >= 1
