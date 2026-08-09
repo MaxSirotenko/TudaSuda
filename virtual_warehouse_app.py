@@ -104,6 +104,9 @@ from warehouse_receipts import (
     load_receipts_state,
     make_receipts_state,
     normalize_receipt_table,
+    optional_receipt_column_index,
+    optional_receipt_column_options,
+    format_receipt_column_option,
     read_receipt_table,
     save_receipts_state,
     zone_classification_settings_hash,
@@ -1149,11 +1152,14 @@ def _render_zone_classification_result(state: dict) -> None:
                 "Номер строки Excel": receipt.get("source_row_number", ""),
             }
             for receipt in state.get("receipts", [])
-            if receipt.get("weight_parse_status") != "ok"
+            if receipt.get("weight_parse_status") == "error"
         ]
         if bad_weight_rows:
-            st.warning("Есть строки, где вес не удалось преобразовать.")
+            st.warning("Вес в некоторых строках не удалось распознать. Строки прихода сохранены, но весовая зона SKU не рассчитана.")
             st.dataframe(pd.DataFrame(bad_weight_rows), use_container_width=True)
+        missing_weight = sum(1 for receipt in state.get("receipts", []) if receipt.get("weight_parse_status") in {"empty", "not_supplied"})
+        if missing_weight:
+            st.info(f"Для SKU не указан вес ({missing_weight} строк). Приход загружен, но весовая зона этого SKU не определена.")
 
 
 def _render_receipt_placement_diagnostics(diag: dict | None) -> None:
@@ -1181,6 +1187,13 @@ def render_receipts_section(model: dict) -> None:
         c3.metric("Строк", len(receipts))
         c4.metric("SKU", diagnostics.get("Всего SKU", 0))
         c5.metric("Паллет", f"{diagnostics.get('Всего паллет', 0):g}" if isinstance(diagnostics.get("Всего паллет", 0), (int, float)) else diagnostics.get("Всего паллет", 0))
+        zone_diagnostics = state.get("zone_classification_diagnostics", {})
+        coverage = st.columns(5)
+        coverage[0].metric("SKU с весом", max(diagnostics.get("Всего SKU", 0) - diagnostics.get("SKU без любого валидного веса", 0), 0))
+        coverage[1].metric("SKU без веса", diagnostics.get("SKU без любого валидного веса", 0))
+        coverage[2].metric("Зона определена", zone_diagnostics.get("SKU с подтверждённой зоной", 0))
+        coverage[3].metric("Зона не определена", zone_diagnostics.get("SKU без подтверждённой зоны", diagnostics.get("Всего SKU", 0)))
+        coverage[4].metric("Конфликтов зоны/веса", zone_diagnostics.get("Конфликтов данных", 0))
         st.info("Приходы загружены. Алгоритм размещения по ячейкам пока не запущен. Все строки имеют статус ‘Не размещено’.")
     upload_tab, data_tab, diag_tab = st.tabs(["Загрузка приходов", "Приходы к размещению", "Диагностика приходов"])
 
@@ -1198,37 +1211,39 @@ def render_receipts_section(model: dict) -> None:
             with st.expander("Предпросмотр", expanded=False):
                 st.dataframe(receipt_df.head(30), use_container_width=True)
             detected = detect_receipt_columns(receipt_df)
-            columns = [None] + list(receipt_df.columns)
-            st.caption("Ручной выбор колонок: проверьте автоопределение или выберите колонки вручную.")
+            columns = optional_receipt_column_options(list(receipt_df.columns))
+            st.caption("Обязательные поля отмечены *. Для необязательных полей можно выбрать «— Не указано —».")
             c1, c2, c3, c4, c5 = st.columns(5)
             c6, c7, c8, c9, c10 = st.columns(5)
             c11, c12, c13, c14, c15 = st.columns(5)
-            c16 = st.columns(1)[0]
             zone_detected = detect_zone_classification_columns(receipt_df)
             mapping = {
-                "sku_code": c1.selectbox("Код товара", columns, index=columns.index(detected["sku_code"]) if detected["sku_code"] in columns else 0, key="receipt_map_sku"),
-                "sku_name": c2.selectbox("Наименование", columns, index=columns.index(detected["sku_name"]) if detected["sku_name"] in columns else 0, key="receipt_map_name"),
-                "qty_pallets": c3.selectbox("Количество паллет", columns, index=columns.index(detected["qty_pallets"]) if detected["qty_pallets"] in columns else 0, key="receipt_map_pallets"),
-                "qty_boxes": c4.selectbox("Количество коробов", columns, index=columns.index(detected["qty_boxes"]) if detected["qty_boxes"] in columns else 0, key="receipt_map_boxes"),
-                "qty_units": c5.selectbox("Базовое количество", columns, index=columns.index(detected["qty_units"]) if detected["qty_units"] in columns else 0, key="receipt_map_units"),
-                "receipt_date": c6.selectbox("Дата прихода", columns, index=columns.index(detected["receipt_date"]) if detected["receipt_date"] in columns else 0, key="receipt_map_date"),
-                "receipt_number": c7.selectbox("Номер документа", columns, index=columns.index(detected["receipt_number"]) if detected["receipt_number"] in columns else 0, key="receipt_map_number"),
-                "receipt_document": c8.selectbox("Документ прихода", columns, index=columns.index(detected["receipt_document"]) if detected["receipt_document"] in columns else 0, key="receipt_map_document"),
-                "warehouse": c9.selectbox("Склад", columns, index=columns.index(detected["warehouse"]) if detected["warehouse"] in columns else 0, key="receipt_map_warehouse"),
-                "warehouse_zone": c10.selectbox("Складская зона", columns, index=columns.index(detected["warehouse_zone"]) if detected["warehouse_zone"] in columns else 0, key="receipt_map_zone"),
-                "characteristic_code": c11.selectbox("Код характеристики", columns, index=columns.index(detected["characteristic_code"]) if detected["characteristic_code"] in columns else 0, key="receipt_map_char_code"),
-                "characteristic_name": c12.selectbox("Характеристика", columns, index=columns.index(detected["characteristic_name"]) if detected["characteristic_name"] in columns else 0, key="receipt_map_char_name"),
-                "batch": c13.selectbox("Партия", columns, index=columns.index(detected["batch"]) if detected["batch"] in columns else 0, key="receipt_map_batch"),
-                "expiry_date": c14.selectbox("Срок годности", columns, index=columns.index(detected["expiry_date"]) if detected["expiry_date"] in columns else 0, key="receipt_map_expiry"),
-                "comment": c15.selectbox("Комментарий", columns, index=columns.index(detected["comment"]) if detected["comment"] in columns else 0, key="receipt_map_comment"),
+                "sku_code": c1.selectbox("Код товара *", columns, index=optional_receipt_column_index(columns, detected["sku_code"]), format_func=format_receipt_column_option, key="receipt_map_sku"),
+                "sku_name": c2.selectbox("Наименование *", columns, index=optional_receipt_column_index(columns, detected["sku_name"]), format_func=format_receipt_column_option, key="receipt_map_name"),
+                "qty_pallets": c3.selectbox("Количество паллет *", columns, index=optional_receipt_column_index(columns, detected["qty_pallets"]), format_func=format_receipt_column_option, key="receipt_map_pallets"),
+                "qty_boxes": c4.selectbox("Количество коробов", columns, index=columns.index(detected["qty_boxes"]) if detected["qty_boxes"] in columns else 0, format_func=format_receipt_column_option, key="receipt_map_boxes"),
+                "qty_units": c5.selectbox("Базовое количество", columns, index=columns.index(detected["qty_units"]) if detected["qty_units"] in columns else 0, format_func=format_receipt_column_option, key="receipt_map_units"),
+                "receipt_date": c6.selectbox("Дата прихода", columns, index=columns.index(detected["receipt_date"]) if detected["receipt_date"] in columns else 0, format_func=format_receipt_column_option, key="receipt_map_date"),
+                "receipt_number": c7.selectbox("Номер документа", columns, index=columns.index(detected["receipt_number"]) if detected["receipt_number"] in columns else 0, format_func=format_receipt_column_option, key="receipt_map_number"),
+                "receipt_document": c8.selectbox("Документ прихода", columns, index=columns.index(detected["receipt_document"]) if detected["receipt_document"] in columns else 0, format_func=format_receipt_column_option, key="receipt_map_document"),
+                "warehouse": c9.selectbox("Склад", columns, index=columns.index(detected["warehouse"]) if detected["warehouse"] in columns else 0, format_func=format_receipt_column_option, key="receipt_map_warehouse"),
+                "warehouse_zone": c10.selectbox("Складская зона", columns, index=columns.index(detected["warehouse_zone"]) if detected["warehouse_zone"] in columns else 0, format_func=format_receipt_column_option, key="receipt_map_zone"),
+                "characteristic_code": c11.selectbox("Код характеристики", columns, index=columns.index(detected["characteristic_code"]) if detected["characteristic_code"] in columns else 0, format_func=format_receipt_column_option, key="receipt_map_char_code"),
+                "characteristic_name": c12.selectbox("Характеристика", columns, index=columns.index(detected["characteristic_name"]) if detected["characteristic_name"] in columns else 0, format_func=format_receipt_column_option, key="receipt_map_char_name"),
+                "batch": c13.selectbox("Партия", columns, index=columns.index(detected["batch"]) if detected["batch"] in columns else 0, format_func=format_receipt_column_option, key="receipt_map_batch"),
+                "expiry_date": c14.selectbox("Срок годности", columns, index=columns.index(detected["expiry_date"]) if detected["expiry_date"] in columns else 0, format_func=format_receipt_column_option, key="receipt_map_expiry"),
+                "comment": c15.selectbox("Комментарий", columns, index=columns.index(detected["comment"]) if detected["comment"] in columns else 0, format_func=format_receipt_column_option, key="receipt_map_comment"),
                 "weight_class": None,
             }
+            # Every selector below maps optional receipt metadata.  The shared
+            # options list and formatter make its None value visible instead of
+            # coercing an undetected field to the first Excel column.
             st.subheader("Правила определения зоны товара")
             st.caption("Используются только подтверждённые весовые диапазоны и явная зона источника; неподтверждённые веса остаются без зоны.")
             zc1, zc2, zc3 = st.columns(3)
-            mapping["source_weight"] = zc1.selectbox("Колонка с весом товара", columns, index=columns.index(zone_detected["weight_column"]) if zone_detected.get("weight_column") in columns else 0, key="receipt_map_source_weight")
-            mapping["fragile_flag"] = zc2.selectbox("Колонка с признаком хрупкости", columns, index=columns.index(zone_detected["fragile_column"]) if zone_detected.get("fragile_column") in columns else 0, key="receipt_map_fragile_flag")
-            mapping["source_zone"] = zc3.selectbox("Колонка с исходной зоной из 1С", columns, index=columns.index(zone_detected["source_zone_column"]) if zone_detected.get("source_zone_column") in columns else 0, key="receipt_map_source_zone")
+            mapping["source_weight"] = zc1.selectbox("Вес товара — необязательно", columns, index=optional_receipt_column_index(columns, zone_detected["weight_column"]), format_func=format_receipt_column_option, help="Используется для определения весовой зоны SKU, если зона не подтверждена другим источником.", key="receipt_map_source_weight")
+            mapping["fragile_flag"] = zc2.selectbox("Признак хрупкости — необязательно", columns, index=optional_receipt_column_index(columns, zone_detected["fragile_column"]), format_func=format_receipt_column_option, key="receipt_map_fragile_flag")
+            mapping["source_zone"] = zc3.selectbox("Исходная зона — необязательно", columns, index=optional_receipt_column_index(columns, zone_detected["source_zone_column"]), format_func=format_receipt_column_option, key="receipt_map_source_zone")
             zone_settings = default_zone_classification_settings()
             zone_settings.update({"weight_column": mapping.get("source_weight"), "fragile_column": mapping.get("fragile_flag"), "source_zone_column": mapping.get("source_zone")})
             normalized_receipts, receipt_diagnostics, receipt_messages = normalize_receipt_table_cached(receipt_df.to_json(orient="split", force_ascii=False), json.dumps(mapping, ensure_ascii=False))
@@ -1885,6 +1900,9 @@ def render_data_workspace(model: dict | None) -> None:
 
 def render_rules_workspace(model: dict | None) -> None:
     from warehouse_workspace_ui import render_rules_control_panel
+    if model:
+        receipt_state, _ = load_receipts_state_cached(model)
+        st.session_state["receipts_state"] = receipt_state
     render_rules_control_panel(model, st.session_state)
 
 

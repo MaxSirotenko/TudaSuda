@@ -13,7 +13,7 @@ from typing import Any, Callable
 import pandas as pd
 import streamlit as st
 
-from warehouse_placement_zones import PLACEMENT_ZONE_IDS, get_placement_zone_label, normalize_placement_zone
+from warehouse_placement_zones import PLACEMENT_ZONE_IDS, get_placement_zone_label, is_assignable_placement_zone, normalize_placement_zone
 from warehouse_scenario_comparison_ui import build_scenario_rule_config
 from warehouse_ui_messages import get_ui_message
 from warehouse_workflow_ui_state import state_from_session
@@ -33,6 +33,30 @@ RULE_CARDS = {
     "deep_lane_optimization": ("Deep lane", "Поддерживаемый складской запас может использовать набивные ряды с сохранением one-SKU-per-lane и существующего depth contract."),
     "base_sku_capacity": ("Минимальная ёмкость SKU", "Для активного SKU резервируется минимум одна normal-позиция при доступной ёмкости."),
 }
+
+
+def build_weight_zone_readiness(receipts: list[Mapping[str, Any]] | None) -> dict[str, Any]:
+    """Report receipt zone coverage without participating in V1 readiness."""
+    zones_by_sku: dict[str, set[str]] = defaultdict(set)
+    for row in receipts or []:
+        sku = str(row.get("sku_key") or "").strip()
+        if not sku:
+            continue
+        zone = normalize_placement_zone(row.get("calculated_zone"))
+        if is_assignable_placement_zone(zone):
+            zones_by_sku[sku].add(zone)
+        else:
+            zones_by_sku.setdefault(sku, set())
+    total = len(zones_by_sku)
+    confirmed = sum(1 for zones in zones_by_sku.values() if len(zones) == 1)
+    unresolved = total - confirmed
+    return {
+        "status": "ready" if total and not unresolved else "partial" if confirmed else "unresolved",
+        "total_sku": total,
+        "confirmed_sku": confirmed,
+        "unresolved_sku": unresolved,
+        "coverage_percent": round(100 * confirmed / total, 1) if total else 0.0,
+    }
 LIMITATION_LABELS = {
     "intraday_receipts_not_modeled": "Приходы внутри дня не моделируются.",
     "intermediate_full_picking_pallet_return_not_modeled": "Возврат полного паллета комплектации между РО не моделируется.",
@@ -137,6 +161,17 @@ def render_rules_control_panel(model: Mapping[str, Any] | None, session_state: M
             st.caption("Заблокировано: требуется правило «Комплектация / хранение».")
         else:
             st.caption("Готово" if model else "Нет данных")
+        if rule == "weight_zones" and values[rule]:
+            receipt_state = session_state.get("receipts_state") or {}
+            coverage = build_weight_zone_readiness(receipt_state.get("receipts", []))
+            if coverage["status"] == "ready":
+                st.success("Весовые зоны: готовы")
+            else:
+                st.warning("Весовые зоны: частично готовы" if coverage["confirmed_sku"] else "Весовые зоны: не готовы")
+            st.caption(f'{coverage["confirmed_sku"]} из {coverage["total_sku"]} SKU имеют подтверждённую зону.')
+            if coverage["unresolved_sku"]:
+                st.caption(f'{coverage["unresolved_sku"]} SKU остаются без зоны.')
+                st.caption('Добавьте подтверждённый вес/зону либо отключите правило "Весовые зоны".')
     minimum = st.number_input("Минимум позиций комплектации на SKU", min_value=1, value=1, step=1,
                               disabled=not values["base_sku_capacity"])
     config = build_workspace_rule_config(values, minimum)

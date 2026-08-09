@@ -37,6 +37,7 @@ WEIGHT_CLASS_ALIASES = ["weight_class", "weight_zone", "весоваякатег
 WEIGHT_ALIASES = ["weight_kg", "weight", "вес", "вескг", "вес, кг", "вес товара", "вес брутто", "масса"]
 FRAGILE_ALIASES = ["fragile", "is_fragile", "хрупкое", "хрупкий", "признакхрупкости", "признак хрупкости"]
 SOURCE_ZONE_ALIASES = ["source_zone", "зона", "зона 1с", "исходная зона", "исходная зона 1с"]
+OPTIONAL_COLUMN_LABEL = "— Не указано —"
 
 RECEIPT_COLUMNS = [
     "receipt_id",
@@ -174,6 +175,20 @@ def detect_zone_classification_columns(df: pd.DataFrame) -> dict[str, str | None
     }
 
 
+def optional_receipt_column_options(columns: list[Any]) -> list[Any]:
+    """Return the UI contract for optional mappings: ``None`` is explicit and first."""
+    return [None, *[column for column in columns if column is not None]]
+
+
+def optional_receipt_column_index(options: list[Any], detected: Any) -> int:
+    """Select auto-detection when present, otherwise the explicit no-selection item."""
+    return options.index(detected) if detected is not None and detected in options else options.index(None)
+
+
+def format_receipt_column_option(value: Any) -> str:
+    return OPTIONAL_COLUMN_LABEL if value is None else str(value)
+
+
 def _calculated_zone_for(weight: float | None) -> tuple[str, str]:
     if weight is None:
         return UNASSIGNED_ZONE, "Вес отсутствует или некорректен"
@@ -243,7 +258,7 @@ def calculate_receipt_zones(receipts: list[dict[str, Any]], settings: dict[str, 
             zone, reason = UNASSIGNED_ZONE, "Конфликт веса SKU"
         else:
             zone, reason = _calculated_zone_for(median_weight)
-        status = "ok" if is_assignable_placement_zone(zone) else "error"
+        status = "ok" if is_assignable_placement_zone(zone) else "unresolved"
         sku_result[sku_key] = (zone, reason, status)
     mismatches = 0
     for item in rows:
@@ -264,6 +279,8 @@ def calculate_receipt_zones(receipts: list[dict[str, Any]], settings: dict[str, 
         "Количество приходных ордеров": len({item.get("receipt_number") for item in rows if item.get("receipt_number")}),
         "Количество строк прихода": len(rows),
         "Всего SKU": len(sku_zones),
+        "SKU с подтверждённой зоной": sum(1 for value in sku_zones.values() if is_assignable_placement_zone(value)),
+        "SKU без подтверждённой зоны": sum(1 for value in sku_zones.values() if value == UNASSIGNED_ZONE),
         "Лёгких SKU": sum(1 for value in sku_zones.values() if value == "light"),
         "Средних SKU": sum(1 for value in sku_zones.values() if value == "medium"),
         "Тяжёлых SKU": sum(1 for value in sku_zones.values() if value == "heavy"),
@@ -363,7 +380,7 @@ def normalize_receipt_table(df: pd.DataFrame, mapping: dict[str, str | None]) ->
     rows: list[dict[str, Any]] = []
     for source_index, (_, row) in enumerate(df.iterrows(), start=1):
         source_row_number = source_index
-        weight_raw, parsed_weight, weight_status, weight_reason = parse_weight_value(row.get(mapping.get("source_weight"))) if mapping.get("source_weight") else ("", None, "empty", "Колонка веса не выбрана")
+        weight_raw, parsed_weight, weight_status, weight_reason = parse_weight_value(row.get(mapping.get("source_weight"))) if mapping.get("source_weight") else ("", None, "not_supplied", "Вес не указан")
         receipt = {
             "receipt_id": str(uuid.uuid4()),
             "receipt_line_id": "",
@@ -391,7 +408,7 @@ def normalize_receipt_table(df: pd.DataFrame, mapping: dict[str, str | None]) ->
             "calculated_zone": UNASSIGNED_ZONE,
             "zone_calculation_reason": "Вес отсутствует",
             "source_weight_raw": weight_raw,
-            "source_weight": parsed_weight if parsed_weight is not None else "",
+            "source_weight": parsed_weight,
             "weight_parse_status": weight_status,
             "weight_parse_reason": weight_reason,
             "fragile_flag": _truthy_flag(row.get(mapping.get("fragile_flag"))) if mapping.get("fragile_flag") else False,
@@ -400,7 +417,21 @@ def normalize_receipt_table(df: pd.DataFrame, mapping: dict[str, str | None]) ->
         receipt["sku_key"] = make_sku_key(receipt)
         receipt["receipt_line_id"] = make_receipt_line_id(receipt)
         rows.append(receipt)
+    missing_weight_skus = {item["sku_key"] for item in rows if item["weight_parse_status"] in {"empty", "not_supplied"}}
+    invalid_weight_rows = [item for item in rows if item["weight_parse_status"] == "error"]
+    if missing_weight_skus:
+        messages.append({"level": "warning", "message": "Для SKU не указан вес. Приход загружен, но весовая зона этого SKU не определена."})
+    for item in invalid_weight_rows:
+        messages.append({
+            "level": "warning",
+            "message": f'Вес "{item["source_weight_raw"]}" не удалось распознать. Строка прихода сохранена, но весовая зона SKU не рассчитана.',
+        })
     result = pd.DataFrame(rows, columns=RECEIPT_COLUMNS)
+    # Keep missing weights as JSON-safe None.  Without object dtype pandas
+    # coerces a mixed float/None column to NaN, obscuring the import contract.
+    result["source_weight"] = pd.Series(
+        [item["source_weight"] for item in rows], dtype="object"
+    )
     diagnostics = build_receipt_diagnostics(rows, len(df), messages)
     return result, diagnostics, messages
 
