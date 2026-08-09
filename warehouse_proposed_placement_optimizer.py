@@ -24,8 +24,8 @@ from warehouse_placement_zones import (
 )
 from warehouse_physical_graph import build_physical_warehouse_graph, find_shortest_path
 
-PROPOSED_PLACEMENT_PLAN_VERSION = 3
-_SUPPORTED_RULES = frozenset({"weight_zones", "velocity", "adjacency"})
+PROPOSED_PLACEMENT_PLAN_VERSION = 4
+_SUPPORTED_RULES = frozenset({"weight_zones", "velocity", "adjacency", "base_sku_capacity"})
 
 
 def _canonical_json(value: Any) -> str:
@@ -132,6 +132,7 @@ def _plan_identity(plan: Mapping[str, Any]) -> dict[str, Any]:
             for reason in plan.get("blocked_reasons", [])
         ],
         "placements": plan.get("placements", []),
+        "sku_capacity_allocations": plan.get("sku_capacity_allocations", []),
         "fixed_units": [
             {key: unit.get(key) for key in ("placement_unit_id", "origin_position_id", "reason")}
             for unit in plan.get("fixed_units", [])
@@ -246,7 +247,7 @@ def _base_plan(model: Mapping[str, Any], state: Mapping[str, Any], rules: Mappin
         "target_normalized_warehouse": state.get("target_normalized_warehouse"),
         "sku_zone_assignments": [{"sku_key": sku, "target_zone": zone} for sku, zone in sorted(assignments.items())],
         "status": "blocked", "blocked_reasons": [], "placements": [], "fixed_units": [],
-        "unresolved_units": [], "zone_summary": [], "summary": {},
+        "unresolved_units": [], "sku_capacity_allocations": [], "zone_summary": [], "summary": {},
         "limitations": [
             "weight_zones_only", "target_layout_not_move_sequence", "simulation_state_not_mutated",
             "deep_lane_optimization_not_implemented", "missing_sku_zone_is_not_inferred",
@@ -311,6 +312,10 @@ def build_proposed_placement_plan(
     weight_enabled = "weight_zones" in enabled
     velocity_enabled = "velocity" in enabled
     adjacency_enabled = "adjacency" in enabled
+    capacity_enabled = "base_sku_capacity" in enabled
+    minimum_positions = next(
+        (rule["parameters"]["minimum_positions_per_sku"] for rule in placement_rule_set["rules"]
+         if rule["rule_id"] == "base_sku_capacity"), 1)
     distances: dict[str, float] = {}
     if velocity_enabled:
         graph, graph_diagnostics = build_physical_warehouse_graph(model, gate_state)
@@ -469,6 +474,81 @@ def build_proposed_placement_plan(
     fixed.sort(key=lambda unit: _text(unit["placement_unit_id"]))
     unresolved.sort(key=lambda unit: (_text(unit.get("placement_unit_id")), _text(unit.get("stock_lot_id")), unit["reason"]))
     plan["placements"], plan["fixed_units"], plan["unresolved_units"] = placements, fixed, unresolved
+    capacity_allocations: list[dict[str, Any]] = []
+    if capacity_enabled and plan["status"] != "blocked":
+        placement_by_sku: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for row in placements:
+            placement_by_sku[_text(row.get("sku_key"))].append(row)
+        final_targets = {row["target_position_id"] for row in placements}
+        reusable_origins = {unit.get("origin_position_id") for unit in units}
+        capacity_candidates: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+        for position in positions.values():
+            cell = cells.get(position.get("cell_key"), {})
+            storage = _text(cell.get("storage_type") or cell.get("row_storage_type") or "normal")
+            zone = normalize_placement_zone(cell.get("weight_zone"))
+            position_id = position.get("position_id")
+            is_vacant = position.get("status") == "free" or position_id in reusable_origins
+            if (position_id not in final_targets and is_vacant and storage != "deep_lane"
+                    and cell.get("capacity_pallets", 1) == 1 and zone in ASSIGNABLE_PLACEMENT_ZONE_IDS
+                    and (not velocity_enabled or position.get("cell_key") in distances)):
+                capacity_candidates[zone].append(position)
+        capacity_rank: dict[str, int] = {}
+        for zone, candidates in capacity_candidates.items():
+            all_zone_positions = [p for p in positions.values()
+                                  if normalize_placement_zone(cells.get(p.get("cell_key"), {}).get("weight_zone")) == zone]
+            capacity_rank.update({p.get("position_id"): index for index, p in enumerate(
+                sorted(all_zone_positions, key=lambda item: _position_key(item, cells)))})
+        claimed: set[str] = set()
+        for sku, sku_rows in sorted(placement_by_sku.items(),
+                                    key=lambda item: (velocities.get(item[0], {}).get("velocity_rank") or 7,
+                                                      item[0])):
+            occupied_ids = sorted(row["target_position_id"] for row in sku_rows)
+            occupied_zones = {row.get("target_zone") for row in sku_rows
+                              if row.get("target_zone") in ASSIGNABLE_PLACEMENT_ZONE_IDS}
+            target_zone = assignments.get(sku) if weight_enabled else (
+                next(iter(occupied_zones)) if len(occupied_zones) == 1 else None)
+            required = max(len(occupied_ids), minimum_positions)
+            needed_reserve = required - len(occupied_ids)
+            reason = None
+            if target_zone is None and needed_reserve:
+                reason = "missing_target_zone" if weight_enabled else "ambiguous_target_zone"
+            candidates = [p for p in capacity_candidates.get(target_zone, [])
+                          if p.get("position_id") not in claimed] if target_zone else []
+            anchor_ranks = [capacity_rank[position_id] for position_id in occupied_ids
+                            if position_id in capacity_rank]
+            def capacity_key(position: Mapping[str, Any]) -> tuple[Any, ...]:
+                rank = capacity_rank.get(position.get("position_id"), 0)
+                compactness = min((abs(rank - anchor) for anchor in anchor_ranks), default=0)
+                if velocity_enabled:
+                    return (distances.get(position.get("cell_key"), float("inf")), compactness,
+                            _position_key(position, cells))
+                return (compactness, _position_key(position, cells))
+            selected = sorted(candidates, key=capacity_key)[:needed_reserve]
+            reserved_ids = sorted(p["position_id"] for p in selected)
+            claimed.update(reserved_ids)
+            shortage = needed_reserve - len(reserved_ids)
+            if shortage and reason is None:
+                reason = "insufficient_eligible_capacity"
+            capacity_allocations.append({
+                "sku_key": sku, "target_zone": target_zone,
+                "minimum_positions": minimum_positions,
+                "stock_positions_required": len(occupied_ids), "positions_required": required,
+                "occupied_target_position_ids": occupied_ids, "reserved_position_ids": reserved_ids,
+                "positions_allocated": len(occupied_ids) + len(reserved_ids),
+                "shortage_positions": shortage, "status": "partial" if shortage else "satisfied",
+                "reason": reason,
+            })
+        plan["sku_capacity_allocations"] = capacity_allocations
+        if any(row["shortage_positions"] for row in capacity_allocations):
+            plan["status"] = "partial"
+        zone_rows = {row["zone"]: row for row in plan["zone_summary"]}
+        for zone, row in zone_rows.items():
+            row["reserved_capacity_positions"] = sum(
+                len(allocation["reserved_position_ids"]) for allocation in capacity_allocations
+                if allocation["target_zone"] == zone)
+            row["capacity_shortage_positions"] = sum(
+                allocation["shortage_positions"] for allocation in capacity_allocations
+                if allocation["target_zone"] == zone)
     valid_assignment_units = [(unit, assignments[unit["sku_key"]]) for unit in units if unit.get("sku_key") in assignments]
     before = sum(normalize_placement_zone(cells.get(unit.get("origin_cell_key"), {}).get("weight_zone")) == zone
                  for unit, zone in valid_assignment_units)
@@ -535,6 +615,13 @@ def build_proposed_placement_plan(
         "same_sku_fragment_reduction": same_before - same_after,
         "adjacency_group_fragment_reduction": group_before - group_after,
         "adjacency_units_moved": sum(bool(row["moved"]) for row in adjacency_rows_for_metrics) if adjacency_enabled else 0,
+        "capacity_skus_total": len(capacity_allocations),
+        "capacity_skus_satisfied": sum(row["status"] == "satisfied" for row in capacity_allocations),
+        "capacity_skus_short": sum(row["status"] == "partial" for row in capacity_allocations),
+        "capacity_positions_required": sum(row["positions_required"] for row in capacity_allocations),
+        "capacity_positions_occupied": sum(row["stock_positions_required"] for row in capacity_allocations),
+        "capacity_positions_reserved": sum(len(row["reserved_position_ids"]) for row in capacity_allocations),
+        "capacity_shortage_positions": sum(row["shortage_positions"] for row in capacity_allocations),
     }
     velocity_rows = [row for row in placements if "velocity_rank" in row]
     ranked_rows = [row for row in velocity_rows if row.get("velocity_rank") is not None]
@@ -605,6 +692,21 @@ def validate_proposed_placement_plan(
         error("duplicate_placement_unit_id")
     if len(targets) != len(set(targets)):
         error("duplicate_target_position_id")
+    reservation_rows = plan.get("sku_capacity_allocations", []) or []
+    reserved_capacity = [position_id for row in reservation_rows
+                         for position_id in row.get("reserved_position_ids", [])]
+    if len(reserved_capacity) != len(set(reserved_capacity)):
+        error("duplicate_reserved_capacity_position")
+    if set(reserved_capacity) & set(targets):
+        error("reserved_capacity_overlaps_stock")
+    for position_id in reserved_capacity:
+        position = positions.get(position_id)
+        cell = cells.get((position or {}).get("cell_key"), {})
+        storage = _text(cell.get("storage_type") or cell.get("row_storage_type") or "normal")
+        if not position:
+            error("invalid_reserved_capacity_position", position_id=position_id)
+        elif position.get("status") == "unknown" or storage == "deep_lane" or cell.get("capacity_pallets", 1) != 1:
+            error("ineligible_reserved_capacity_position", position_id=position_id)
     fixed_positions = {unit.get("origin_position_id") for unit in plan.get("fixed_units", []) or [] if unit.get("origin_position_id")}
     fixed_unit_ids = {unit.get("placement_unit_id") for unit in plan.get("fixed_units", []) or []}
     weight_enabled = bool(rule_validation and rule_validation["valid"]

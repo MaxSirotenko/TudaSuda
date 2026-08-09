@@ -150,6 +150,66 @@ def test_permutations_have_same_plan_and_identity_and_api_has_no_previous_plan()
     assert validate_proposed_placement_plan(first, model, state, rules(True), mapping)["valid"]
 
 
+def test_base_capacity_reserves_empty_positions_without_collapsing_or_creating_stock():
+    model, state = fixture([("P1", "heavy", "A"), ("P2", "heavy", "A")],
+                           free=[("P3", "heavy"), ("P4", "heavy")])
+    before = copy.deepcopy((model, state))
+    configured = rules(base_sku_capacity={"enabled": True,
+        "parameters": {"minimum_positions_per_sku": 3}})
+    plan, diagnostics = build_proposed_placement_plan(model, state, configured, [])
+    allocation = plan["sku_capacity_allocations"][0]
+    assert diagnostics["valid"] and plan["status"] == "ready"
+    assert allocation == {"sku_key": "A", "target_zone": "heavy", "minimum_positions": 3,
+        "stock_positions_required": 2, "positions_required": 3,
+        "occupied_target_position_ids": ["P1", "P2"], "reserved_position_ids": ["P3"],
+        "positions_allocated": 3, "shortage_positions": 0, "status": "satisfied", "reason": None}
+    assert all(not row["moved"] for row in plan["placements"])
+    assert (model, state) == before
+
+
+def test_capacity_shortage_is_partial_and_reservations_are_exclusive_and_known():
+    model, state = fixture([("P1", "heavy", "A"), ("P2", "heavy", "B")],
+                           free=[("P3", "heavy")], unknown=[("P4", "heavy")])
+    configured = rules(base_sku_capacity={"enabled": True,
+        "parameters": {"minimum_positions_per_sku": 3}})
+    plan, diagnostics = build_proposed_placement_plan(model, state, configured, [])
+    reserved = [position for row in plan["sku_capacity_allocations"] for position in row["reserved_position_ids"]]
+    assert diagnostics["valid"] and plan["status"] == "partial"
+    assert reserved == ["P3"] and len(reserved) == len(set(reserved)) and "P4" not in reserved
+    assert plan["summary"]["capacity_positions_required"] == 6
+    assert plan["summary"]["capacity_shortage_positions"] == 3
+
+
+def test_weight_capacity_uses_explicit_zone_and_deep_lane_is_never_reserved():
+    model, state = fixture([("P1", "light", "A")], free=[("H1", "heavy")],
+                           deep=[("D1", "heavy", None)])
+    configured = rules(True, base_sku_capacity={"enabled": True,
+        "parameters": {"minimum_positions_per_sku": 3}})
+    plan, _ = build_proposed_placement_plan(model, state, configured, zones(("A", "heavy")))
+    allocation = plan["sku_capacity_allocations"][0]
+    assert allocation["target_zone"] == "heavy"
+    assert allocation["reserved_position_ids"] == []
+    assert allocation["shortage_positions"] == 2 and plan["status"] == "partial"
+
+
+def test_capacity_permutation_identity_and_actual_placement_priority():
+    model, state = fixture([("L1", "light", "A"), ("H1", "heavy", "B")],
+                           free=[("H2", "heavy"), ("H3", "heavy")])
+    configured = rules(True, adjacency=True, base_sku_capacity={"enabled": True,
+        "parameters": {"minimum_positions_per_sku": 2}})
+    mapping = zones(("A", "heavy"), ("B", "heavy"))
+    first, _ = build_proposed_placement_plan(model, state, configured, mapping)
+    shuffled_model, shuffled_state = copy.deepcopy(model), copy.deepcopy(state)
+    shuffled_model["cells"].reverse()
+    for key in ("physical_positions", "cell_occupancy", "stock_lots"):
+        shuffled_state[key].reverse()
+    second, _ = build_proposed_placement_plan(shuffled_model, shuffled_state, configured, list(reversed(mapping)))
+    assert first == second
+    actual_targets = {row["target_position_id"] for row in first["placements"]}
+    reserved = {position for row in first["sku_capacity_allocations"] for position in row["reserved_position_ids"]}
+    assert len(actual_targets) == 2 and not actual_targets & reserved
+
+
 def velocity_fixture():
     model = {
         "model_id": "m", "source_file_hash": "source",
@@ -178,6 +238,24 @@ def velocity_fixture():
     velocity = [{"sku_key": "HOT", "velocity_rank": 1, "velocity_class": "confirmed_core"},
                 {"sku_key": "COLD", "velocity_rank": 6, "velocity_class": "tail"}]
     return model, state, gate, velocity
+
+
+def test_velocity_and_full_rule_set_remain_supported_with_base_capacity():
+    model, state, gate, velocity = velocity_fixture()
+    base = {"enabled": True, "parameters": {"minimum_positions_per_sku": 1}}
+    velocity_plan, velocity_diagnostics = build_proposed_placement_plan(
+        model, state, rules(velocity=True, base_sku_capacity=base), [],
+        sku_velocity_rows=velocity, gate_state=gate)
+    full_plan, full_diagnostics = build_proposed_placement_plan(
+        model, state, rules(True, velocity=True, adjacency=True, base_sku_capacity=base),
+        zones(("HOT", "heavy"), ("COLD", "heavy")), sku_velocity_rows=velocity,
+        adjacency_profile={"adjacency_profile_id": "profile", "rows": [
+            {"sku_key": "HOT", "adjacency_group": "group"},
+            {"sku_key": "COLD", "adjacency_group": "group"}]}, gate_state=gate)
+    for plan, diagnostics in ((velocity_plan, velocity_diagnostics), (full_plan, full_diagnostics)):
+        assert diagnostics["valid"] and plan["status"] == "ready"
+        assert plan["summary"]["capacity_skus_satisfied"] == 2
+        assert next(row for row in plan["placements"] if row["sku_key"] == "HOT")["target_position_id"] == "P_NEAR"
 
 
 def test_velocity_only_uses_graph_distance_and_stays_inside_zone_deterministically():
