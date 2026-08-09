@@ -24,8 +24,8 @@ from warehouse_placement_zones import (
 )
 from warehouse_physical_graph import build_physical_warehouse_graph, find_shortest_path
 
-PROPOSED_PLACEMENT_PLAN_VERSION = 4
-_SUPPORTED_RULES = frozenset({"weight_zones", "velocity", "adjacency", "base_sku_capacity"})
+PROPOSED_PLACEMENT_PLAN_VERSION = 5
+_SUPPORTED_RULES = frozenset({"weight_zones", "velocity", "adjacency", "base_sku_capacity", "picking_storage"})
 
 
 def _canonical_json(value: Any) -> str:
@@ -150,7 +150,8 @@ def compute_proposed_placement_plan_id(plan: Mapping[str, Any]) -> str:
 
 
 def _placement_row(unit: Mapping[str, Any], target: Mapping[str, Any], cells: Mapping[str, Mapping[str, Any]],
-                   velocity: Mapping[str, Any] | None = None, distances: Mapping[str, float] | None = None) -> dict[str, Any]:
+                   velocity: Mapping[str, Any] | None = None, distances: Mapping[str, float] | None = None,
+                   role: str | None = None) -> dict[str, Any]:
     origin_cell = unit.get("origin_cell_key")
     target_cell = target.get("cell_key")
     row = {
@@ -169,6 +170,8 @@ def _placement_row(unit: Mapping[str, Any], target: Mapping[str, Any], cells: Ma
     }
     if unit.get("qty_boxes") is not None:
         row["qty_boxes"] = unit["qty_boxes"]
+    if role is not None:
+        row["stock_role"] = role
     if velocity is not None:
         row.update({"velocity_rank": velocity.get("velocity_rank"),
                     "velocity_class": velocity.get("velocity_class"),
@@ -313,15 +316,16 @@ def build_proposed_placement_plan(
     velocity_enabled = "velocity" in enabled
     adjacency_enabled = "adjacency" in enabled
     capacity_enabled = "base_sku_capacity" in enabled
+    picking_enabled = "picking_storage" in enabled
     minimum_positions = next(
         (rule["parameters"]["minimum_positions_per_sku"] for rule in placement_rule_set["rules"]
          if rule["rule_id"] == "base_sku_capacity"), 1)
     distances: dict[str, float] = {}
-    if velocity_enabled:
+    if velocity_enabled or picking_enabled:
         graph, graph_diagnostics = build_physical_warehouse_graph(model, gate_state)
         gates = graph.get("gate_links", [])
         if len(gates) != 1 or graph_diagnostics.get("configuration_errors"):
-            error = {"code": "velocity_gate_required"}
+            error = {"code": "picking_storage_gate_required" if picking_enabled else "velocity_gate_required"}
             plan["blocked_reasons"] = [error]
             plan["proposed_placement_plan_id"] = compute_proposed_placement_plan_id(plan)
             return plan, _diagnostics([error])
@@ -336,7 +340,16 @@ def build_proposed_placement_plan(
     kept: list[tuple[dict[str, Any], str]] = []
     identity_units: list[dict[str, Any]] = []
 
-    if not weight_enabled and not velocity_enabled and not adjacency_enabled:
+    ambiguous_picking_skus: set[str] = set()
+    if picking_enabled and not weight_enabled:
+        zones_by_sku: dict[str, set[str]] = defaultdict(set)
+        for unit in units:
+            zone = normalize_placement_zone(cells.get(unit.get("origin_cell_key"), {}).get("weight_zone"))
+            if zone in ASSIGNABLE_PLACEMENT_ZONE_IDS:
+                zones_by_sku[_text(unit.get("sku_key"))].add(zone)
+        ambiguous_picking_skus = {sku for sku, zones in zones_by_sku.items() if len(zones) != 1}
+
+    if not weight_enabled and not velocity_enabled and not adjacency_enabled and not picking_enabled:
         identity_units = units
     else:
         for unit in units:
@@ -345,6 +358,8 @@ def build_proposed_placement_plan(
             occupancy = occupancy_by_cell.get(unit.get("origin_cell_key"), {})
             storage = _text(cell.get("storage_type") or cell.get("row_storage_type") or "normal")
             reason = None
+            if picking_enabled and _text(unit.get("sku_key")) in ambiguous_picking_skus:
+                reason = "ambiguous_picking_weight_zone"
             if storage == "deep_lane" or cell.get("capacity_pallets", 1) != 1:
                 reason = ("deep_lane_adjacency_optimization_not_implemented" if adjacency_enabled
                           else "deep_lane_optimization_not_enabled")
@@ -354,21 +369,23 @@ def build_proposed_placement_plan(
                 reason = "occupancy_conflict"
             elif not cell or not position or position.get("cell_key") != unit.get("origin_cell_key"):
                 reason = "invalid_physical_reference"
-            elif velocity_enabled and unit.get("origin_cell_key") not in distances:
-                reason = "velocity_unreachable_position"
+            elif (velocity_enabled or picking_enabled) and unit.get("origin_cell_key") not in distances:
+                reason = "picking_unreachable_position" if picking_enabled else "velocity_unreachable_position"
             elif weight_enabled and unit.get("sku_key") not in assignments:
                 reason = "missing_sku_zone_assignment"
             if reason:
                 record = dict(unit) | {"reason": reason}
+                if picking_enabled:
+                    record["stock_role"] = "storage"
                 fixed.append(record)
-                if reason == "missing_sku_zone_assignment":
+                if reason in {"missing_sku_zone_assignment", "ambiguous_picking_weight_zone"}:
                     unresolved.append({"placement_unit_id": unit["placement_unit_id"], "sku_key": unit.get("sku_key"),
                                        "origin_position_id": unit.get("origin_position_id"),
                                        "origin_cell_key": unit.get("origin_cell_key"), "reason": reason})
                 identity_units.append(unit)
                 continue
             target_zone = assignments[unit["sku_key"]] if weight_enabled else normalize_placement_zone(cell.get("weight_zone"))
-            if not velocity_enabled and not adjacency_enabled and normalize_placement_zone(cell.get("weight_zone")) == target_zone:
+            if not velocity_enabled and not adjacency_enabled and not picking_enabled and normalize_placement_zone(cell.get("weight_zone")) == target_zone:
                 kept.append((unit, target_zone))
             else:
                 applicable.append((unit, target_zone))
@@ -389,14 +406,14 @@ def build_proposed_placement_plan(
         zone = normalize_placement_zone(cell.get("weight_zone"))
         if storage == "deep_lane" or cell.get("capacity_pallets", 1) != 1 or zone not in ASSIGNABLE_PLACEMENT_ZONE_IDS:
             continue
-        if velocity_enabled and position.get("cell_key") not in distances:
+        if (velocity_enabled or picking_enabled) and position.get("cell_key") not in distances:
             continue
         normal_position_totals[zone] += 1
         if position.get("status") in {"free", "occupied"} and position.get("position_id") not in reserved:
             available[zone].append(position)
     for zone in available:
         available[zone].sort(key=lambda p: ((distances.get(p.get("cell_key"), float("inf")), _position_key(p, cells))
-                                            if velocity_enabled else _position_key(p, cells)))
+                                            if (velocity_enabled or picking_enabled) else _position_key(p, cells)))
 
     needed = Counter(zone for _, zone in applicable)
     shortages = {zone: max(0, needed[zone] - len(available[zone])) for zone in ASSIGNABLE_PLACEMENT_ZONE_IDS}
@@ -421,7 +438,8 @@ def build_proposed_placement_plan(
                                    for zone in DEFAULT_PLACEMENT_ZONE_ORDER if shortages[zone]]
     else:
         for unit in identity_units:
-            placements.append(_placement_row(unit, positions[unit["origin_position_id"]], cells))
+            placements.append(_placement_row(unit, positions[unit["origin_position_id"]], cells,
+                                              role="storage" if picking_enabled else None))
         for unit, _ in kept:
             placements.append(_placement_row(unit, positions[unit["origin_position_id"]], cells))
         zone_rank = {zone: index for index, zone in enumerate(DEFAULT_PLACEMENT_ZONE_ORDER)}
@@ -450,23 +468,32 @@ def build_proposed_placement_plan(
                          adjacency_key(item),
                          origin_order.get(item[0]["placement_unit_id"], ()),
                          _text(item[0].get("placement_unit_id"))))
-        ranked = [(unit, zone) for unit, zone in ordered if velocities.get(_text(unit.get("sku_key")), {}).get("velocity_rank")]
-        unranked = [(unit, zone) for unit, zone in ordered if not velocities.get(_text(unit.get("sku_key")), {}).get("velocity_rank")]
         remaining = {zone: list(values) for zone, values in available.items()}
-        for unit, zone in ranked:
-            target = remaining[zone].pop(0)
-            row = _placement_row(unit, target, cells, velocities.get(_text(unit.get("sku_key"))), distances)
-            if adjacency_enabled:
-                row["adjacency_group"] = adjacency.get(_text(unit.get("sku_key")), "")
-            placements.append(row)
-        for unit, zone in unranked:
-            origin = None if adjacency_enabled else next((p for p in remaining[zone] if p.get("position_id") == unit.get("origin_position_id")), None)
+        picking_unit_ids: set[str] = set()
+        allocation_order = ordered
+        if picking_enabled:
+            first_by_sku: dict[str, tuple[dict[str, Any], str]] = {}
+            for item in ordered:
+                first_by_sku.setdefault(_text(item[0].get("sku_key")), item)
+            picking_items = sorted(first_by_sku.values(), key=lambda item: (
+                velocities.get(_text(item[0].get("sku_key")), {}).get("velocity_rank") or 7,
+                _text(item[0].get("sku_key")), _text(item[0].get("placement_unit_id"))))
+            picking_unit_ids = {item[0]["placement_unit_id"] for item in picking_items}
+            allocation_order = picking_items + [item for item in ordered if item[0]["placement_unit_id"] not in picking_unit_ids]
+        for unit, zone in allocation_order:
+            is_picking = unit["placement_unit_id"] in picking_unit_ids
+            origin = None
+            if (not is_picking and not adjacency_enabled
+                    and not velocities.get(_text(unit.get("sku_key")), {}).get("velocity_rank")):
+                origin = next((p for p in remaining[zone] if p.get("position_id") == unit.get("origin_position_id")), None)
             target = origin or remaining[zone][0]
             remaining[zone].remove(target)
-            velocity = velocities.get(_text(unit.get("sku_key")), {"velocity_rank": None, "velocity_class": "no_history"})
-            row = _placement_row(unit, target, cells, velocity if velocity_enabled else None, distances)
+            sku = _text(unit.get("sku_key"))
+            velocity = velocities.get(sku, {"velocity_rank": None, "velocity_class": "no_history"})
+            row = _placement_row(unit, target, cells, velocity if velocity_enabled else None, distances,
+                                 "picking" if is_picking else ("storage" if picking_enabled else None))
             if adjacency_enabled:
-                row["adjacency_group"] = adjacency.get(_text(unit.get("sku_key")), "")
+                row["adjacency_group"] = adjacency.get(sku, "")
             placements.append(row)
         plan["status"] = "partial" if unresolved or fixed else "ready"
 
@@ -653,6 +680,19 @@ def build_proposed_placement_plan(
         "capacity_positions_reserved": sum(len(row["reserved_position_ids"]) for row in capacity_allocations),
         "capacity_shortage_positions": sum(row["shortage_positions"] for row in capacity_allocations),
     }
+    picking_rows = [row for row in placements if row.get("stock_role") == "picking"]
+    storage_rows = [row for row in placements if row.get("stock_role") == "storage"]
+    represented_skus = ({_text(unit.get("sku_key")) for unit in units if _text(unit.get("sku_key"))}
+                        | {_text(unit.get("sku_key")) for unit in unresolved if _text(unit.get("sku_key"))})
+    picking_skus = {_text(row.get("sku_key")) for row in picking_rows}
+    plan["summary"].update({
+        "picking_storage_enabled": picking_enabled,
+        "picking_storage_participating_skus": len(represented_skus) if picking_enabled else 0,
+        "skus_with_picking_position": len(picking_skus),
+        "picking_positions": len(picking_rows),
+        "storage_positions": len(storage_rows),
+        "skus_without_supported_picking_position": len(represented_skus - picking_skus) if picking_enabled else 0,
+    })
     velocity_rows = [row for row in placements if "velocity_rank" in row]
     ranked_rows = [row for row in velocity_rows if row.get("velocity_rank") is not None]
     def average(rows: list[dict[str, Any]], key: str) -> float | None:
@@ -744,6 +784,9 @@ def validate_proposed_placement_plan(
     fixed_unit_ids = {unit.get("placement_unit_id") for unit in plan.get("fixed_units", []) or []}
     weight_enabled = bool(rule_validation and rule_validation["valid"]
                           and "weight_zones" in get_enabled_rule_ids(placement_rule_set))
+    picking_enabled = bool(rule_validation and rule_validation["valid"]
+                           and "picking_storage" in get_enabled_rule_ids(placement_rule_set))
+    picking_counts: Counter[str] = Counter()
     for row in placements:
         origin, target = positions.get(row.get("origin_position_id")), positions.get(row.get("target_position_id"))
         if not origin:
@@ -771,4 +814,15 @@ def validate_proposed_placement_plan(
         if (weight_enabled and mapped and row.get("placement_unit_id") not in fixed_unit_ids
                 and row.get("target_zone") != mapped):
             error("weight_zone_target_mismatch", placement_unit_id=row.get("placement_unit_id"))
+        if picking_enabled:
+            if row.get("stock_role") not in {"picking", "storage"}:
+                error("missing_stock_role", placement_unit_id=row.get("placement_unit_id"))
+            if row.get("stock_role") == "picking":
+                picking_counts[_text(row.get("sku_key"))] += 1
+                target_storage = _text(cell.get("storage_type") or cell.get("row_storage_type") or "normal")
+                if target_storage == "deep_lane" or cell.get("capacity_pallets", 1) != 1:
+                    error("ineligible_picking_position", placement_unit_id=row.get("placement_unit_id"))
+    for sku, count in sorted(picking_counts.items()):
+        if count != 1:
+            error("invalid_picking_position_count", sku_key=sku, count=count)
     return _diagnostics(errors)

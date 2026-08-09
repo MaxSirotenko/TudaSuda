@@ -334,6 +334,39 @@ def test_velocity_requires_gate_and_profile_and_does_not_invent_missing_rank():
     assert cold["velocity_rank"] is None
 
 
+def test_picking_storage_assigns_exactly_one_nearest_picking_position_per_sku():
+    model, state, gate, _ = velocity_fixture()
+    for lot in state["stock_lots"]:
+        lot["sku_key"] = "A"
+    plan, diagnostics = build_proposed_placement_plan(
+        model, state, rules(picking_storage=True), [], gate_state=gate)
+    roles = [row["stock_role"] for row in plan["placements"]]
+    picking = next(row for row in plan["placements"] if row["stock_role"] == "picking")
+    assert diagnostics["valid"] and plan["status"] == "ready"
+    assert roles.count("picking") == 1 and roles.count("storage") == 1
+    assert picking["target_position_id"] == "P_NEAR"
+    assert plan["summary"]["picking_positions"] == 1
+    assert plan["summary"]["storage_positions"] == 1
+
+
+def test_picking_storage_requires_mapped_gate_and_is_permutation_stable():
+    model, state, gate, _ = velocity_fixture()
+    blocked, diagnostics = build_proposed_placement_plan(
+        model, state, rules(picking_storage=True), [])
+    assert not diagnostics["valid"]
+    assert blocked["blocked_reasons"] == [{"code": "picking_storage_gate_required"}]
+
+    first, _ = build_proposed_placement_plan(
+        model, state, rules(picking_storage=True), [], gate_state=gate)
+    shuffled_model, shuffled_state = copy.deepcopy(model), copy.deepcopy(state)
+    shuffled_model["cells"].reverse()
+    for key in ("physical_positions", "stock_lots", "pallet_units"):
+        shuffled_state[key].reverse()
+    second, _ = build_proposed_placement_plan(
+        shuffled_model, shuffled_state, rules(picking_storage=True), [], gate_state=gate)
+    assert second == first
+
+
 def test_adjacency_compacts_same_sku_without_explicit_profile():
     model, state = fixture([("P1", "heavy", "A"), ("P2", "heavy", "B"), ("P3", "heavy", "A"), ("P4", "heavy", "C"), ("P5", "heavy", "B"), ("P6", "heavy", "A")])
     plan, diagnostics = build_proposed_placement_plan(model, state, rules(adjacency=True), [])

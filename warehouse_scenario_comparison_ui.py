@@ -77,16 +77,19 @@ def build_comparison_signature(
 def build_weight_zone_rule_config(enabled: bool) -> dict[str, dict[str, Any]]:
     """Backward-compatible adapter for callers that expose only weight zones."""
     return build_scenario_rule_config(weight_zones_enabled=enabled, velocity_enabled=False,
-                                      adjacency_enabled=False, base_sku_capacity_enabled=False)
+                                      adjacency_enabled=False, base_sku_capacity_enabled=False,
+                                      picking_storage_enabled=False)
 
 
 def build_scenario_rule_config(*, weight_zones_enabled: bool, velocity_enabled: bool,
                                adjacency_enabled: bool = False,
-                               base_sku_capacity_enabled: bool = False) -> dict[str, dict[str, Any]]:
+                               base_sku_capacity_enabled: bool = False,
+                               picking_storage_enabled: bool = False) -> dict[str, dict[str, Any]]:
     """Translate the supported UI toggles into the backend rule contract."""
     return {"weight_zones": {"enabled": bool(weight_zones_enabled)},
             "velocity": {"enabled": bool(velocity_enabled)},
             "adjacency": {"enabled": bool(adjacency_enabled)},
+            "picking_storage": {"enabled": bool(picking_storage_enabled)},
             "base_sku_capacity": {"enabled": bool(base_sku_capacity_enabled),
                                   "parameters": {"minimum_positions_per_sku": 1}}}
 
@@ -279,10 +282,12 @@ def render_scenario_comparison(
     weight_zones = st.checkbox("Весовые зоны", key=f"{SESSION_PREFIX}_weight_zones")
     velocity_enabled = st.checkbox("Оборачиваемость / частота отбора", key=f"{SESSION_PREFIX}_velocity")
     adjacency_enabled = st.checkbox("Товарное соседство", key=f"{SESSION_PREFIX}_adjacency")
+    picking_storage_enabled = st.checkbox("Комплектация / хранение", key=f"{SESSION_PREFIX}_picking_storage")
     base_capacity_enabled = st.checkbox("Базовое место для SKU", key=f"{SESSION_PREFIX}_base_capacity")
     rule_config = build_scenario_rule_config(weight_zones_enabled=weight_zones, velocity_enabled=velocity_enabled,
                                              adjacency_enabled=adjacency_enabled,
-                                             base_sku_capacity_enabled=base_capacity_enabled)
+                                             base_sku_capacity_enabled=base_capacity_enabled,
+                                             picking_storage_enabled=picking_storage_enabled)
     adjacency_profile, adjacency_diagnostics = build_sku_adjacency_profile(adjacency_rows)
     if adjacency_enabled and not adjacency_rows:
         st.caption("Связанные товарные группы не загружены — используется только компактное размещение одинаковых SKU.")
@@ -309,7 +314,7 @@ def render_scenario_comparison(
         sku_zone_rows=sku_zone_rows, rule_config=rule_config,
         velocity_profile_id=velocity_profile.get("velocity_profile_id") if velocity_profile else None,
         adjacency_profile_id=adjacency_profile.get("adjacency_profile_id") if adjacency_enabled else None,
-        gate_identity=gate_state if velocity_enabled else None,
+        gate_identity=gate_state if velocity_enabled or picking_storage_enabled else None,
     )
     if st.button("Пересчитать PROPOSED", type="primary", key=f"{SESSION_PREFIX}_calculate"):
         scenario, diagnostics = build_proposed_scenario(
@@ -361,7 +366,7 @@ def render_scenario_comparison(
             components.html(proposed_html, height=MAP_HEIGHT, scrolling=True)
 
     if scenario and scenario.get("status") in {"ready", "partial"}:
-        if not weight_zones and not velocity_enabled and not adjacency_enabled and not base_capacity_enabled:
+        if not weight_zones and not velocity_enabled and not adjacency_enabled and not base_capacity_enabled and not picking_storage_enabled:
             st.info("Правила оптимизации выключены — PROPOSED совпадает с CURRENT.")
         _show_metrics(summarize_scenario_ui_metrics(scenario, baseline, sku_zone_rows))
         if adjacency_enabled:
@@ -378,6 +383,12 @@ def render_scenario_comparison(
                        f"{summary.get('capacity_skus_total', 0)} · Выделено дополнительных мест: "
                        f"{summary.get('capacity_positions_reserved', 0)} · Не хватило: "
                        f"{summary.get('capacity_shortage_positions', 0)}")
+        if picking_storage_enabled:
+            summary = scenario.get("summary", {})
+            st.caption(f"Комплектация: {summary.get('picking_positions', 0)} · "
+                       f"Хранение: {summary.get('storage_positions', 0)} · "
+                       f"SKU без поддерживаемой комплектации: "
+                       f"{summary.get('skus_without_supported_picking_position', 0)}")
         if scenario.get("status") == "partial":
             summary = scenario.get("summary", {})
             st.warning(f"Неразрешено: {summary.get('unresolved_units', 0)} · "
