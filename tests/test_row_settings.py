@@ -14,6 +14,7 @@ from warehouse_row_settings import (
     update_row_settings_state,
 )
 from warehouse_geometry_model import GeometrySettings, build_geometry_html, build_geometry_model
+from warehouse_cross_aisles import apply_cross_aisles_transaction
 
 
 def _cell(row, number, *, direction="bottom_to_top", capacity=1, storage="normal", x_min=0.0, x_max=0.8):
@@ -412,6 +413,29 @@ def test_offsets_use_row_cell_length_and_refresh_navigation_endpoints():
     assert nodes["row:152:bottom"]["y"] == 0
     assert nodes["row:152:top"]["y"] == pytest.approx(7.2)
     assert updated["navigation_edges"][0]["distance_m"] == pytest.approx(7.2)
+
+
+def test_offset_only_and_full_sync_preserve_top_to_bottom_cross_aisle_direction():
+    source = _model()
+    direction_edit = _edited(source)
+    next(row for row in direction_edit if row["row_number"] == "152")["cell_direction"] = "top_to_bottom"
+    directed, _ = apply_row_settings_transaction(source, direction_edit)
+    crossed, errors = apply_cross_aisles_transaction(directed, [{"row_number": "152", "after_cell_number": "1", "width_cells": 1}])
+    assert not errors
+
+    offset_edit = _edited(crossed)
+    next(row for row in offset_edit if row["row_number"] == "152")["top_offset_cells"] = 1
+    offset, messages = apply_row_settings_transaction(crossed, offset_edit)
+    assert not any(message.startswith("Ошибка:") for message in messages)
+    assert _row_cell_centers(offset, 152)["1"] > _row_cell_centers(offset, 152)["3"]
+    assert sorted(cell["y_min"] for cell in offset["cells"] if cell["row_number"] == "152") == [1, 2, 4]
+
+    full_edit = _edited(offset)
+    next(row for row in full_edit if row["row_number"] == "152")["comment"] = "full sync"
+    synced, messages = apply_row_settings_transaction(offset, full_edit)
+    assert not any(message.startswith("Ошибка:") for message in messages)
+    assert _row_cell_centers(synced, 152)["1"] > _row_cell_centers(synced, 152)["3"]
+    assert sorted(cell["y_min"] for cell in synced["cells"] if cell["row_number"] == "152") == [1, 2, 4]
 
 
 def test_row_tooltip_contains_offset_cells_and_meters():
