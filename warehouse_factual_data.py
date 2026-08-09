@@ -1,0 +1,389 @@
+"""Versioned factual source registry for the authoritative Data workspace.
+
+This module preserves source rows and their provenance.  It intentionally does
+not convert source pallet references, inventory quantities, or historical pick
+orders into simulator authority.  The existing one-day V1 adapters remain the
+only benchmark input boundary.
+"""
+from __future__ import annotations
+
+import gzip
+import hashlib
+import json
+import math
+import os
+import tempfile
+from collections import Counter, defaultdict
+from collections.abc import Iterable, Mapping
+from datetime import date, datetime, timedelta, timezone
+from io import BytesIO
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+
+from warehouse_business_identity import build_canonical_sku_identity, find_canonical_identity_collisions
+
+PARSER_VERSION = "factual-july-v1"
+DATA_ROOT = Path("data/last_import/factual")
+REGISTRY_PATH = DATA_ROOT / "registry.json"
+UNKNOWN_SOURCE = "unknown"
+SOURCE_LABELS = {
+    "historical_placement": "Историческое размещение",
+    "inventory": "Инвентаризации",
+    "receipts": "Приходные ордера",
+    "outbound": "Расходные ордера",
+    "vgh": "ВГХ / паллетизация",
+    UNKNOWN_SOURCE: "Неизвестный тип файла",
+}
+
+# Contracts contain only fields confirmed in the task or existing importers.
+CONTRACTS: dict[str, dict[str, tuple[str, ...]]] = {
+    "historical_placement": {
+        "snapshot_at": ("ДатаСреза",), "source_pallet_ref": ("Паллета",),
+        "nomenclature": ("Номенклатура",), "characteristic": ("Характеристика",),
+        "source_stock_quantity": ("КоличествоОстатокТовара",), "cell": ("Ячейка",),
+        "cell_picking_order": ("ПорядокСборки",),
+        "source_position_balance": ("КоличествоОстатокПоложения",),
+    },
+    "inventory": {
+        "inventory_ref": ("СсылкаИнвентаризации", "Инвентаризация"),
+        "inventory_number": ("НомерИнвентаризации", "Номер"),
+        "occurred_at": ("ДатаИнвентаризации", "Дата"), "line_number": ("НомерСтроки",),
+        "warehouse": ("Склад",), "nomenclature": ("Номенклатура",),
+        "characteristic": ("Характеристика",), "actual_quantity": ("КоличествоФакт",),
+        "accounting_quantity": ("КоличествоУчет",),
+    },
+    "receipts": {
+        "document_ref": ("СсылкаПриходногоОрдера",), "document_number": ("НомерПриходногоОрдера",),
+        "occurred_at": ("ДатаПриходногоОрдера",), "warehouse": ("Склад",),
+        "line_number": ("НомерСтроки",), "nomenclature": ("Номенклатура",),
+        "characteristic": ("Характеристика",), "box_quantity": ("КоличествоКоробок",),
+        "reported_pallets": ("КоличествоПаллет",),
+        "terminal_completed": ("ПриемкаТерминаломЗакончена",),
+        "expected_receipt": ("ОжидаемыйПриход",),
+    },
+    "outbound": {
+        "document_ref": ("СсылкаРасходногоОрдера", "РасходныйОрдер"),
+        "document_number": ("НомерРасходногоОрдера",),
+        "occurred_at": ("ДатаРасходногоОрдера", "ДатаСоздания"), "warehouse": ("Склад",),
+        "line_number": ("НомерСтроки",), "nomenclature": ("Номенклатура",),
+        "characteristic": ("Характеристика",),
+        "quantity": ("РасчетноеКоличествоКоробов", "КоличествоКоробок"),
+        "source_pick_order": ("ПорядокСборки",),
+    },
+    "vgh": {
+        "nomenclature": ("Номенклатура",), "characteristic": ("Характеристика",),
+        "weight": ("Вес",), "length": ("Длина",), "width": ("Ширина",), "height": ("Высота",),
+        "boxes_per_layer": ("КоличествоКоробовВОдномСлоеНаПаллете",),
+        "layers_per_pallet": ("КоличествоСлоевНаПаллете",),
+        "quantity_per_box": ("КоличествоВКоробке",),
+    },
+}
+REQUIRED = {
+    "historical_placement": {"snapshot_at", "source_pallet_ref", "nomenclature", "characteristic", "cell", "cell_picking_order"},
+    "inventory": {"occurred_at", "warehouse", "nomenclature", "characteristic", "actual_quantity", "accounting_quantity"},
+    "receipts": {"document_number", "occurred_at", "warehouse", "line_number", "nomenclature", "characteristic", "box_quantity"},
+    "outbound": {"document_number", "occurred_at", "warehouse", "nomenclature", "characteristic", "quantity"},
+    "vgh": {"nomenclature", "characteristic", "boxes_per_layer", "layers_per_pallet"},
+}
+
+
+def _norm(value: Any) -> str:
+    return "" if value is None else "".join(str(value).split()).casefold().replace("ё", "е")
+
+
+def _json_value(value: Any) -> Any:
+    if value is None or (not isinstance(value, (list, dict, str)) and pd.isna(value)):
+        return None
+    if isinstance(value, (pd.Timestamp, datetime)):
+        return value.isoformat()
+    if hasattr(value, "item"):
+        value = value.item()
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value if isinstance(value, (str, int, float, bool)) else str(value)
+
+
+def _number(value: Any) -> float | int | None:
+    value = _json_value(value)
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(str(value).replace("\u00a0", "").replace(" ", "").replace(",", "."))
+    except ValueError:
+        return None
+    if not math.isfinite(number):
+        return None
+    return int(number) if number.is_integer() else number
+
+
+def _timestamp(value: Any) -> str | None:
+    if _json_value(value) in (None, ""):
+        return None
+    try:
+        return pd.Timestamp(value).isoformat()
+    except (TypeError, ValueError):
+        return None
+
+
+def content_hash(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def dataset_identity(data_hash: str, source_type: str, sheet: str, parser_version: str = PARSER_VERSION) -> str:
+    payload = "\x1f".join((data_hash, source_type, sheet, parser_version))
+    return "dataset:" + hashlib.sha256(payload.encode()).hexdigest()
+
+
+def detect_source_type(columns: Iterable[Any]) -> dict[str, Any]:
+    """Detect by exact observed columns; filename is deliberately not authority."""
+    normalized = {_norm(column): str(column) for column in columns}
+    matches: dict[str, dict[str, str]] = {}
+    for source_type, fields in CONTRACTS.items():
+        mapping = {}
+        for field, aliases in fields.items():
+            found = next((normalized[_norm(alias)] for alias in aliases if _norm(alias) in normalized), None)
+            if found:
+                mapping[field] = found
+        if REQUIRED[source_type].issubset(mapping):
+            matches[source_type] = mapping
+    status = "detected" if len(matches) == 1 else "ambiguous" if len(matches) > 1 else "unknown"
+    source_type = next(iter(matches)) if len(matches) == 1 else UNKNOWN_SOURCE
+    return {"source_type": source_type, "status": status, "detected_columns": list(map(str, columns)),
+            "matches": sorted(matches), "mapping": matches.get(source_type, {})}
+
+
+def read_excel_source(data: bytes, sheet: str | None = None) -> tuple[str, pd.DataFrame]:
+    with pd.ExcelFile(BytesIO(data)) as workbook:
+        selected = sheet or workbook.sheet_names[0]
+        if selected not in workbook.sheet_names:
+            raise ValueError("sheet_not_found")
+        table = pd.read_excel(workbook, sheet_name=selected)
+    table.columns = [str(column).strip() for column in table.columns]
+    return selected, table.dropna(how="all")
+
+
+def _canonical_record(raw: Mapping[str, Any], mapping: Mapping[str, str], provenance: Mapping[str, Any]) -> dict[str, Any]:
+    def get(field: str) -> Any:
+        return raw.get(mapping[field]) if field in mapping else None
+    identity = build_canonical_sku_identity({"nomenclature": get("nomenclature"), "characteristic": get("characteristic")})
+    record = {**provenance, "sku_key": identity["sku_key"], "nomenclature": identity["nomenclature"],
+              "characteristic": identity["characteristic"], "identity_diagnostics": identity["diagnostics"]}
+    for field in mapping:
+        if field in {"nomenclature", "characteristic"}:
+            continue
+        value = get(field)
+        if field in {"snapshot_at", "occurred_at"}:
+            record[field] = _timestamp(value)
+        elif field in {"source_stock_quantity", "source_position_balance", "cell_picking_order", "actual_quantity",
+                       "accounting_quantity", "box_quantity", "reported_pallets", "quantity", "source_pick_order",
+                       "weight", "length", "width", "height", "boxes_per_layer", "layers_per_pallet", "quantity_per_box"}:
+            record[field] = _number(value)
+            record[field + "_raw"] = _json_value(value)
+        else:
+            record[field] = _json_value(value)
+    if provenance["source_type"] == "vgh":
+        a, b = record.get("boxes_per_layer"), record.get("layers_per_pallet")
+        record["source_boxes_per_pallet"] = a * b if isinstance(a, (int, float)) and isinstance(b, (int, float)) else None
+        record["palletization_authority"] = "source_layer_norm" if record["source_boxes_per_pallet"] else "unresolved"
+    return record
+
+
+def normalize_table(table: pd.DataFrame, *, dataset_id: str, filename: str, data_hash: str,
+                    source_type: str, sheet: str, imported_at: str, mapping: Mapping[str, str] | None = None
+                    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    mapping = dict(mapping or detect_source_type(table.columns)["mapping"])
+    raw_records, canonical = [], []
+    for ordinal, (source_index, series) in enumerate(table.iterrows(), 2):
+        provenance = {"dataset_id": dataset_id, "source_file_name": filename, "content_hash": data_hash,
+                      "source_type": source_type, "parser_version": PARSER_VERSION, "sheet": sheet,
+                      "source_row": ordinal, "source_index": _json_value(source_index), "imported_at": imported_at}
+        raw = {str(key): _json_value(value) for key, value in series.items()}
+        raw_records.append({**provenance, "raw": raw})
+        canonical.append(_canonical_record(raw, mapping, provenance))
+    return raw_records, canonical
+
+
+def _day(record: Mapping[str, Any]) -> str | None:
+    value = record.get("snapshot_at") or record.get("occurred_at")
+    return str(value)[:10] if value else None
+
+
+def _duplicates(raw_records: list[dict[str, Any]]) -> int:
+    values = [json.dumps(row["raw"], ensure_ascii=False, sort_keys=True, separators=(",", ":")) for row in raw_records]
+    return len(values) - len(set(values))
+
+
+def validate_records(source_type: str, raw: list[dict[str, Any]], rows: list[dict[str, Any]],
+                     geometry_cells: set[str] | None = None) -> dict[str, Any]:
+    geometry_cells = geometry_cells or set()
+    days = sorted({day for row in rows if (day := _day(row))})
+    sku = {row["sku_key"] for row in rows if row.get("sku_key")}
+    diagnostics: dict[str, Any] = {"rows": len(raw), "unique_sku": len(sku), "missing_sku": sum(not r.get("sku_key") for r in rows),
+        "duplicate_raw_rows": _duplicates(raw), "period_from": days[0] if days else None, "period_to": days[-1] if days else None,
+        "snapshot_count": len(days) if source_type == "historical_placement" else None,
+        "zero_quantities": 0, "negative_quantities": 0, "missing_quantities": 0,
+        "identity_collisions": find_canonical_identity_collisions(rows), "warnings": [], "errors": []}
+    quantity_field = {"receipts": "box_quantity", "outbound": "quantity", "inventory": "actual_quantity"}.get(source_type)
+    if quantity_field:
+        values = [row.get(quantity_field) for row in rows]
+        diagnostics.update(zero_quantities=sum(v == 0 for v in values), negative_quantities=sum(isinstance(v, (int, float)) and v < 0 for v in values), missing_quantities=sum(v is None for v in values))
+    if source_type == "historical_placement":
+        def grouped(field: str, value: str, *, across_snapshots: bool = False) -> int:
+            groups = defaultdict(set)
+            for row in rows:
+                if row.get(field) not in (None, "") and row.get(value) not in (None, ""):
+                    key = str(row[field]) if across_snapshots else (row.get("snapshot_at"), str(row[field]))
+                    groups[key].add(str(row[value]))
+            return sum(len(items) > 1 for items in groups.values())
+        cells = {str(r.get("cell")) for r in rows if r.get("cell") not in (None, "")}
+        orders = defaultdict(set)
+        for row in rows:
+            if row.get("cell") and row.get("cell_picking_order") is not None:
+                orders[str(row["cell"])].add(row["cell_picking_order"])
+        diagnostics.update(unique_cells=len(cells), sku_in_multiple_cells=grouped("sku_key", "cell"),
+            multiple_sku_per_cell=grouped("cell", "sku_key"), multiple_sku_per_pallet=grouped("source_pallet_ref", "sku_key"),
+            pallet_in_multiple_cells=grouped("source_pallet_ref", "cell", across_snapshots=True),
+            unknown_geometry_cells=len(cells - geometry_cells) if geometry_cells else 0,
+            cell_picking_order_conflicts=sum(len(values) > 1 for values in orders.values()),
+            cell_picking_order_evidence=[{"cell": cell, "picking_orders": sorted(values), "conflict": len(values) > 1} for cell, values in sorted(orders.items())])
+    for key, label in (("missing_sku", "missing_sku"), ("duplicate_raw_rows", "duplicate_raw_rows"),
+                       ("identity_collisions", "identity_collisions"), ("negative_quantities", "negative_quantities"),
+                       ("missing_quantities", "missing_quantities")):
+        if diagnostics.get(key): diagnostics["warnings"].append(label)
+    return diagnostics
+
+
+def _known_july_placement_check(filename: str, rows: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Apply the supplied fingerprint only to the explicitly known export."""
+    if _norm(Path(filename).name) != _norm("размещение июль.xlsx"):
+        return None
+    expected = [(date(2026, 7, 1) + timedelta(days=offset)).isoformat() for offset in range(32)]
+    counts = Counter(_day(row) for row in rows)
+    missing = [day for day in expected if not counts.get(day)]
+    return {"expected_snapshot_count": 32, "actual_snapshot_count": len({day for day in counts if day}),
+            "period_expected": [expected[0], expected[-1]], "missing_dates": missing,
+            "rows_2026_07_15": counts.get("2026-07-15", 0), "rows_2026_07_15_expected": 587,
+            "snapshot_count_matches": len({day for day in counts if day}) == 32,
+            "july_15_fingerprint_matches": counts.get("2026-07-15", 0) == 587}
+
+
+def _atomic_json(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(dir=path.parent, prefix=path.name, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, ensure_ascii=False, sort_keys=True, indent=2)
+        os.replace(name, path)
+    finally:
+        if os.path.exists(name): os.unlink(name)
+
+
+def _write_jsonl(path: Path, rows: Iterable[Mapping[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with gzip.open(path, "wt", encoding="utf-8") as stream:
+        for row in rows:
+            stream.write(json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
+
+
+def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+    if not path.exists(): return []
+    with gzip.open(path, "rt", encoding="utf-8") as stream:
+        return [json.loads(line) for line in stream if line.strip()]
+
+
+def load_registry(root: Path = DATA_ROOT) -> dict[str, Any]:
+    path = root / "registry.json"
+    if not path.exists(): return {"registry_version": 1, "datasets": []}
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"registry_version": 1, "datasets": [], "warning": "registry_unreadable"}
+    return state if isinstance(state.get("datasets"), list) else {"registry_version": 1, "datasets": [], "warning": "registry_invalid"}
+
+
+def import_excel_dataset(data: bytes, filename: str, *, sheet: str | None = None, root: Path = DATA_ROOT,
+                         geometry_cells: Iterable[str] | None = None, reimport: bool = False) -> dict[str, Any]:
+    selected, table = read_excel_source(data, sheet)
+    detection = detect_source_type(table.columns)
+    if detection["source_type"] == UNKNOWN_SOURCE:
+        return {"status": detection["status"], "source_type": UNKNOWN_SOURCE, "source_label": SOURCE_LABELS[UNKNOWN_SOURCE],
+                "detected_columns": detection["detected_columns"], "matches": detection["matches"], "errors": ["unknown_or_ambiguous_schema"]}
+    digest = content_hash(data); source_type = detection["source_type"]
+    dataset_id = dataset_identity(digest, source_type, selected)
+    registry = load_registry(root)
+    existing = next((item for item in registry["datasets"] if item.get("dataset_id") == dataset_id), None)
+    if existing and not reimport:
+        return {**existing, "reused": True}
+    imported_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    raw, canonical = normalize_table(table, dataset_id=dataset_id, filename=filename, data_hash=digest,
+        source_type=source_type, sheet=selected, imported_at=imported_at, mapping=detection["mapping"])
+    diagnostics = validate_records(source_type, raw, canonical, set(map(str, geometry_cells or [])))
+    known_check = _known_july_placement_check(filename, canonical) if source_type == "historical_placement" else None
+    if known_check:
+        diagnostics["known_july_validation"] = known_check
+        if known_check["missing_dates"]: diagnostics["warnings"].append("known_july_missing_dates")
+        if not known_check["july_15_fingerprint_matches"]: diagnostics["warnings"].append("known_july_15_fingerprint_mismatch")
+    artifact = root / dataset_id.removeprefix("dataset:")
+    _write_jsonl(artifact / "raw.jsonl.gz", raw)
+    partitions = defaultdict(list)
+    for row in canonical: partitions[_day(row) or "undated"].append(row)
+    for day, rows in partitions.items(): _write_jsonl(artifact / "canonical" / f"date={day}.jsonl.gz", rows)
+    metadata = {"dataset_id": dataset_id, "source_file_name": filename, "content_hash": digest, "source_type": source_type,
+        "source_label": SOURCE_LABELS[source_type], "parser_version": PARSER_VERSION, "sheet": selected, "rows": len(raw),
+        "period_from": diagnostics["period_from"], "period_to": diagnostics["period_to"], "unique_sku": diagnostics["unique_sku"],
+        "imported_at": imported_at, "status": "warning" if diagnostics["warnings"] else "ready", "errors": diagnostics["errors"],
+        "warnings": diagnostics["warnings"], "detected_columns": detection["detected_columns"],
+        "artifact": str(artifact), "partitions": sorted(partitions), "diagnostics": diagnostics}
+    _atomic_json(artifact / "metadata.json", metadata)
+    registry["datasets"] = [item for item in registry["datasets"] if item.get("dataset_id") != dataset_id] + [metadata]
+    registry["datasets"].sort(key=lambda item: (item.get("imported_at", ""), item["dataset_id"]))
+    _atomic_json(root / "registry.json", registry)
+    return {**metadata, "reused": False}
+
+
+def load_dataset_rows(dataset: Mapping[str, Any], day: str | None = None, *, raw: bool = False) -> list[dict[str, Any]]:
+    artifact = Path(str(dataset["artifact"]))
+    if raw: return _read_jsonl(artifact / "raw.jsonl.gz")
+    if day is not None: return _read_jsonl(artifact / "canonical" / f"date={day}.jsonl.gz")
+    rows = []
+    for partition in dataset.get("partitions", []): rows.extend(_read_jsonl(artifact / "canonical" / f"date={partition}.jsonl.gz"))
+    return rows
+
+
+def positive_outbound(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    return [dict(row) for row in rows if isinstance(row.get("quantity"), (int, float)) and row["quantity"] > 0]
+
+
+def date_summary(registry: Mapping[str, Any], day: str) -> dict[str, Any]:
+    result = {"operational_day": day, "placement": {"snapshot_exists": False, "rows": 0, "sku": 0, "cells": 0},
+              "inventory": {"documents": 0, "rows": 0}, "receipts": {"documents": 0, "rows": 0, "accepted_boxes": None},
+              "outbound": {"documents": 0, "lines": 0, "positive_demand": 0}, "vgh": {"relevant_sku": 0, "covered_sku": 0},
+              "next_day_placement_available": False}
+    source_rows = defaultdict(list)
+    for dataset in registry.get("datasets", []): source_rows[dataset["source_type"]].extend(load_dataset_rows(dataset, day))
+    placement = source_rows["historical_placement"]
+    result["placement"] = {"snapshot_exists": bool(placement), "rows": len(placement), "sku": len({r.get("sku_key") for r in placement if r.get("sku_key")}), "cells": len({r.get("cell") for r in placement if r.get("cell")})}
+    for source, target in (("inventory", "inventory"), ("receipts", "receipts")):
+        rows = source_rows[source]; docs = {(r.get("document_ref") or r.get("inventory_ref"), r.get("document_number") or r.get("inventory_number"), r.get("occurred_at")) for r in rows}
+        result[target].update(documents=len(docs), rows=len(rows))
+    outbound = source_rows["outbound"]; positive = positive_outbound(outbound)
+    result["outbound"] = {"documents": len({(r.get("document_ref"), r.get("document_number"), r.get("occurred_at")) for r in outbound}), "lines": len(outbound), "positive_demand": sum(r["quantity"] for r in positive)}
+    demanded = {r.get("sku_key") for r in positive if r.get("sku_key")}; vgh = set()
+    for dataset in registry.get("datasets", []):
+        if dataset.get("source_type") == "vgh": vgh.update(r.get("sku_key") for r in load_dataset_rows(dataset) if r.get("sku_key"))
+        if dataset.get("source_type") == "historical_placement":
+            tomorrow = (pd.Timestamp(day).date() + timedelta(days=1)).isoformat()
+            result["next_day_placement_available"] |= bool(load_dataset_rows(dataset, tomorrow))
+    result["vgh"] = {"relevant_sku": len(demanded), "covered_sku": len(demanded & vgh)}
+    return result
+
+
+def cross_source_coverage(registry: Mapping[str, Any]) -> list[dict[str, Any]]:
+    indexes: dict[str, set[str]] = defaultdict(set)
+    for dataset in registry.get("datasets", []):
+        indexes[dataset["source_type"]].update(row.get("sku_key") for row in load_dataset_rows(dataset) if row.get("sku_key"))
+    scope = indexes["outbound"] | indexes["historical_placement"]
+    return [{"sku_key": sku, "outbound": sku in indexes["outbound"], "placement": sku in indexes["historical_placement"],
+             "vgh": sku in indexes["vgh"], "inventory": sku in indexes["inventory"], "receipts": sku in indexes["receipts"]} for sku in sorted(scope)]

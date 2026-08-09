@@ -17,6 +17,9 @@ from warehouse_placement_zones import PLACEMENT_ZONE_IDS, get_placement_zone_lab
 from warehouse_scenario_comparison_ui import build_scenario_rule_config
 from warehouse_ui_messages import get_ui_message
 from warehouse_workflow_ui_state import state_from_session
+from warehouse_factual_data import (
+    SOURCE_LABELS, cross_source_coverage, date_summary, import_excel_dataset, load_registry,
+)
 
 WORKSPACE_TABS = ("Склад", "Данные", "Условия модели", "CURRENT / PROPOSED", "Пробег", "Аналитика")
 SUPPORTED_RULES = (
@@ -187,6 +190,61 @@ def render_rules_control_panel(model: Mapping[str, Any] | None, session_state: M
         st.caption("Весовые диапазоны здесь не дублируются: используются только подтверждённые классификации источника.")
     with st.expander("Ещё не реализовано"):
         st.write(" · ".join(UNSUPPORTED_RULES))
+
+
+def render_factual_data_layer(model: Mapping[str, Any] | None) -> None:
+    """Render the sole monthly factual registry inside the existing Data tab."""
+    st.subheader("Фактический Data Layer")
+    st.caption("RAW + CANONICAL · реестр по хешу содержимого · исторические данные не изменяют CURRENT V1 автоматически")
+    files = st.file_uploader(
+        "Добавить фактические Excel", type=["xlsx", "xls"], accept_multiple_files=True,
+        key="factual_data_uploads",
+    )
+    if files and st.button("Импортировать в Data Layer", type="primary", key="factual_data_import"):
+        geometry_cells = {
+            str(cell.get("cell_code") or cell.get("display_code") or cell.get("cell_key") or "")
+            for cell in (model or {}).get("cells", []) if isinstance(cell, Mapping)
+        }
+        for uploaded in files:
+            try:
+                result = import_excel_dataset(uploaded.getvalue(), uploaded.name, geometry_cells=geometry_cells)
+            except (OSError, ValueError) as exc:
+                st.error(f"{uploaded.name}: файл не импортирован ({exc})")
+                continue
+            if result.get("source_type") == "unknown":
+                st.error(f"{uploaded.name}: Неизвестный тип файла")
+                st.caption("Обнаруженные колонки: " + " · ".join(result.get("detected_columns", [])))
+            elif result.get("reused"):
+                st.info(f"{uploaded.name}: уже импортирован, использован сохранённый артефакт")
+            else:
+                st.success(f"{uploaded.name}: {SOURCE_LABELS[result['source_type']]}")
+    registry = load_registry()
+    datasets = registry.get("datasets", [])
+    if not datasets:
+        st.info("Фактические месячные наборы ещё не импортированы.")
+        return
+    compact = [{
+        "Файл": item.get("source_file_name"), "Тип": item.get("source_label"), "Статус": item.get("status"),
+        "Период": " — ".join(filter(None, (item.get("period_from"), item.get("period_to")))) or "—",
+        "Строк": item.get("rows", 0), "SKU": item.get("unique_sku", 0),
+        "Ошибки": len(item.get("errors", [])), "Предупреждения": len(item.get("warnings", [])),
+    } for item in datasets]
+    st.dataframe(pd.DataFrame(compact), use_container_width=True, hide_index=True)
+    for item in datasets:
+        with st.expander(f"{item.get('source_file_name')} · {item.get('source_label')}"):
+            st.json({key: item.get(key) for key in (
+                "dataset_id", "content_hash", "parser_version", "sheet", "imported_at", "artifact",
+                "detected_columns", "diagnostics",
+            )})
+    available_days = sorted({day for item in datasets for day in item.get("partitions", []) if day != "undated"})
+    if available_days:
+        selected = st.selectbox("Операционный день", available_days, key="factual_operational_day")
+        summary = date_summary(registry, selected)
+        st.subheader(f"Срез на {selected}")
+        st.json(summary)
+        with st.expander("Покрытие SKU между источниками"):
+            coverage = cross_source_coverage(registry)
+            st.dataframe(pd.DataFrame(coverage), use_container_width=True, hide_index=True)
 
 
 def authoritative_analytics_metrics(comparison: Mapping[str, Any]) -> dict[str, Any] | None:

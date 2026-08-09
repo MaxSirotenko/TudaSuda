@@ -1918,9 +1918,14 @@ def render_data_workspace(model: dict | None) -> None:
     st.subheader("Авторитетные данные V1")
     st.caption("START · расходные РО · операционный день · склад · ворота")
     st.info("Приходы и END необязательны и не участвуют в headline replay V1.")
+    from warehouse_workspace_ui import render_factual_data_layer
+    render_factual_data_layer(model)
     if not model:
-        st.warning("Для загрузки данных сначала настройте склад.")
+        st.warning("Для загрузки данных V1 сначала настройте склад. Фактический Data Layer доступен независимо.")
         return
+    st.divider()
+    st.subheader("Совместимость V1")
+    st.caption("Следующие импортеры сохраняют действующий однодневный контракт; ПорядокСборки из РО остаётся входом V1.")
     render_receipts_inventory_tab(model)
     with st.expander("Запросы 1С и техническая подготовка"):
         render_1c_queries_tab()
