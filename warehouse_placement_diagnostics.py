@@ -14,6 +14,10 @@ ZONE_LABELS_RU = {
     "medium": "Среднее",
     "light": "Лёгкое",
     "fragile": "Хрупкое",
+    "medium_light": "Средне-лёгкое",
+    "bulky": "Крупногабаритное",
+    "small_and_bulky": "Мелкое и крупногабаритное",
+    "show_boxes": "Шоу-боксы",
     "unclassified": "Без классификации",
     "unassigned": "Не назначено",
     "": "Нет данных",
@@ -24,6 +28,10 @@ PLACEMENT_CATEGORY_COLORS = {
     "medium": "#F7D486",
     "light": "#BFE3B4",
     "fragile": "#D8B4FE",
+    "medium_light": "#DDE7A7",
+    "bulky": "#F0B27A",
+    "small_and_bulky": "#C4B5FD",
+    "show_boxes": "#93C5FD",
     "unclassified": "#CBD5E1",
     "unassigned": "#E5E7EB",
 }
@@ -208,7 +216,7 @@ def _category_for_placements(placements: list[dict[str, Any]], fallback_zone: st
             return "fragile"
     for placement in placements:
         zone = _display(placement.get("calculated_zone")) or _display(placement.get("weight_class"))
-        if zone in {"heavy", "medium", "light", "fragile", "unclassified"}:
+        if zone in {"heavy", "medium", "light", "fragile", "medium_light", "bulky", "small_and_bulky", "show_boxes", "unclassified"}:
             return zone
     return fallback_zone or "unclassified"
 

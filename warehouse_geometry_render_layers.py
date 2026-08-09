@@ -21,10 +21,13 @@ DEFAULT_COLORS = {
     "occupied_cell_color": "#90CAF9",
     "deep_lane_partial_color": "#A5D6A7",
     "deep_lane_full_color": "#66BB6A",
+    "unknown_occupancy_color": "#E5E7EB",
 }
 CATEGORY_COLORS = {
     "heavy": "#F4A6A6", "medium": "#F7D486", "light": "#BFE3B4",
     "fragile": "#D8B4FE", "unclassified": "#CBD5E1", "unassigned": "#E5E7EB",
+    "medium_light": "#DDE7A7", "bulky": "#F0B27A",
+    "small_and_bulky": "#C4B5FD", "show_boxes": "#93C5FD",
 }
 _DYNAMIC_CELL_FIELDS = {
     "occupied_capacity_pallets", "occupancy_label", "placements", "placement_category",
@@ -78,9 +81,12 @@ def build_dynamic_cell_payload(
     colors = DEFAULT_COLORS | dict(settings.get("colors", {}))
     key = geometry_cell_key(cell)
     occupied = float(cell.get("occupied_capacity_pallets", 0) or 0)
+    occupancy_unknown = bool(cell.get("occupancy_unknown"))
     capacity = float(cell.get("capacity_pallets", 1) or 1)
     placements = cell.get("placements", [])
-    if occupied > capacity:
+    if occupancy_unknown:
+        status, fill, border = "unknown", colors["unknown_occupancy_color"], "2px dashed #64748B"
+    elif occupied > capacity:
         status, fill, border = "overfilled", "#fecaca", "2px solid #DC5A5A"
     elif occupied >= capacity:
         status, border = "full", "2px solid #4F8F5B"
@@ -91,13 +97,15 @@ def build_dynamic_cell_payload(
     if key == str(settings.get("selected_cell_key", "")):
         fill, border = str(colors.get("selected_cell_color", "#FF7043")), "2px solid #E5532D"
     entry: dict[str, Any] = {"occupied": occupied, "capacity": capacity, "occupancy_status": status, "fill_color": fill, "border": border}
+    if occupancy_unknown:
+        entry["occupancy_unknown"] = True
     if cell.get("placement_tooltip"):
         entry["tooltip"] = str(cell["placement_tooltip"])
     if settings.get("show_cell_labels", True) and (label := _sku_label(placements)):
         entry["label"] = label
     compact_placements = []
     for placement in placements:
-        compact = {field: placement[field] for field in ("sku_code", "sku_name", "item_name", "characteristic", "quantity", "source", "confidence") if placement.get(field) not in (None, "")}
+        compact = {field: placement[field] for field in ("sku_key", "sku_code", "sku_name", "item_name", "characteristic", "quantity", "qty_boxes", "source", "confidence") if placement.get(field) not in (None, "")}
         if compact:
             compact_placements.append(compact)
     if compact_placements:
@@ -158,14 +166,18 @@ def build_geometry_dynamic_payload_from_state(
     with measure_step("build_dynamic_payload_direct", build_metadata):
         for key, cell in resolved.items():
             summary = summaries.get(key, {})
+            unknown = any(item.get("occupancy_unknown") for item in summary.get("placements", []))
             dynamic = {
                 "row_number": cell.get("row_number"), "cell_number": cell.get("cell_number"), "tier": cell.get("tier"),
                 "capacity_pallets": cell.get("capacity_pallets"), "storage_type": cell.get("storage_type"),
                 "occupied_capacity_pallets": summary.get("occupied_capacity_pallets", 0),
                 "placements": summary.get("placements", []),
                 "placement_category": placement_category_for_placements(summary.get("placements", []), str(cell.get("weight_zone") or "unclassified")),
+                "occupancy_unknown": unknown,
             }
             tooltip = tooltips.get(key, "") + str(outbound_tooltips.get(key, ""))
+            if unknown:
+                tooltip = (tooltip + "\n" if tooltip else "") + "Физическая занятость неизвестна"
             if tooltip:
                 dynamic["placement_tooltip"] = tooltip
             if key in outbound_statuses:

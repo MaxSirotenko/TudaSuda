@@ -1,0 +1,94 @@
+"""Single deterministic orchestration seam for rebuilding a PROPOSED scenario."""
+from __future__ import annotations
+
+import hashlib
+import json
+from collections.abc import Mapping
+from typing import Any
+
+from warehouse_placement_rules import build_placement_rule_set, get_enabled_rule_ids
+from warehouse_proposed_placement_optimizer import build_proposed_placement_plan
+from warehouse_proposed_state import apply_proposed_placement_plan
+
+
+def _scenario_id(result: Mapping[str, Any]) -> str:
+    identity = {key: result.get(key) for key in (
+        "baseline_state_id", "placement_rule_set_id", "placement_plan_id", "proposed_state_id",
+    )}
+    encoded = json.dumps(identity, sort_keys=True, separators=(",", ":"),
+                         ensure_ascii=False, allow_nan=False).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _boxes(state: Mapping[str, Any] | None) -> int | float | None:
+    if state is None:
+        return None
+    return sum(lot.get("qty_boxes", 0) for lot in state.get("stock_lots", []) or [])
+
+
+def build_proposed_scenario(
+    model: dict[str, Any],
+    baseline_state: dict[str, Any],
+    rule_config: dict[str, Any],
+    *,
+    sku_zone_rows: list[dict[str, Any]] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Run RuleSet -> Plan -> ProposedState, always from ``baseline_state``."""
+    rule_set, rule_validation = build_placement_rule_set(rule_config)
+    plan, plan_validation = build_proposed_placement_plan(
+        model, baseline_state, rule_set, sku_zone_rows or [],
+    )
+    proposed = None
+    apply_report: dict[str, Any] | None = None
+    if rule_validation["valid"] and plan.get("status") in {"ready", "partial"}:
+        proposed, apply_report = apply_proposed_placement_plan(model, baseline_state, plan)
+
+    if not rule_validation["valid"] or plan.get("status") == "blocked" or proposed is None:
+        status = "blocked"
+    else:
+        status = "partial" if plan.get("status") == "partial" else "ready"
+
+    baseline_id = baseline_state.get("simulation_state_id")
+    proposed_id = proposed.get("simulation_state_id") if proposed else None
+    plan_summary = plan.get("summary", {})
+    baseline_boxes, proposed_boxes = _boxes(baseline_state), _boxes(proposed)
+    summary = {
+        "enabled_rule_ids": get_enabled_rule_ids(rule_set) if rule_validation["valid"] else [],
+        **{key: plan_summary.get(key, 0) for key in (
+            "placement_units_total", "units_kept", "units_moved", "fixed_units", "unresolved_units",
+        )},
+        "weight_zone_compliance_before_percent": plan_summary.get("weight_zone_compliance_before_percent", 100.0),
+        "weight_zone_compliance_after_percent": plan_summary.get("weight_zone_compliance_after_percent", 100.0),
+        "baseline_boxes": baseline_boxes,
+        "proposed_boxes": proposed_boxes,
+        "box_conservation_ok": proposed_boxes is not None and baseline_boxes == proposed_boxes,
+        "baseline_state_id": baseline_id,
+        "proposed_state_id": proposed_id,
+        "state_changed": proposed_id is not None and proposed_id != baseline_id,
+    }
+    limitations = list(dict.fromkeys(
+        list(plan.get("limitations", [])) + list((apply_report or {}).get("limitations", []))
+    ))
+    result = {
+        "status": status,
+        "baseline_state_id": baseline_id,
+        "placement_rule_set": rule_set,
+        "placement_rule_set_id": rule_set.get("placement_rule_set_id"),
+        "placement_plan": plan,
+        "placement_plan_id": plan.get("proposed_placement_plan_id"),
+        "proposed_state": proposed,
+        "proposed_state_id": proposed_id,
+        "summary": summary,
+        "limitations": limitations,
+    }
+    result["proposed_scenario_id"] = _scenario_id(result)
+    diagnostics = {
+        "valid": status != "blocked",
+        "status": status,
+        "rule_set_validation": rule_validation,
+        "placement_plan_validation": plan_validation,
+        "apply_report": apply_report,
+        "errors": (rule_validation.get("errors", []) + plan.get("blocked_reasons", [])
+                   + ([] if apply_report is None else apply_report.get("blocked_reasons", []))),
+    }
+    return result, diagnostics
