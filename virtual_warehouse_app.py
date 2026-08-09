@@ -1881,6 +1881,34 @@ def render_warehouse_workspace(model: dict | None) -> None:
     elif subsection == "zones":
         render_zone_boundaries_fragment(model)
     else:
+        st.subheader("Ворота")
+        st.caption("Единая точка начала и возврата для авторитетного расчёта пробега.")
+        roads = model.get("roads", []) or []
+        if not roads:
+            st.warning("Сначала настройте проезды, к которым можно привязать ворота.")
+        else:
+            road_index = st.selectbox(
+                "Проезд для ворот", list(range(len(roads))),
+                format_func=lambda i: f"{roads[i].get('road_type')} · {roads[i].get('road_id', i)}",
+                key="workspace_gate_road",
+            )
+            road = roads[road_index]
+            x = st.number_input("X ворот", value=float(road.get("x_min", 0) + road.get("x_max", 0)) / 2,
+                                key="workspace_gate_x")
+            y = st.number_input("Y ворот", value=float(road.get("y_min", 0) + road.get("y_max", 0)) / 2,
+                                key="workspace_gate_y")
+            if st.button("Сохранить ворота", key="workspace_gate_save"):
+                st.session_state["workspace_gate_state"] = {
+                    "model_id": model.get("model_id"), "gates": [{
+                        "gate_key": "main_gate", "gate_name": "Основные ворота",
+                        "road_type": road.get("road_type"), "x": float(x), "y": float(y),
+                    }],
+                }
+                st.success("Ворота сохранены. Следующий шаг: Данные.")
+            saved_gate = st.session_state.get("workspace_gate_state")
+            if saved_gate and saved_gate.get("model_id") == model.get("model_id"):
+                gate = saved_gate["gates"][0]
+                st.caption(f"Настроено: {gate['gate_name']} · X {gate['x']} · Y {gate['y']}")
         with st.expander("Техническая геометрия"):
             render_geometry_data_tabs(model)
 
@@ -1915,6 +1943,17 @@ def render_comparison_workspace(model: dict | None) -> None:
     render_outbound_experiment(model)
 
 
+def render_distance_workspace(model: dict | None) -> None:
+    """Read-only home for the latest authoritative replay and its route evidence."""
+    st.subheader("Пробег CURRENT / PROPOSED")
+    replay = st.session_state.get("placement_comparison_distance_replay")
+    if not replay:
+        st.info("Сначала постройте PROPOSED и нажмите «Рассчитать CURRENT / PROPOSED» в предыдущем разделе.")
+        return
+    from warehouse_route_ui import render_replay_routes
+    render_replay_routes(replay)
+
+
 def render_business_analytics_workspace(model: dict | None) -> None:
     from warehouse_workspace_ui import render_cached_analytics
     render_cached_analytics(st.session_state)
@@ -1938,6 +1977,7 @@ def render_excel_geometry_warehouse() -> None:
         data_renderer=render_data_workspace,
         rules_renderer=render_rules_workspace,
         comparison_renderer=render_comparison_workspace,
+        distance_renderer=render_distance_workspace,
         analytics_renderer=render_business_analytics_workspace,
     )
 

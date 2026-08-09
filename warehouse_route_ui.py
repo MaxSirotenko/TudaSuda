@@ -5,6 +5,9 @@ import math
 from collections.abc import Mapping
 from typing import Any
 
+import pandas as pd
+import streamlit as st
+
 ROUTE_COLORS = {"current": "#2563EB", "proposed": "#D97706", "pick": "#7C3AED", "gate": "#166534"}
 
 
@@ -49,3 +52,32 @@ def select_replay_order(replay: Mapping[str, Any], scenario: str, order_key: str
     for order in replay.get(scenario, {}).get("orders", []) or []:
         if str(order.get("order_key")) == str(order_key): return order
     return None
+
+
+def render_replay_routes(replay: Mapping[str, Any]) -> None:
+    """Render CURRENT/PROPOSED from the graph and legs retained by authoritative replay."""
+    graph = replay.get("route_graph") or {}
+    current = replay.get("current", {}).get("orders", []) or []
+    proposed = replay.get("proposed", {}).get("orders", []) or []
+    keys = [str(order.get("order_key")) for order in current if order.get("order_key") is not None]
+    st.markdown("### Маршрут выбранного РО")
+    if not keys:
+        st.info("Нет рассчитанных РО. Загрузите РО в разделе «Данные» и рассчитайте пробег.")
+        return
+    selected = st.selectbox("РО для просмотра", keys, key="route_ui_selected_ro")
+    columns = st.columns(2)
+    for column, scenario, orders in zip(columns, ("current", "proposed"), (current, proposed)):
+        order = next((item for item in orders if str(item.get("order_key")) == selected), None)
+        with column:
+            st.markdown(f"#### {scenario.upper()}")
+            if order is None:
+                st.warning("Для этого сценария РО отсутствует.")
+                continue
+            overlay = build_route_overlay(order, graph, scenario)
+            st.metric("Пробег комплектовщика, м", overlay["route_distance_m"])
+            if overlay["visualization_message"]:
+                st.warning("Маршрут рассчитан, но часть пути не удалось отобразить.")
+            if overlay["route_points"]:
+                st.dataframe(pd.DataFrame(overlay["route_points"]), hide_index=True,
+                             use_container_width=True)
+            st.caption(f"Точек отбора: {len(overlay['pick_stops'])}; цвет маршрута: {overlay['style']['route_color']}")

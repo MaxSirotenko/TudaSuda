@@ -18,7 +18,7 @@ from warehouse_scenario_comparison_ui import build_scenario_rule_config
 from warehouse_ui_messages import get_ui_message
 from warehouse_workflow_ui_state import state_from_session
 
-WORKSPACE_TABS = ("Склад", "Данные", "Условия модели", "CURRENT / PROPOSED", "Аналитика")
+WORKSPACE_TABS = ("Склад", "Данные", "Условия модели", "CURRENT / PROPOSED", "Пробег", "Аналитика")
 SUPPORTED_RULES = (
     "weight_zones", "velocity", "adjacency", "picking_storage", "replenishment",
     "deep_lane_optimization", "base_sku_capacity",
@@ -70,6 +70,7 @@ STEP_CONTEXT = {
     "Данные": ("Загружаем фактический START и расходные РО выбранного дня.", "START станет неизменяемым CURRENT, а РО — одинаковым спросом для сравнения.", "Подтверждённое исходное размещение и фактический ПорядокСборки."),
     "Условия модели": ("Выбираем правила, по которым проект перестроит размещение товара.", "Правила формируют PROPOSED, не изменяя фактический CURRENT.", "Новая раскладка тех же исходных остатков."),
     "CURRENT / PROPOSED": ("Строим PROPOSED и повторяем одинаковые РО на двух размещениях.", "Так сравнивается пробег сборщика при одинаковом спросе.", "Две карты, CURRENT и PROPOSED метры и экономия."),
+    "Пробег": ("Рассчитываем одинаковые расходные РО для CURRENT и PROPOSED.", "Используются выбранный день, спрос и ворота из предыдущих шагов.", "Авторитетный пробег и маршруты выбранного РО."),
     "Аналитика": ("Изучаем текущий результат сравнения.", "Метрики помогают оценить эффект без подмены фактического CURRENT.", "Сводка пробега, качества и ограничений расчёта."),
 }
 
@@ -108,8 +109,8 @@ def build_workspace_rule_config(values: Mapping[str, Any], minimum_positions_per
         replenishment_enabled=selected["replenishment"],
         deep_lane_optimization_enabled=selected["deep_lane_optimization"],
         base_sku_capacity_enabled=selected["base_sku_capacity"],
+        minimum_positions_per_sku=minimum_positions_per_sku,
     )
-    config["base_sku_capacity"]["parameters"]["minimum_positions_per_sku"] = max(1, int(minimum_positions_per_sku))
     return config
 
 
@@ -133,7 +134,8 @@ def build_warehouse_zone_summary(model: Mapping[str, Any]) -> list[dict[str, Any
 
 def render_operational_workspace(model: dict | None, *, warehouse_renderer: Callable,
                                  data_renderer: Callable, rules_renderer: Callable,
-                                 comparison_renderer: Callable, analytics_renderer: Callable) -> None:
+                                 comparison_renderer: Callable, distance_renderer: Callable,
+                                 analytics_renderer: Callable) -> None:
     st.markdown("""<style>
     .stApp {background:#f6f7f9}.workflow-stepper{display:flex;gap:.45rem;flex-wrap:wrap;background:white;border:1px solid #e5e7eb;border-radius:10px;padding:.65rem .8rem;margin-bottom:.8rem}
     .workflow-step{color:#64748b;padding:.15rem .35rem}.workflow-step.completed{color:#397354}.workflow-step.current{color:#1d4ed8;font-weight:650}.workflow-step.stale{color:#a16207}
@@ -142,7 +144,7 @@ def render_operational_workspace(model: dict | None, *, warehouse_renderer: Call
     render_workflow_stepper(model, st.session_state)
     tabs = st.tabs(list(WORKSPACE_TABS))
     for tab, name, renderer in zip(tabs, WORKSPACE_TABS, (warehouse_renderer, data_renderer, rules_renderer,
-                                          comparison_renderer, analytics_renderer)):
+                                          comparison_renderer, distance_renderer, analytics_renderer)):
         with tab:
             render_context_block(name)
             renderer(model)
@@ -177,6 +179,8 @@ def render_rules_control_panel(model: Mapping[str, Any] | None, session_state: M
     config = build_workspace_rule_config(values, minimum)
     # Persist configuration only; rendering never starts a scenario.
     session_state["workspace_rule_config"] = config
+    session_state["workspace_rule_dependencies_valid"] = not (
+        config["replenishment"]["enabled"] and not config["picking_storage"]["enabled"])
     with st.expander("Как работают правила"):
         st.write("Оборачиваемость использует закреплённые в warehouse_sku_velocity определения окон 28/14/7/4.")
         st.write(RULE_CARDS["adjacency"][1])
@@ -185,22 +189,36 @@ def render_rules_control_panel(model: Mapping[str, Any] | None, session_state: M
         st.write(" · ".join(UNSUPPORTED_RULES))
 
 
+def authoritative_analytics_metrics(comparison: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Return the exact benchmark headline contract, or no non-authoritative headline."""
+    if comparison.get("full_day_effect_valid") is not True:
+        return None
+    summary = comparison.get("authoritative_summary") or {}
+    keys = ("current_picker_distance_m", "proposed_picker_distance_m", "picker_distance_saved_m",
+            "picker_distance_saved_percent", "orders_total", "current_picked_boxes",
+            "proposed_picked_boxes", "current_shortage_boxes", "proposed_shortage_boxes",
+            "service_equivalent")
+    return {key: summary.get(key) for key in keys}
+
+
 def render_cached_analytics(session_state: Mapping[str, Any]) -> None:
     """Render only cached authoritative benchmark output; never recalculate it."""
     st.subheader("Аналитика CURRENT / PROPOSED")
     comparison = session_state.get("placement_comparison_distance_comparison")
     if not comparison:
         st.info("Рассчитайте пробег CURRENT / PROPOSED в одноимённом разделе.")
-    elif session_state.get("workspace_benchmark_stale"):
+    elif session_state.get("placement_comparison_distance_signature") != session_state.get("placement_comparison_active_distance_signature"):
         st.warning("Результат пробега устарел — пересчитайте.")
     elif comparison.get("full_day_effect_valid") is not True:
-        st.warning("Эффект полного дня не рассчитан")
+        st.warning("Эффект полного дня недоступен")
         st.write(" · ".join(comparison.get("blockers") or comparison.get("limitations") or ["Сервис CURRENT и PROPOSED не эквивалентен."]))
     else:
-        summary = comparison.get("authoritative_summary", {})
+        summary = authoritative_analytics_metrics(comparison) or {}
         keys = (("CURRENT, м", "current_picker_distance_m"), ("PROPOSED, м", "proposed_picker_distance_m"),
-                ("Экономия, м", "distance_saved_m"), ("Экономия, %", "distance_saved_percent"),
-                ("РО", "accepted_orders"), ("Коробов собрано", "picked_boxes"), ("Shortage", "shortage_boxes"))
+                ("Экономия, м", "picker_distance_saved_m"), ("Экономия, %", "picker_distance_saved_percent"),
+                ("РО", "orders_total"), ("Собрано CURRENT", "current_picked_boxes"),
+                ("Собрано PROPOSED", "proposed_picked_boxes"), ("Shortage CURRENT", "current_shortage_boxes"),
+                ("Shortage PROPOSED", "proposed_shortage_boxes"), ("Сервис эквивалентен", "service_equivalent"))
         for column, (label, key) in zip(st.columns(len(keys)), keys): column.metric(label, summary.get(key, "—"))
     if comparison:
         orders = comparison.get("orders") or comparison.get("order_comparisons") or []

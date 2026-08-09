@@ -5,8 +5,8 @@ from warehouse_workspace_ui import (
 )
 
 
-def test_five_business_workspace_tabs_are_fixed():
-    assert WORKSPACE_TABS == ("Склад", "Данные", "Условия модели", "CURRENT / PROPOSED", "Аналитика")
+def test_six_business_workspace_tabs_are_fixed():
+    assert WORKSPACE_TABS == ("Склад", "Данные", "Условия модели", "CURRENT / PROPOSED", "Пробег", "Аналитика")
 
 
 def test_only_supported_rules_are_active_and_dependency_is_deterministic():
@@ -22,6 +22,16 @@ def test_rule_contract_has_only_real_parameter_and_exact_adjacency_copy():
     assert config["base_sku_capacity"]["parameters"] == {"minimum_positions_per_sku": 2}
     assert config["deep_lane_optimization"] == {"enabled": False}
     assert RULE_CARDS["adjacency"][1] == "Разная номенклатура с одинаковой непустой характеристикой не размещается в соседних ячейках."
+
+
+def test_every_workspace_rule_reaches_the_single_scenario_contract():
+    config = build_workspace_rule_config({
+        "weight_zones": True, "velocity": True, "adjacency": True,
+        "picking_storage": True, "replenishment": True,
+        "deep_lane_optimization": True, "base_sku_capacity": True,
+    }, 4)
+    assert all(config[name]["enabled"] for name in SUPPORTED_RULES)
+    assert config["base_sku_capacity"]["parameters"]["minimum_positions_per_sku"] == 4
 
 
 def test_zone_summary_uses_canonical_zone_ids_and_physical_capacity():
