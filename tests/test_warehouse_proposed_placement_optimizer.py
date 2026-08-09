@@ -375,13 +375,21 @@ def test_adjacency_compacts_same_sku_without_explicit_profile():
     assert plan["summary"]["same_sku_fragments_after"] < plan["summary"]["same_sku_fragments_before"]
 
 
-def test_explicit_group_blocks_are_neighbours_and_conflict_blocks_plan():
+def test_same_characteristic_different_nomenclature_are_not_physical_neighbours():
     model, state = fixture([("P1", "heavy", "A"), ("P2", "heavy", "X"), ("P3", "heavy", "B"), ("P4", "heavy", "Y")])
-    profile = {"adjacency_profile_id": "sha256:test", "rows": [{"sku_key": "A", "adjacency_group": "dairy"}, {"sku_key": "B", "adjacency_group": "dairy"}], "validation_errors": []}
+    for index, cell in enumerate(model["cells"], 1):
+        cell.update(row_number=1, cell_number=index, physical_index=index)
+    profile = {"adjacency_profile_id": "sha256:test", "rows": [
+        {"sku_key": "A", "normalized_nomenclature": "name a", "normalized_characteristic": "x"},
+        {"sku_key": "B", "normalized_nomenclature": "name b", "normalized_characteristic": "x"},
+        {"sku_key": "X", "normalized_nomenclature": "x", "normalized_characteristic": ""},
+        {"sku_key": "Y", "normalized_nomenclature": "y", "normalized_characteristic": ""}],
+        "validation_errors": []}
     plan, diagnostics = build_proposed_placement_plan(model, state, rules(adjacency=True), [], adjacency_profile=profile)
     targets = sorted(int(row["target_position_id"][1:]) for row in plan["placements"] if row["sku_key"] in {"A", "B"})
-    assert diagnostics["valid"] and targets[1] == targets[0] + 1
-    bad = dict(profile, validation_errors=[{"code": "conflicting_adjacency_group_assignment", "sku_key": "A"}])
+    assert diagnostics["valid"] and targets[1] != targets[0] + 1
+    assert plan["summary"]["adjacency_conflicts_after"] == 0
+    bad = dict(profile, validation_errors=[{"code": "conflicting_sku_business_metadata", "sku_key": "A"}])
     blocked, blocked_diagnostics = build_proposed_placement_plan(model, state, rules(adjacency=True), [], adjacency_profile=bad)
     assert blocked["status"] == "blocked" and not blocked_diagnostics["valid"]
 
