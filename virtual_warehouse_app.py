@@ -1989,7 +1989,10 @@ def render_geometry_constructor_tab(saved_model: dict | None, *, show_active_mod
     st.caption("Обычный ряд хранит одну паллету на системную ячейку. Набивной ряд хранит несколько физических паллетомест внутри одной системной ячейки.")
     row_config_source = st.session_state.get("geometry_row_config_data", row_config_default)
     row_config_display = row_config_source.copy()
+    if "deep_lane_access_side" not in row_config_display.columns:
+        row_config_display["deep_lane_access_side"] = ""
     row_config_display["row_storage_type"] = row_config_display["row_storage_type"].map({"normal": "Обычный ряд", "deep_lane": "Набивной ряд"}).fillna(row_config_display["row_storage_type"])
+    row_config_display["deep_lane_access_side"] = row_config_display["deep_lane_access_side"].map({"": "Не настроено", "left": "Слева", "right": "Справа"}).fillna("Не настроено")
     row_config_display["cell_direction"] = row_config_display["cell_direction"].map({"bottom_to_top": "Снизу вверх", "top_to_bottom": "Сверху вниз"}).fillna(row_config_display["cell_direction"])
     if "weight_zone" not in row_config_display.columns:
         row_config_display["weight_zone"] = "unassigned"
@@ -2004,6 +2007,7 @@ def render_geometry_constructor_tab(saved_model: dict | None, *, show_active_mod
             "row_order": "Порядок ряда",
             "row_storage_type": st.column_config.SelectboxColumn("Тип ряда", options=["Обычный ряд", "Набивной ряд"]),
             "deep_lane_width": st.column_config.NumberColumn("Набивных паллетомест", min_value=1, max_value=7, step=1),
+            "deep_lane_access_side": st.column_config.SelectboxColumn("Доступ набивного ряда", options=["Не настроено", "Слева", "Справа"]),
             "cell_direction": st.column_config.SelectboxColumn("Направление ячеек", options=["Снизу вверх", "Сверху вниз"]),
             "weight_zone": st.column_config.SelectboxColumn("Весовая зона", options=["Тяжёлое", "Среднее", "Лёгкое", "Хрупкое", "Не назначено"]),
             "top_offset_cells": st.column_config.NumberColumn("Отступ сверху, ячеек", min_value=0, step=1),
@@ -2014,6 +2018,7 @@ def render_geometry_constructor_tab(saved_model: dict | None, *, show_active_mod
         },
     )
     row_config["row_storage_type"] = row_config["row_storage_type"].map({"Обычный ряд": "normal", "Набивной ряд": "deep_lane"}).fillna(row_config["row_storage_type"])
+    row_config["deep_lane_access_side"] = row_config["deep_lane_access_side"].map({"Не настроено": "", "Слева": "left", "Справа": "right"}).fillna("")
     row_config["cell_direction"] = row_config["cell_direction"].map({"Снизу вверх": "bottom_to_top", "Сверху вниз": "top_to_bottom"}).fillna(row_config["cell_direction"])
     if "weight_zone" not in row_config.columns:
         row_config["weight_zone"] = "Не назначено"
@@ -2081,6 +2086,7 @@ RUSSIAN_COLUMN_LABELS = {
     "source_line": "Строка источника",
     "storage_type": "Тип хранения",
     "row_storage_type": "Тип ряда",
+    "deep_lane_access_side": "Доступ набивного ряда",
     "deep_lane_width": "Набивных паллетомест",
     "capacity_pallets": "Вместимость, паллет",
     "volume_m3": "Объём, м³",
@@ -2245,6 +2251,7 @@ ROW_SETTINGS_COLUMNS = {
     "cell_direction": "Направление сборки",
     "weight_zone": "Весовая зона",
     "row_storage_type": "Тип ряда",
+    "deep_lane_access_side": "Доступ набивного ряда",
     "cell_capacity_pallets": "Вместимость одной логической ячейки",
     "cells_count": "Количество логических ячеек",
     "row_capacity_pallets": "Общая вместимость ряда",
@@ -2262,6 +2269,7 @@ def _row_settings_to_display(df: pd.DataFrame) -> pd.DataFrame:
     display_df["cell_direction"] = display_df["cell_direction"].map(DIRECTION_LABELS).fillna(display_df["cell_direction"])
     display_df["weight_zone"] = display_df["weight_zone"].map(WEIGHT_ZONE_LABELS).fillna(display_df["weight_zone"])
     display_df["row_storage_type"] = display_df["row_storage_type"].map(ROW_STORAGE_TYPE_LABELS).fillna(display_df["row_storage_type"])
+    display_df["deep_lane_access_side"] = display_df["deep_lane_access_side"].map({"": "Не настроено", "left": "Слева", "right": "Справа"}).fillna("Не настроено")
     return display_df.rename(columns=ROW_SETTINGS_COLUMNS)
 
 
@@ -2270,6 +2278,7 @@ def _row_settings_from_display(display_df: pd.DataFrame) -> pd.DataFrame:
     df["cell_direction"] = df["cell_direction"].map(DIRECTION_LABEL_TO_VALUE).fillna(df["cell_direction"])
     df["weight_zone"] = df["weight_zone"].map(WEIGHT_ZONE_LABEL_TO_VALUE).fillna(df["weight_zone"])
     df["row_storage_type"] = df["row_storage_type"].map({label: value for value, label in ROW_STORAGE_TYPE_LABELS.items()}).fillna(df["row_storage_type"])
+    df["deep_lane_access_side"] = df["deep_lane_access_side"].map({"Не настроено": "", "Слева": "left", "Справа": "right"}).fillna("")
     for column in ["row_order", "cell_capacity_pallets", "cells_count", "row_capacity_pallets", "top_offset_cells", "bottom_offset_cells"]:
         if column in df.columns:
             df[column] = pd.to_numeric(df[column], errors="coerce").fillna(0)
@@ -2279,7 +2288,7 @@ def _row_settings_from_display(display_df: pd.DataFrame) -> pd.DataFrame:
 def _merge_row_settings_edits(draft: pd.DataFrame, edited_display: pd.DataFrame) -> pd.DataFrame:
     edited = _row_settings_from_display(edited_display)
     result = draft.copy()
-    editable = ["row_order", "cell_direction", "weight_zone", "row_storage_type", "cell_capacity_pallets", "top_offset_cells", "bottom_offset_cells", "row_group", "side", "comment"]
+    editable = ["row_order", "cell_direction", "weight_zone", "row_storage_type", "deep_lane_access_side", "cell_capacity_pallets", "top_offset_cells", "bottom_offset_cells", "row_group", "side", "comment"]
     for _, row in edited.iterrows():
         mask = result["row_number"].astype(str) == str(row.get("row_number"))
         for column in editable:
@@ -2335,10 +2344,11 @@ def render_unified_row_settings_editor(model: dict) -> dict:
                 "Зона": st.column_config.SelectboxColumn("Зона", options=list(WEIGHT_ZONE_LABELS.values())),
                 "Тип ряда": st.column_config.SelectboxColumn("Тип ряда", options=list(ROW_STORAGE_TYPE_LABELS.values())),
                 "Вместимость": st.column_config.NumberColumn("Вместимость", min_value=1, step=1),
+                "Доступ набивного ряда": st.column_config.SelectboxColumn("Доступ набивного ряда", options=["Не настроено", "Слева", "Справа"]),
                 "Отступ сверху, ячеек": st.column_config.NumberColumn("Отступ сверху, ячеек", min_value=0, step=1),
                 "Отступ снизу, ячеек": st.column_config.NumberColumn("Отступ снизу, ячеек", min_value=0, step=1),
             },
-            column_order=["Ряд", "Порядок", "Направление", "Зона", "Тип ряда", "Вместимость", "Отступ сверху, ячеек", "Отступ снизу, ячеек"],
+            column_order=["Ряд", "Порядок", "Направление", "Зона", "Тип ряда", "Доступ набивного ряда", "Вместимость", "Отступ сверху, ячеек", "Отступ снизу, ячеек"],
         )
         cancel_column, apply_column = st.columns(2)
         reset_submit = cancel_column.form_submit_button("Отменить изменения")

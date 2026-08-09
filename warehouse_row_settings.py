@@ -7,11 +7,12 @@ from typing import Any
 import pandas as pd
 
 from warehouse_placement_zones import PLACEMENT_ZONE_IDS, normalize_placement_zone
+from warehouse_deep_lane import deep_lane_access_contract_id, deep_lane_access_diagnostics, normalize_deep_lane_access_side
 
 VALID_DIRECTIONS = {"bottom_to_top", "top_to_bottom"}
 VALID_STORAGE_TYPES = {"normal", "deep_lane"}
 VALID_ZONES = set(PLACEMENT_ZONE_IDS)
-SYNC_FIELDS = ["row_number", "row_order", "cell_direction", "weight_zone", "initial_weight_zone", "row_storage_type", "deep_lane_width", "capacity_pallets", "row_group", "side", "comment", "base_cell_width_m", "base_row_width_m", "top_offset_cells", "bottom_offset_cells", "top_offset_m", "bottom_offset_m"]
+SYNC_FIELDS = ["row_number", "row_order", "cell_direction", "weight_zone", "initial_weight_zone", "row_storage_type", "deep_lane_width", "deep_lane_access_side", "capacity_pallets", "row_group", "side", "comment", "base_cell_width_m", "base_row_width_m", "top_offset_cells", "bottom_offset_cells", "top_offset_m", "bottom_offset_m"]
 CELL_SYNC_FIELDS = ["row_order", "cell_direction", "weight_zone", "row_group", "side", "comment"]
 
 
@@ -32,7 +33,7 @@ def _float(value: Any, default: float = 0.0) -> float:
 
 
 OFFSET_FIELDS = {"top_offset_cells", "bottom_offset_cells"}
-DISPLAY_FIELDS = {"row_group", "side", "comment"}
+DISPLAY_FIELDS = {"row_group", "side", "comment", "deep_lane_access_side"}
 
 
 def _offset_cells(value: Any) -> int:
@@ -89,6 +90,7 @@ def build_row_settings_draft(model: dict[str, Any]) -> pd.DataFrame:
                 row.get("weight_zone") or _row_fallback(model, row_number, "weight_zone", "unassigned")
             ),
             "row_storage_type": storage,
+            "deep_lane_access_side": (row.get("deep_lane_access_side") or _row_fallback(model, row_number, "deep_lane_access_side", "")) if storage == "deep_lane" else "",
             "cell_capacity_pallets": cell_capacity,
             "cells_count": len(row_cells) or int(_float(row.get("cells_count"), 0)),
             "row_capacity_pallets": (len(row_cells) or int(_float(row.get("cells_count"), 0))) * cell_capacity,
@@ -355,6 +357,11 @@ def _validate_edited_rows(model: dict[str, Any], edited_rows: list[dict[str, Any
         if edited.get("row_storage_type") not in VALID_STORAGE_TYPES:
             errors.append(f"Ошибка: ряд {row_number}: некорректный тип ряда.")
 
+        raw_access = edited.get("deep_lane_access_side")
+        if (edited.get("row_storage_type") == "deep_lane" and raw_access not in {None, ""}
+                and normalize_deep_lane_access_side(raw_access) is None):
+            errors.append(f"Ошибка: ряд {row_number}: некорректная сторона доступа набивного ряда.")
+
         if normalize_placement_zone(edited.get("weight_zone")) not in VALID_ZONES:
             errors.append(f"Ошибка: ряд {row_number}: некорректная весовая зона.")
 
@@ -451,8 +458,11 @@ def sync_row_settings_to_model(model: dict[str, Any]) -> dict[str, Any]:
                     cell[field] = row.get(field, "")
                 cell.setdefault("initial_weight_zone", row.get("initial_weight_zone", row.get("weight_zone", "unassigned")))
                 cell.update({"storage_type": row.get("row_storage_type", "normal"), "deep_lane_width": capacity, "capacity_pallets": capacity, "base_cell_width_m": base_width, "base_row_width_m": base_width, "x_min": x_min, "x_max": x_max, "x_center": (x_min + x_max) / 2, "width_m": x_max - x_min})
+                cell["deep_lane_access_side"] = row.get("deep_lane_access_side", "") if row.get("row_storage_type") == "deep_lane" else ""
                 cell["physical_slots"] = _physical_slots(cell, capacity) if row.get("row_storage_type") == "deep_lane" else []
     model["row_settings"] = [{field: row.get(field, "") for field in SYNC_FIELDS} for row in model.get("rows", [])]
+    model["deep_lane_access_diagnostics"] = deep_lane_access_diagnostics(model.get("rows", []))
+    model["deep_lane_access_contract_id"] = deep_lane_access_contract_id(model.get("rows", []))
     _refresh_navigation(model)
     return model
 
@@ -542,6 +552,7 @@ def apply_row_settings_transaction(
                 "weight_zone",
                 "row_storage_type",
                 "deep_lane_width",
+                "deep_lane_access_side",
                 "row_group",
                 "side",
                 "comment",
@@ -570,6 +581,7 @@ def apply_row_settings_transaction(
             "weight_zone": normalize_placement_zone(edited.get("weight_zone")),
             "row_storage_type": storage,
             "deep_lane_width": capacity,
+            "deep_lane_access_side": _display(edited.get("deep_lane_access_side")) if storage == "deep_lane" else "",
             "row_group": _display(edited.get("row_group")),
             "side": _display(edited.get("side")),
             "comment": _display(edited.get("comment")),
