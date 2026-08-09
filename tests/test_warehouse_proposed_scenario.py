@@ -44,13 +44,13 @@ def test_all_off_is_identity_deterministic_and_rebuilds_from_baseline():
     assert (model, baseline, rows) == before
 
 
-def test_unsupported_rule_and_invalid_rule_set_are_blocked():
+def test_adjacency_rule_is_supported_and_invalid_rule_set_is_blocked():
     model, baseline, rows = _fixture()
     blocked, diagnostics = build_proposed_scenario(
         model, baseline, {"adjacency": {"enabled": True}}, sku_zone_rows=rows,
     )
-    assert blocked["status"] == "blocked" and blocked["proposed_state"] is None
-    assert any(error["code"] == "unsupported_enabled_rule" for error in diagnostics["errors"])
+    assert blocked["status"] == "ready" and blocked["proposed_state"] is not None
+    assert diagnostics["valid"]
 
     invalid, invalid_diagnostics = build_proposed_scenario(
         model, baseline, {"unknown_rule": True}, sku_zone_rows=rows,
