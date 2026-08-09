@@ -11,12 +11,14 @@ from typing import Any
 from warehouse_physical_graph import build_physical_warehouse_graph, find_shortest_path
 from warehouse_placement_rules import get_enabled_rule_ids, validate_placement_rule_set
 from warehouse_placement_zones import DEFAULT_PLACEMENT_ZONE_ORDER
+from warehouse_simulation_state import refresh_simulation_state, validate_simulation_state
 
-REPLAY_VERSION = 2
-PICK_POLICY = "zone_then_nearest_access_node_v1"
+REPLAY_VERSION = 3
+PICK_POLICY = "modeled_zone_then_nearest_reachable_access_node_then_deterministic_tie_break_v1"
 LIMITATIONS = [
     "deep_lane_internal_access_not_modeled", "dynamic_passage_opening_not_modeled",
-    "intermediate_pallet_return_not_modeled", "opening_stock_only_no_receipts",
+    "intermediate_full_picking_pallet_return_not_modeled",
+    "opening_stock_outbound_only_no_intraday_receipts",
     "static_physical_graph_independent_of_occupancy",
     "replenishment_distance_is_loaded_one_way_transfer_only",
     "replenishment_empty_and_return_travel_not_modeled",
@@ -58,7 +60,11 @@ def _replay_scenario(state: Mapping[str, Any], orders: list[Any], graph: dict[st
     positions = {str(p.get("position_id")): p for p in working.get("physical_positions", []) or [] if isinstance(p, dict) and p.get("position_id") is not None}
     diagnostics: dict[str, Any] = {"unknown_location_stock": [], "invalid_stock_lots": [], "unmapped_cell_stock": [],
                                    "unknown_location_boxes": 0, "unmapped_cell_boxes": 0,
-                                   "replenishment_fallbacks": []}
+                                   "replenishment_fallbacks": [], "post_ro_validation": [],
+                                   "source_location_ambiguous_demands": 0,
+                                   "source_location_ambiguous_orders": 0,
+                                   "source_location_ambiguous_boxes": 0,
+                                   "source_location_single_cell_demands": 0}
     usable: list[dict[str, Any]] = []
     for lot in lots:
         qty = _quantity(lot.get("qty_boxes")); sku = str(lot.get("sku_key") or "").strip(); cell = str(lot.get("cell_key") or "").strip()
@@ -85,6 +91,18 @@ def _replay_scenario(state: Mapping[str, Any], orders: list[Any], graph: dict[st
     def role(lot: Mapping[str, Any]) -> str:
         return str(lot.get("location_role") or pallets.get(str(lot.get("pallet_unit_id")), {}).get("placement_role") or "unassigned")
 
+    def release(lot: dict[str, Any], pallet: dict[str, Any]) -> None:
+        """Release exact physical occupancy while retaining provenance."""
+        position_id, cell_key = pallet.get("position_id"), pallet.get("cell_key")
+        pallet.update(remaining_boxes=0, physical_status="depleted", location_status="unassigned",
+                      previous_position_id=position_id, previous_cell_key=cell_key,
+                      position_id=None, cell_key=None)
+        lot.update(location_status="unassigned", previous_position_id=position_id,
+                   previous_cell_key=cell_key, position_id=None, cell_key=None)
+        if position_id is not None and str(position_id) in positions:
+            positions[str(position_id)].update(status="free", occupied_stock_lot_ids=[], pallet_unit_id=None)
+        working["positions_released_total"] = int(working.get("positions_released_total") or 0) + 1
+
     def candidates(sku: str, node: str, *, role_filter: str | None = None) -> list[tuple[Any, ...]]:
         result = []
         for lot in usable:
@@ -98,10 +116,12 @@ def _replay_scenario(state: Mapping[str, Any], orders: list[Any], graph: dict[st
 
     def replenish(sku: str, demand: Mapping[str, Any], order: Mapping[str, Any]) -> bool:
         nonlocal replenishment_distance
-        depleted = [l for l in usable if l.get("sku_key") == sku and role(l) == "picking" and _quantity(l.get("qty_boxes")) == 0]
+        depleted = [l for l in lots if l.get("sku_key") == sku and role(l) == "picking" and _quantity(l.get("qty_boxes")) == 0]
         depleted.sort(key=lambda l: (str(l.get("position_id") or ""), str(l.get("stock_lot_id") or "")))
         if not depleted: return False
-        target_lot = depleted[0]; target_pos = str(target_lot.get("position_id") or ""); target_cell = str(target_lot.get("cell_key") or "")
+        target_lot = depleted[0]
+        target_pos = str(target_lot.get("position_id") or target_lot.get("previous_position_id") or "")
+        target_cell = str(target_lot.get("cell_key") or target_lot.get("previous_cell_key") or "")
         destination_ok = bool(target_pos and target_pos in positions and target_cell in access and
                               positions[target_pos].get("cell_key") == target_cell and
                               (cells[target_cell].get("storage_type") or cells[target_cell].get("row_storage_type") or "normal") != "deep_lane" and
@@ -129,7 +149,9 @@ def _replay_scenario(state: Mapping[str, Any], orders: list[Any], graph: dict[st
         boxes = _quantity(pallet["remaining_boxes"])
         source_lot.update(cell_key=target_cell, position_id=target_pos, location_status="located", location_role="picking")
         pallet.update(cell_key=target_cell, position_id=target_pos, location_status="located", placement_role="picking")
-        positions[source_pos]["status"] = "free"; positions[target_pos]["status"] = "occupied"
+        positions[source_pos].update(status="free", occupied_stock_lot_ids=[], pallet_unit_id=None)
+        positions[target_pos].update(status="occupied", occupied_stock_lot_ids=[source_lot.get("stock_lot_id")],
+                                     pallet_unit_id=pallet_id)
         event = {"sku_key": sku, "pallet_unit_id": pallet_id, "source_position_id": source_pos, "source_cell_key": source_cell,
                  "target_position_id": target_pos, "target_cell_key": target_cell, "boxes": _display(boxes),
                  "replenishment_distance_m": round(distance, 6), "order_key": order.get("order_key"),
@@ -140,10 +162,18 @@ def _replay_scenario(state: Mapping[str, Any], orders: list[Any], graph: dict[st
     results = []; total_picked = 0.0
     for raw_order in orders:
         order = raw_order if isinstance(raw_order, Mapping) else {}; current_node = gate_node; picker_distance = 0.0; valid = True
-        events = []; legs = []; demand_results = []
+        events = []; legs = []; demand_results = []; order_ambiguous = False
         for raw_demand in order.get("demands", []) or []:
             demand = raw_demand if isinstance(raw_demand, Mapping) else {}; sku = str(demand.get("sku_key") or "").strip()
             requested = _quantity(demand.get("requested_boxes", demand.get("requested_units"))); remaining = requested; picks = []
+            source_cells = {str(lot.get("cell_key")) for lot in usable
+                            if lot.get("sku_key") == sku and _quantity(lot.get("qty_boxes")) > 0
+                            and lot.get("cell_key") in access}
+            ambiguous = len(source_cells) > 1
+            diagnostics["source_location_single_cell_demands"] += len(source_cells) == 1
+            diagnostics["source_location_ambiguous_demands"] += ambiguous
+            diagnostics["source_location_ambiguous_boxes"] += requested if ambiguous else 0
+            order_ambiguous |= ambiguous
             fallback_recorded = False
             while remaining > 0:
                 selection_role = "picking" if picking_storage else None
@@ -174,26 +204,33 @@ def _replay_scenario(state: Mapping[str, Any], orders: list[Any], graph: dict[st
                     if pallet and math.isclose(_quantity(pallet.get("remaining_boxes")), amount + _quantity(consumed_lot.get("qty_boxes")), abs_tol=1e-9):
                         pallet["remaining_boxes"] = _quantity(consumed_lot.get("qty_boxes"))
                         if not pallet["remaining_boxes"]:
-                            pallet.update(physical_status="depleted", location_status="unassigned",
-                                          position_id=None, cell_key=None)
+                            release(consumed_lot, pallet)
                     to_consume -= amount
                     if to_consume <= 0: break
                 remaining -= picked; total_picked += picked; picker_distance += leg_distance
                 node = access[cell]; legs.append({"from_node_id": current_node, "to_node_id": node, "from_kind": "gate" if current_node == gate_node else "pick", "to_kind": "pick", "distance_m": leg_distance, "path_node_ids": selected["path_node_ids"], "path_edge_ids": selected["path_edge_ids"]}); current_node = node
                 event = {"demand_key": demand.get("demand_key"), "sku_key": sku, "cell_key": cell, "access_node_id": node, "picked_boxes": _display(picked), "remaining_demand_boxes": _display(remaining)}
                 events.append(event); picks.append(event)
-            demand_results.append({"demand_key": demand.get("demand_key"), "sku_key": sku, "requested_boxes": _display(requested), "picked_boxes": _display(requested-remaining), "shortage_boxes": _display(remaining), "split": len(picks)>1, "pick_events": picks})
+            demand_results.append({"demand_key": demand.get("demand_key"), "sku_key": sku, "requested_boxes": _display(requested), "picked_boxes": _display(requested-remaining), "shortage_boxes": _display(remaining), "split": len(picks)>1, "source_location_cell_count": len(source_cells), "pick_source_location_authoritative": len(source_cells) == 1, "pick_events": picks})
         if events:
             back = path(current_node, gate_node)
             if back.get("reachable"):
                 d = float(back["distance_m"]); picker_distance += d; legs.append({"from_node_id": current_node, "to_node_id": gate_node, "from_kind": "pick", "to_kind": "gate", "distance_m": d, "path_node_ids": back["path_node_ids"], "path_edge_ids": back["path_edge_ids"]})
             else: valid = False
         requested_total = sum(float(x["requested_boxes"]) for x in demand_results); picked_total = sum(float(x["picked_boxes"]) for x in demand_results); shortage = requested_total-picked_total
-        results.append({"order_key": order.get("order_key"), "outbound_order_number": order.get("outbound_order_number"), "created_at": order.get("created_at"), "requested_boxes": _display(requested_total), "picked_boxes": _display(picked_total), "shortage_boxes": _display(shortage), "route_distance_m": round(picker_distance,6) if valid else None, "picker_distance_m": round(picker_distance,6) if valid else None, "demands": demand_results, "pick_events": events, "route_legs": legs, "returned_to_gate": bool(valid and (not events or legs[-1]["to_kind"]=="gate")), "status": "invalid_route" if not valid else "fulfilled" if not shortage else "partial" if picked_total else "shortage"})
+        diagnostics["source_location_ambiguous_orders"] += order_ambiguous
+        results.append({"order_key": order.get("order_key"), "outbound_order_number": order.get("outbound_order_number"), "created_at": order.get("created_at"), "requested_boxes": _display(requested_total), "picked_boxes": _display(picked_total), "shortage_boxes": _display(shortage), "route_distance_m": round(picker_distance,6) if valid else None, "picker_distance_m": round(picker_distance,6) if valid else None, "demands": demand_results, "pick_events": events, "route_legs": legs, "source_location_ambiguous": order_ambiguous, "route_sequence_authoritative": True, "pick_source_location_authoritative": not order_ambiguous, "returned_to_gate": bool(valid and (not events or legs[-1]["to_kind"]=="gate")), "status": "invalid_route" if not valid else "fulfilled" if not shortage else "partial" if picked_total else "shortage"})
+        if working.get("simulation_state_version"):
+            working.setdefault("stock_conservation", {})["cumulative_picked_boxes"] = int(total_picked)
+            refreshed = refresh_simulation_state(model, working)
+            validation = validate_simulation_state(refreshed, model)
+            diagnostics["post_ro_validation"].append({"order_key": order.get("order_key"), **validation})
     final = sum(_quantity(l.get("qty_boxes")) for l in usable)
     picker_total = round(sum(float(o["picker_distance_m"] or 0) for o in results), 6); replenishment_total = round(replenishment_distance, 6)
+    if working.get("simulation_state_version"):
+        working = refresh_simulation_state(model, working)
     scenario = {"simulation_state_id": state.get("simulation_state_id"), "orders": results, "replenishment_events": replenishment_events,
-                "working_state": working, "summary": {"orders": len(results), "initial_boxes": _display(initial), "picked_boxes": _display(total_picked), "final_boxes": _display(final), "route_distance_m": picker_total, "picker_distance_m": picker_total, "replenishment_distance_m": replenishment_total, "total_movement_distance_m": round(picker_total+replenishment_total,6), "replenishment_event_count": len(replenishment_events), "replenishment_fallback_count": len(diagnostics["replenishment_fallbacks"]), "replenishment_modeled_coverage_percent": 100.0 * len(replenishment_events)/(len(replenishment_events)+len(diagnostics["replenishment_fallbacks"])) if replenishment_events or diagnostics["replenishment_fallbacks"] else 100.0, "conservation_valid": math.isclose(initial-total_picked,final,abs_tol=1e-9)}}
+                "working_state": working, "summary": {"orders": len(results), "initial_boxes": _display(initial), "picked_boxes": _display(total_picked), "final_boxes": _display(final), "route_distance_m": picker_total, "picker_distance_m": picker_total, "replenishment_distance_m": replenishment_total, "total_movement_distance_m": round(picker_total+replenishment_total,6), "replenishment_event_count": len(replenishment_events), "replenishment_fallback_count": len(diagnostics["replenishment_fallbacks"]), "replenishment_modeled_coverage_percent": 100.0 * len(replenishment_events)/(len(replenishment_events)+len(diagnostics["replenishment_fallbacks"])) if replenishment_events or diagnostics["replenishment_fallbacks"] else 100.0, "source_location_ambiguous_orders": diagnostics["source_location_ambiguous_orders"], "source_location_ambiguous_boxes": _display(float(diagnostics["source_location_ambiguous_boxes"])), "post_replay_state_valid": all(item["valid"] for item in diagnostics["post_ro_validation"]), "conservation_valid": math.isclose(initial-total_picked,final,abs_tol=1e-9)}}
     diagnostics["unknown_location_boxes"] = _display(float(diagnostics["unknown_location_boxes"])); diagnostics["unmapped_cell_boxes"] = _display(float(diagnostics["unmapped_cell_boxes"]))
     return scenario, diagnostics
 

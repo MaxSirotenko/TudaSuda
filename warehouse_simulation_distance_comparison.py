@@ -10,7 +10,7 @@ from statistics import median
 from typing import Any
 
 DISTANCE_TOLERANCE_M = 0.000001
-COMPARISON_VERSION = 1
+COMPARISON_VERSION = 2
 
 
 def _canonical(value: Any) -> str:
@@ -105,8 +105,8 @@ def compare_simulation_outbound_replay(
     metrics.update({
         "current_picker_distance_m": current_total,
         "proposed_picker_distance_m": proposed_total,
-        "picker_distance_saved_m": saved_total,
-        "picker_distance_saved_percent": saved_total / current_total * 100 if current_total else 0.0,
+        "picker_distance_saved_m": saved_total if full_day_valid else None,
+        "picker_distance_saved_percent": saved_total / current_total * 100 if full_day_valid and current_total else None,
         "proposed_replenishment_distance_m": replenishment_distance,
         "current_total_movement_distance_m": current_movement,
         "proposed_total_movement_distance_m": proposed_movement,
@@ -124,6 +124,37 @@ def compare_simulation_outbound_replay(
     raw_proposed = sum(float(o.get("route_distance_m") or 0) for o in proposed_orders)
     identity = {"version": COMPARISON_VERSION, "replay_id": replay_state.get("simulation_outbound_replay_id"),
                 "metrics": metrics, "coverage": coverage, "orders": rows}
+    current_requested = sum(float(o.get("requested_boxes") or 0) for o in current_orders)
+    proposed_requested = sum(float(o.get("requested_boxes") or 0) for o in proposed_orders)
+    current_picked = sum(float(o.get("picked_boxes") or 0) for o in current_orders)
+    proposed_picked = sum(float(o.get("picked_boxes") or 0) for o in proposed_orders)
+    current_shortage = sum(float(o.get("shortage_boxes") or 0) for o in current_orders)
+    proposed_shortage = sum(float(o.get("shortage_boxes") or 0) for o in proposed_orders)
+    ambiguous_orders = sum(bool(o.get("source_location_ambiguous")) for o in current_orders)
+    valid_current_values = [float(o["route_distance_m"]) for o in current_orders if _valid_distance(o)]
+    valid_proposed_values = [float(o["route_distance_m"]) for o in proposed_orders if _valid_distance(o)]
+    authoritative_summary = {
+        "benchmark_status": "ready" if full_day_valid else "blocked",
+        "full_day_effect_valid": full_day_valid, "orders_total": total,
+        "strict_comparable_orders": count, "requested_boxes": current_requested,
+        "current_picked_boxes": current_picked, "proposed_picked_boxes": proposed_picked,
+        "current_shortage_boxes": current_shortage, "proposed_shortage_boxes": proposed_shortage,
+        "current_picker_distance_m": raw_current, "proposed_picker_distance_m": raw_proposed,
+        "picker_distance_saved_m": raw_current - raw_proposed if full_day_valid else None,
+        "picker_distance_saved_percent": ((raw_current - raw_proposed) / raw_current * 100
+                                            if full_day_valid and raw_current > 0 else None),
+        "current_avg_distance_per_ro": raw_current / total if total else None,
+        "proposed_avg_distance_per_ro": raw_proposed / len(proposed_orders) if proposed_orders else None,
+        "current_median_distance_per_ro": median(valid_current_values) if valid_current_values else None,
+        "proposed_median_distance_per_ro": median(valid_proposed_values) if valid_proposed_values else None,
+        "improved_orders": improved, "worsened_orders": worsened, "equal_orders": equal,
+        "source_location_ambiguous_orders": ambiguous_orders,
+        "source_location_ambiguity_coverage_percent": (100.0 * (total - ambiguous_orders) / total if total else 100.0),
+        "proposed_replenishment_distance_m": replenishment_distance,
+        "proposed_total_movement_distance_m": proposed_movement,
+        "service_equivalent": (current_requested == proposed_requested and current_picked == proposed_picked
+                               and current_shortage == proposed_shortage),
+    }
     comparison = {"simulation_distance_comparison_version": COMPARISON_VERSION,
                   "simulation_distance_comparison_id": _hash(identity), **identity,
                   "operational_date": _operational_date(current_orders), "summary": metrics,
@@ -132,5 +163,7 @@ def compare_simulation_outbound_replay(
                                   "raw_distance_difference_m": raw_current - raw_proposed,
                                   "raw_distance_difference_is_business_effect": count == total},
                   "full_day_effect_valid": full_day_valid,
+                  "benchmark_status": authoritative_summary["benchmark_status"],
+                  "authoritative_summary": authoritative_summary,
                   "scope": "full_day" if full_day_valid else "comparable_orders_only"}
     return comparison, {"configuration_errors": [], "unmatched_proposed_orders": len(proposed_orders) - sum(o.get("order_key") in proposed_by_key for o in current_orders)}

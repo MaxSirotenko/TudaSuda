@@ -1,3 +1,4 @@
+from pathlib import Path
 from unittest.mock import patch
 
 import warehouse_outbound_experiment_ui as ui
@@ -15,22 +16,11 @@ def test_stale_result_detection():
     assert not ui.experiment_result_is_stale("new", None)
 
 
-def test_pipeline_is_not_called_when_inputs_are_not_ready():
-    with patch.object(ui, "build_outbound_experiment_inputs", return_value=({"pipeline_inputs_ready": False}, {})), \
-         patch.object(ui, "run_outbound_distance_experiment") as pipeline:
-        result = ui.calculate_outbound_experiment({}, {}, {}, {}, [], [], [], {})
-    pipeline.assert_not_called()
-    assert result[2:] == (None, None)
-
-
-def test_pipeline_receives_exact_builder_pipeline_inputs():
-    arguments = {"model": {"model_id": "m"}, "gate_state": {"gates": []}}
-    with patch.object(ui, "build_outbound_experiment_inputs",
-                      return_value=({"pipeline_inputs_ready": True, "pipeline_inputs": arguments}, {"input": 1})), \
-         patch.object(ui, "run_outbound_distance_experiment", return_value=({"execution_status": "completed"}, {"pipeline": 1})) as pipeline:
-        result = ui.calculate_outbound_experiment({}, {}, {}, {}, [], [], [], {})
-    pipeline.assert_called_once_with(**arguments)
-    assert result[2]["execution_status"] == "completed"
+def test_active_ui_has_no_legacy_business_metric_pipeline():
+    source = Path(ui.__file__).read_text(encoding="utf-8")
+    assert "run_outbound_distance_experiment" not in source
+    assert "Рассчитать эксперимент" not in source
+    assert "render_scenario_comparison(" in source
 
 
 def test_missing_slotting_does_not_block_otherwise_ready_inputs():

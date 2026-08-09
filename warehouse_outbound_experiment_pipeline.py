@@ -1,4 +1,8 @@
-"""Pure orchestration for the outbound CURRENT versus PROPOSED experiment."""
+"""Deprecated legacy receipt-timeline experiment orchestration.
+
+Retained for historical diagnostics/tests only. Active headline metrics use
+``warehouse_day_benchmark`` and the SimulationState replay stack.
+"""
 
 from __future__ import annotations
 

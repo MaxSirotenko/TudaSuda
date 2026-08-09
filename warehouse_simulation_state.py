@@ -471,8 +471,11 @@ def validate_simulation_state(state: Mapping[str, Any], model: Mapping[str, Any]
     for lot in lots:
         if not str(lot.get("sku_key", "")).startswith("sku:v2:") or canonical_sku_key(lot) != lot.get("sku_key"):
             error("invalid_sku_identity", stock_lot_id=lot.get("stock_lot_id"))
-        quantity, quantity_error = validate_box_quantity(lot.get("qty_boxes"), positive=True)
-        if quantity_error:
+        quantity, quantity_error = validate_box_quantity(lot.get("qty_boxes"))
+        linked_depleted_provenance = (quantity == 0 and lot.get("pallet_unit_id") and
+                                      lot.get("location_status") == "unassigned" and
+                                      lot.get("position_id") is None and lot.get("cell_key") is None)
+        if quantity_error or quantity == 0 and not linked_depleted_provenance:
             error("invalid_box_quantity", stock_lot_id=lot.get("stock_lot_id"))
         if normalize_unit_name(lot.get("unit_name")) != CANONICAL_BOX_UNIT or lot.get("unit_name") != CANONICAL_BOX_UNIT:
             error("unsupported_unit", stock_lot_id=lot.get("stock_lot_id"))
