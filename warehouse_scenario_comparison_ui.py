@@ -26,6 +26,7 @@ from warehouse_pick_demands import build_outbound_pick_demands
 from warehouse_placement_zones import is_assignable_placement_zone, normalize_placement_zone
 from warehouse_proposed_scenario import build_proposed_scenario
 from warehouse_sku_velocity import build_sku_velocity_profile
+from warehouse_sku_adjacency import build_sku_adjacency_profile
 from warehouse_simulation_distance_comparison import compare_simulation_outbound_replay
 from warehouse_simulation_outbound_replay import replay_outbound_on_simulation_states
 from warehouse_simulation_render import build_simulation_dynamic_payload
@@ -50,7 +51,8 @@ def _canonical(value: Any) -> Any:
 def build_comparison_signature(
     *, model_id: Any, baseline_state_id: Any, operational_date: Any,
     normalized_warehouse: Any, sku_zone_rows: Sequence[Mapping[str, Any]],
-    rule_config: Mapping[str, Any], velocity_profile_id: Any = None, gate_identity: Any = None,
+    rule_config: Mapping[str, Any], velocity_profile_id: Any = None, adjacency_profile_id: Any = None,
+    gate_identity: Any = None,
 ) -> str:
     """Fingerprint business inputs without depending on translated UI labels."""
     identity = {
@@ -64,6 +66,7 @@ def build_comparison_signature(
         ),
         "rule_config": _canonical(rule_config),
         "velocity_profile_id": velocity_profile_id,
+        "adjacency_profile_id": adjacency_profile_id,
         "gate_identity": _canonical(gate_identity),
     }
     payload = json.dumps(identity, ensure_ascii=False, sort_keys=True,
@@ -73,13 +76,15 @@ def build_comparison_signature(
 
 def build_weight_zone_rule_config(enabled: bool) -> dict[str, dict[str, bool]]:
     """Backward-compatible adapter for callers that expose only weight zones."""
-    return build_scenario_rule_config(weight_zones_enabled=enabled, velocity_enabled=False)
+    return build_scenario_rule_config(weight_zones_enabled=enabled, velocity_enabled=False, adjacency_enabled=False)
 
 
-def build_scenario_rule_config(*, weight_zones_enabled: bool, velocity_enabled: bool) -> dict[str, dict[str, bool]]:
+def build_scenario_rule_config(*, weight_zones_enabled: bool, velocity_enabled: bool,
+                               adjacency_enabled: bool = False) -> dict[str, dict[str, bool]]:
     """Translate the supported UI toggles into the backend rule contract."""
     return {"weight_zones": {"enabled": bool(weight_zones_enabled)},
-            "velocity": {"enabled": bool(velocity_enabled)}}
+            "velocity": {"enabled": bool(velocity_enabled)},
+            "adjacency": {"enabled": bool(adjacency_enabled)}}
 
 
 def build_sku_zone_rows(classification_rows: Sequence[Mapping[str, Any]] | None) -> list[dict[str, str]]:
@@ -234,6 +239,7 @@ def render_scenario_comparison(
     start_state: dict[str, Any] | None, opening_rows: list[dict[str, Any]],
     classification_rows: Sequence[Mapping[str, Any]] | None,
     outbound_rows: Sequence[Mapping[str, Any]] | None = None,
+    adjacency_rows: list[dict[str, Any]] | None = None,
     gate_state: dict[str, Any] | None = None,
 ) -> None:
     """Render the independent placement preview before the outbound replay UI."""
@@ -264,7 +270,12 @@ def render_scenario_comparison(
     st.markdown("### Правила PROPOSED")
     weight_zones = st.checkbox("Весовые зоны", key=f"{SESSION_PREFIX}_weight_zones")
     velocity_enabled = st.checkbox("Оборачиваемость / частота отбора", key=f"{SESSION_PREFIX}_velocity")
-    rule_config = build_scenario_rule_config(weight_zones_enabled=weight_zones, velocity_enabled=velocity_enabled)
+    adjacency_enabled = st.checkbox("Товарное соседство", key=f"{SESSION_PREFIX}_adjacency")
+    rule_config = build_scenario_rule_config(weight_zones_enabled=weight_zones, velocity_enabled=velocity_enabled,
+                                             adjacency_enabled=adjacency_enabled)
+    adjacency_profile, adjacency_diagnostics = build_sku_adjacency_profile(adjacency_rows)
+    if adjacency_enabled and not adjacency_rows:
+        st.caption("Связанные товарные группы не загружены — используется только компактное размещение одинаковых SKU.")
     velocity_profile = None
     velocity_diagnostics: dict[str, Any] = {"valid": True, "errors": [], "warnings": []}
     if velocity_enabled:
@@ -287,12 +298,14 @@ def render_scenario_comparison(
         operational_date=operational_date, normalized_warehouse=target,
         sku_zone_rows=sku_zone_rows, rule_config=rule_config,
         velocity_profile_id=velocity_profile.get("velocity_profile_id") if velocity_profile else None,
+        adjacency_profile_id=adjacency_profile.get("adjacency_profile_id") if adjacency_enabled else None,
         gate_identity=gate_state if velocity_enabled else None,
     )
     if st.button("Пересчитать PROPOSED", type="primary", key=f"{SESSION_PREFIX}_calculate"):
         scenario, diagnostics = build_proposed_scenario(
             model, baseline, rule_config, sku_zone_rows=sku_zone_rows,
             sku_velocity_rows=velocity_profile.get("rows", []) if velocity_profile else None,
+            sku_adjacency_rows=adjacency_rows,
             gate_state=gate_state,
         )
         st.session_state[f"{SESSION_PREFIX}_baseline"] = baseline
@@ -338,9 +351,17 @@ def render_scenario_comparison(
             components.html(proposed_html, height=MAP_HEIGHT, scrolling=True)
 
     if scenario and scenario.get("status") in {"ready", "partial"}:
-        if not weight_zones and not velocity_enabled:
+        if not weight_zones and not velocity_enabled and not adjacency_enabled:
             st.info("Правила оптимизации выключены — PROPOSED совпадает с CURRENT.")
         _show_metrics(summarize_scenario_ui_metrics(scenario, baseline, sku_zone_rows))
+        if adjacency_enabled:
+            summary = scenario.get("summary", {})
+            st.caption(f"SKU с несколькими размещениями: {summary.get('multi_unit_skus', 0)} · "
+                       f"Explicit adjacency groups: {summary.get('adjacency_groups_total', 0)} · "
+                       f"Фрагментов одинаковых SKU: до {summary.get('same_sku_fragments_before', 0)}, "
+                       f"после {summary.get('same_sku_fragments_after', 0)} · "
+                       f"Фрагментов групп: до {summary.get('adjacency_group_fragments_before', 0)}, "
+                       f"после {summary.get('adjacency_group_fragments_after', 0)}")
         if scenario.get("status") == "partial":
             summary = scenario.get("summary", {})
             st.warning(f"Неразрешено: {summary.get('unresolved_units', 0)} · "

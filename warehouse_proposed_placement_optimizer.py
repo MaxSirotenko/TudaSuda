@@ -24,8 +24,8 @@ from warehouse_placement_zones import (
 )
 from warehouse_physical_graph import build_physical_warehouse_graph, find_shortest_path
 
-PROPOSED_PLACEMENT_PLAN_VERSION = 2
-_SUPPORTED_RULES = frozenset({"weight_zones", "velocity"})
+PROPOSED_PLACEMENT_PLAN_VERSION = 3
+_SUPPORTED_RULES = frozenset({"weight_zones", "velocity", "adjacency"})
 
 
 def _canonical_json(value: Any) -> str:
@@ -123,6 +123,8 @@ def _plan_identity(plan: Mapping[str, Any]) -> dict[str, Any]:
         "placement_rule_set_id": plan.get("placement_rule_set_id"),
         "sku_zone_assignments": plan.get("sku_zone_assignments", []),
         "sku_velocity_assignments": plan.get("sku_velocity_assignments", []),
+        "adjacency_profile_id": plan.get("adjacency_profile_id"),
+        "sku_adjacency_assignments": plan.get("sku_adjacency_assignments", []),
         "gate_identity": plan.get("gate_identity"),
         "status": plan.get("status"),
         "blocked_reasons": [
@@ -255,13 +257,23 @@ def _base_plan(model: Mapping[str, Any], state: Mapping[str, Any], rules: Mappin
 def build_proposed_placement_plan(
     model: dict[str, Any], baseline_state: dict[str, Any], placement_rule_set: dict[str, Any],
     sku_zone_rows: list[dict[str, Any]], *, sku_velocity_rows: list[dict[str, Any]] | None = None,
+    adjacency_profile: dict[str, Any] | None = None,
     gate_state: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Build a deterministic target layout exclusively from the given baseline."""
     rule_validation = validate_placement_rule_set(placement_rule_set)
     assignments, mapping_errors = _canonical_sku_zones(sku_zone_rows)
     velocities, velocity_errors = _canonical_velocity(sku_velocity_rows)
-    errors = list(rule_validation.get("errors", [])) + mapping_errors + velocity_errors
+    adjacency_rows = adjacency_profile.get("rows", []) if isinstance(adjacency_profile, Mapping) else []
+    adjacency = {_text(row.get("sku_key")): _text(row.get("adjacency_group"))
+                 for row in adjacency_rows if isinstance(row, Mapping) and _text(row.get("sku_key"))}
+    adjacency_errors = []
+    if adjacency_profile is not None and (not isinstance(adjacency_profile, Mapping)
+                                          or not adjacency_profile.get("adjacency_profile_id")):
+        adjacency_errors.append({"code": "invalid_adjacency_profile"})
+    if isinstance(adjacency_profile, Mapping):
+        adjacency_errors.extend(adjacency_profile.get("validation_errors", []) or [])
+    errors = list(rule_validation.get("errors", [])) + mapping_errors + velocity_errors + adjacency_errors
     rules_id = None
     if rule_validation.get("valid"):
         rules_id = compute_placement_rule_set_id(placement_rule_set)
@@ -272,6 +284,9 @@ def build_proposed_placement_plan(
     rules_copy["placement_rule_set_id"] = rules_id or rules_copy.get("placement_rule_set_id")
     plan = _base_plan(model, baseline_state, rules_copy, assignments)
     plan["sku_velocity_assignments"] = list(velocities.values())
+    plan["adjacency_profile_id"] = adjacency_profile.get("adjacency_profile_id") if isinstance(adjacency_profile, Mapping) else None
+    plan["sku_adjacency_assignments"] = [{"sku_key": sku, "adjacency_group": group}
+                                          for sku, group in sorted(adjacency.items())]
     plan["gate_identity"] = None
 
     enabled = get_enabled_rule_ids(placement_rule_set) if rule_validation.get("valid") else []
@@ -295,6 +310,7 @@ def build_proposed_placement_plan(
     occupancy_by_cell = {row.get("cell_key"): row for row in baseline_state.get("cell_occupancy", []) or []}
     weight_enabled = "weight_zones" in enabled
     velocity_enabled = "velocity" in enabled
+    adjacency_enabled = "adjacency" in enabled
     distances: dict[str, float] = {}
     if velocity_enabled:
         graph, graph_diagnostics = build_physical_warehouse_graph(model, gate_state)
@@ -315,7 +331,7 @@ def build_proposed_placement_plan(
     kept: list[tuple[dict[str, Any], str]] = []
     identity_units: list[dict[str, Any]] = []
 
-    if not weight_enabled and not velocity_enabled:
+    if not weight_enabled and not velocity_enabled and not adjacency_enabled:
         identity_units = units
     else:
         for unit in units:
@@ -325,7 +341,8 @@ def build_proposed_placement_plan(
             storage = _text(cell.get("storage_type") or cell.get("row_storage_type") or "normal")
             reason = None
             if storage == "deep_lane" or cell.get("capacity_pallets", 1) != 1:
-                reason = "deep_lane_optimization_not_enabled"
+                reason = ("deep_lane_adjacency_optimization_not_implemented" if adjacency_enabled
+                          else "deep_lane_optimization_not_enabled")
             elif position.get("status") == "unknown":
                 reason = "unknown_position_status"
             elif occupancy.get("occupancy_conflict"):
@@ -346,7 +363,7 @@ def build_proposed_placement_plan(
                 identity_units.append(unit)
                 continue
             target_zone = assignments[unit["sku_key"]] if weight_enabled else normalize_placement_zone(cell.get("weight_zone"))
-            if not velocity_enabled and normalize_placement_zone(cell.get("weight_zone")) == target_zone:
+            if not velocity_enabled and not adjacency_enabled and normalize_placement_zone(cell.get("weight_zone")) == target_zone:
                 kept.append((unit, target_zone))
             else:
                 applicable.append((unit, target_zone))
@@ -403,22 +420,49 @@ def build_proposed_placement_plan(
         for unit, _ in kept:
             placements.append(_placement_row(unit, positions[unit["origin_position_id"]], cells))
         zone_rank = {zone: index for index, zone in enumerate(DEFAULT_PLACEMENT_ZONE_ORDER)}
+        origin_order = {unit["placement_unit_id"]: _position_key(
+            positions.get(unit.get("origin_position_id"), {}), cells) for unit, _ in applicable}
+        sku_first = {}
+        group_first = {}
+        for unit, zone in applicable:
+            sku = _text(unit.get("sku_key"))
+            key = (zone, velocities.get(sku, {}).get("velocity_rank") or 7)
+            order = origin_order[unit["placement_unit_id"]]
+            sku_first[(key, sku)] = min(sku_first.get((key, sku), order), order)
+            group = adjacency.get(sku, "")
+            if group:
+                group_first[(key, group)] = min(group_first.get((key, group), order), order)
+
+        def adjacency_key(item: tuple[dict[str, Any], str]) -> tuple[Any, ...]:
+            sku = _text(item[0].get("sku_key"))
+            group = adjacency.get(sku, "") if adjacency_enabled else ""
+            bucket = (item[1], velocities.get(sku, {}).get("velocity_rank") or 7)
+            # Explicit groups make SKU blocks neighbours; the SKU key keeps each block compact.
+            return ((0, group_first[(bucket, group)], sku_first[(bucket, sku)], sku)
+                    if group else (1, sku_first.get((bucket, sku), ()), sku))
         ordered = sorted(applicable, key=lambda item: (zone_rank[item[1]],
                          velocities.get(_text(item[0].get("sku_key")), {}).get("velocity_rank") or 7,
-                         _text(item[0].get("sku_key")), _text(item[0].get("placement_unit_id"))))
-        offsets: Counter[str] = Counter()
+                         adjacency_key(item),
+                         origin_order.get(item[0]["placement_unit_id"], ()),
+                         _text(item[0].get("placement_unit_id"))))
         ranked = [(unit, zone) for unit, zone in ordered if velocities.get(_text(unit.get("sku_key")), {}).get("velocity_rank")]
         unranked = [(unit, zone) for unit, zone in ordered if not velocities.get(_text(unit.get("sku_key")), {}).get("velocity_rank")]
         remaining = {zone: list(values) for zone, values in available.items()}
         for unit, zone in ranked:
             target = remaining[zone].pop(0)
-            placements.append(_placement_row(unit, target, cells, velocities.get(_text(unit.get("sku_key"))), distances))
+            row = _placement_row(unit, target, cells, velocities.get(_text(unit.get("sku_key"))), distances)
+            if adjacency_enabled:
+                row["adjacency_group"] = adjacency.get(_text(unit.get("sku_key")), "")
+            placements.append(row)
         for unit, zone in unranked:
-            origin = next((p for p in remaining[zone] if p.get("position_id") == unit.get("origin_position_id")), None)
+            origin = None if adjacency_enabled else next((p for p in remaining[zone] if p.get("position_id") == unit.get("origin_position_id")), None)
             target = origin or remaining[zone][0]
             remaining[zone].remove(target)
-            placements.append(_placement_row(unit, target, cells, velocities.get(_text(unit.get("sku_key")),
-                                                                                  {"velocity_rank": None, "velocity_class": "no_history"}), distances))
+            velocity = velocities.get(_text(unit.get("sku_key")), {"velocity_rank": None, "velocity_class": "no_history"})
+            row = _placement_row(unit, target, cells, velocity if velocity_enabled else None, distances)
+            if adjacency_enabled:
+                row["adjacency_group"] = adjacency.get(_text(unit.get("sku_key")), "")
+            placements.append(row)
         plan["status"] = "partial" if unresolved or fixed else "ready"
 
     placements.sort(key=lambda row: _text(row["placement_unit_id"]))
@@ -433,6 +477,43 @@ def build_proposed_placement_plan(
                 for unit, zone in valid_assignment_units)
     moved = sum(row["moved"] for row in placements)
     denominator = len(valid_assignment_units)
+    ordered_by_zone: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    for position in positions.values():
+        zone = normalize_placement_zone(cells.get(position.get("cell_key"), {}).get("weight_zone"))
+        if zone in ASSIGNABLE_PLACEMENT_ZONE_IDS:
+            ordered_by_zone[zone].append(position)
+    physical_rank = {}
+    for zone, zone_positions in ordered_by_zone.items():
+        for index, position in enumerate(sorted(zone_positions, key=lambda p: _position_key(p, cells))):
+            physical_rank[position.get("position_id")] = (zone, index)
+
+    def fragments(rows: list[dict[str, Any]], position_key: str, grouping: str) -> int:
+        grouped: dict[str, list[tuple[str, int]]] = defaultdict(list)
+        for row in rows:
+            group = row.get(grouping)
+            rank = physical_rank.get(row.get(position_key))
+            if group and rank:
+                grouped[str(group)].append(rank)
+        total = 0
+        for ranks in grouped.values():
+            ordered_ranks = sorted(ranks)
+            total += sum(index == 0 or rank[0] != ordered_ranks[index - 1][0]
+                         or rank[1] != ordered_ranks[index - 1][1] + 1
+                         for index, rank in enumerate(ordered_ranks))
+        return total
+
+    movable_ids = {unit["placement_unit_id"] for unit, _ in applicable + kept}
+    adjacency_rows_for_metrics = [row for row in placements if row["placement_unit_id"] in movable_ids]
+    for row in adjacency_rows_for_metrics:
+        row.setdefault("adjacency_group", adjacency.get(_text(row.get("sku_key")), ""))
+    sku_counts = Counter(row["sku_key"] for row in adjacency_rows_for_metrics)
+    multi_unit_skus = {sku for sku, count in sku_counts.items() if count > 1}
+    sku_metric_rows = [row for row in adjacency_rows_for_metrics if row["sku_key"] in multi_unit_skus]
+    same_before = fragments(sku_metric_rows, "origin_position_id", "sku_key")
+    same_after = fragments(sku_metric_rows, "target_position_id", "sku_key")
+    group_metric_rows = [row for row in adjacency_rows_for_metrics if row.get("adjacency_group")]
+    group_before = fragments(group_metric_rows, "origin_position_id", "adjacency_group")
+    group_after = fragments(group_metric_rows, "target_position_id", "adjacency_group")
     plan["summary"] = {
         "placement_units_total": len(units), "movable_units": len(applicable) + len(kept),
         "fixed_units": len(fixed), "unresolved_units": len(unresolved),
@@ -445,6 +526,15 @@ def build_proposed_placement_plan(
         "weight_zone_compliance_before_percent": 100.0 * before / denominator if denominator else 100.0,
         "weight_zone_compliance_after_percent": 100.0 * after / denominator if denominator else 100.0,
         "weight_zone_compliance_complete": weight_enabled and not unresolved and not any(shortages.values()) and after == denominator,
+        "adjacency_enabled": adjacency_enabled,
+        "adjacency_profile_skus": len(adjacency),
+        "adjacency_groups_total": len({group for group in adjacency.values() if group}),
+        "multi_unit_skus": len(multi_unit_skus),
+        "same_sku_fragments_before": same_before, "same_sku_fragments_after": same_after,
+        "adjacency_group_fragments_before": group_before, "adjacency_group_fragments_after": group_after,
+        "same_sku_fragment_reduction": same_before - same_after,
+        "adjacency_group_fragment_reduction": group_before - group_after,
+        "adjacency_units_moved": sum(bool(row["moved"]) for row in adjacency_rows_for_metrics) if adjacency_enabled else 0,
     }
     velocity_rows = [row for row in placements if "velocity_rank" in row]
     ranked_rows = [row for row in velocity_rows if row.get("velocity_rank") is not None]
@@ -466,6 +556,11 @@ def build_proposed_placement_plan(
         plan["limitations"] = [item for item in plan["limitations"] if item != "weight_zones_only"]
         plan["limitations"].extend(["velocity_priority_uses_gate_distance_not_global_route_optimization",
                                     "deep_lane_velocity_optimization_not_implemented"])
+    if adjacency_enabled:
+        plan["limitations"] = [item for item in plan["limitations"] if item != "weight_zones_only"]
+        plan["limitations"].extend(["physical_order_contiguity_v1", "cross_rank_adjacency_not_optimized_v1",
+                                    "deep_lane_adjacency_optimization_not_implemented",
+                                    "explicit_adjacency_groups_only_no_fuzzy_matching"])
     plan["proposed_placement_plan_id"] = compute_proposed_placement_plan_id(plan)
     validation = validate_proposed_placement_plan(plan, model, baseline_state, placement_rule_set, sku_zone_rows)
     return plan, validation

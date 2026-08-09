@@ -127,13 +127,13 @@ def test_exact_pallet_is_one_unit_not_duplicated_by_linked_lot():
     assert plan["placements"][0]["unit_type"] == "pallet"
 
 
-def test_conflicting_mapping_and_unsupported_rule_are_blocking():
+def test_conflicting_mapping_is_blocking_and_adjacency_is_supported():
     model, state = fixture([("P1", "heavy", "A")])
     conflict, diagnostics = build_proposed_placement_plan(model, state, rules(True), zones(("A", "heavy"), ("A", "light")))
     assert conflict["status"] == "blocked"
     assert diagnostics["errors"][0]["code"] == "conflicting_sku_zone_assignment"
-    unsupported, _ = build_proposed_placement_plan(model, state, rules(True, adjacency=True), zones(("A", "heavy")))
-    assert {row["code"] for row in unsupported["blocked_reasons"]} == {"unsupported_enabled_rule"}
+    supported, supported_diagnostics = build_proposed_placement_plan(model, state, rules(True, adjacency=True), zones(("A", "heavy")))
+    assert supported_diagnostics["valid"] and supported["status"] == "ready"
 
 
 def test_permutations_have_same_plan_and_identity_and_api_has_no_previous_plan():
@@ -204,3 +204,22 @@ def test_velocity_requires_gate_and_profile_and_does_not_invent_missing_rank():
         model, state, rules(velocity=True), [], sku_velocity_rows=velocity[:1], gate_state=gate)
     cold = next(row for row in partial["placements"] if row["sku_key"] == "COLD")
     assert cold["velocity_rank"] is None
+
+
+def test_adjacency_compacts_same_sku_without_explicit_profile():
+    model, state = fixture([("P1", "heavy", "A"), ("P2", "heavy", "B"), ("P3", "heavy", "A"), ("P4", "heavy", "C"), ("P5", "heavy", "B"), ("P6", "heavy", "A")])
+    plan, diagnostics = build_proposed_placement_plan(model, state, rules(adjacency=True), [])
+    targets = sorted(int(row["target_position_id"][1:]) for row in plan["placements"] if row["sku_key"] == "A")
+    assert diagnostics["valid"] and targets[-1] - targets[0] == 2
+    assert plan["summary"]["same_sku_fragments_after"] < plan["summary"]["same_sku_fragments_before"]
+
+
+def test_explicit_group_blocks_are_neighbours_and_conflict_blocks_plan():
+    model, state = fixture([("P1", "heavy", "A"), ("P2", "heavy", "X"), ("P3", "heavy", "B"), ("P4", "heavy", "Y")])
+    profile = {"adjacency_profile_id": "sha256:test", "rows": [{"sku_key": "A", "adjacency_group": "dairy"}, {"sku_key": "B", "adjacency_group": "dairy"}], "validation_errors": []}
+    plan, diagnostics = build_proposed_placement_plan(model, state, rules(adjacency=True), [], adjacency_profile=profile)
+    targets = sorted(int(row["target_position_id"][1:]) for row in plan["placements"] if row["sku_key"] in {"A", "B"})
+    assert diagnostics["valid"] and targets[1] == targets[0] + 1
+    bad = dict(profile, validation_errors=[{"code": "conflicting_adjacency_group_assignment", "sku_key": "A"}])
+    blocked, blocked_diagnostics = build_proposed_placement_plan(model, state, rules(adjacency=True), [], adjacency_profile=bad)
+    assert blocked["status"] == "blocked" and not blocked_diagnostics["valid"]
