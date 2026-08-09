@@ -2374,9 +2374,21 @@ def render_unified_row_settings_editor(model: dict) -> dict:
         st.info("Черновик восстановлен из текущей модели.")
         return model
     if apply_submit:
+        from warehouse_workspace_ui import deep_lane_edit_issue
+        raw_edited = _row_settings_from_display(edited_display.rename(columns={value: key for key, value in compact_columns.items()}))
+        incompatible = []
+        for _, row in raw_edited.iterrows():
+            issue = deep_lane_edit_issue(str(row.get("row_storage_type")), row.get("cell_capacity_pallets"), row.get("deep_lane_access_side"))
+            if issue:
+                incompatible.append((row.get("row_number"), issue))
+        if incompatible:
+            row_number, issue = incompatible[0]
+            st.error(f'{issue["title"]}. Ряд {row_number} имеет тип "Обычный ряд". {issue["solution"]}')
+            st.caption("Доступно только для типа \"Набивной ряд\".")
+            return model
         st.session_state[state_key] = submitted_state
         if not changed_row_numbers(submitted_state):
-            st.info("Изменений нет")
+            st.info("Вы ничего не изменили.")
             return model
         edited_rows = submitted_state["draft"]
         with measure_step("apply_row_settings"):

@@ -15,6 +15,8 @@ import streamlit as st
 
 from warehouse_placement_zones import PLACEMENT_ZONE_IDS, get_placement_zone_label, normalize_placement_zone
 from warehouse_scenario_comparison_ui import build_scenario_rule_config
+from warehouse_ui_messages import get_ui_message
+from warehouse_workflow_ui_state import state_from_session
 
 WORKSPACE_TABS = ("Склад", "Данные", "Условия модели", "CURRENT / PROPOSED", "Аналитика")
 SUPPORTED_RULES = (
@@ -38,6 +40,33 @@ LIMITATION_LABELS = {
     "deep_lane_internal_access_distance_not_modeled": "Внутренний пробег в набивном ряду не моделируется.",
     "replenishment_distance_loaded_one_way_only": "Пробег пополнения учитывается только в загруженном направлении.",
 }
+
+STEP_CONTEXT = {
+    "Склад": ("Настраиваем физическую схему, ряды, зоны и Ворота.", "Геометрия определяет доступные места и физический маршрут.", "Сохранённая модель склада для следующих шагов."),
+    "Данные": ("Загружаем фактический START и расходные РО выбранного дня.", "START станет неизменяемым CURRENT, а РО — одинаковым спросом для сравнения.", "Подтверждённое исходное размещение и фактический ПорядокСборки."),
+    "Условия модели": ("Выбираем правила, по которым проект перестроит размещение товара.", "Правила формируют PROPOSED, не изменяя фактический CURRENT.", "Новая раскладка тех же исходных остатков."),
+    "CURRENT / PROPOSED": ("Строим PROPOSED и повторяем одинаковые РО на двух размещениях.", "Так сравнивается пробег сборщика при одинаковом спросе.", "Две карты, CURRENT и PROPOSED метры и экономия."),
+    "Аналитика": ("Изучаем текущий результат сравнения.", "Метрики помогают оценить эффект без подмены фактического CURRENT.", "Сводка пробега, качества и ограничений расчёта."),
+}
+
+
+def deep_lane_edit_issue(row_type: str, width: Any, access_side: Any) -> dict[str, str] | None:
+    """Explain an incompatible row draft instead of silently normalising it."""
+    if row_type == "normal" and (float(width or 1) != 1 or str(access_side or "") not in {"", "Не настроено"}):
+        return get_ui_message("deep_width_on_normal_row" if float(width or 1) != 1 else "deep_access_on_normal_row")
+    return None
+
+
+def render_context_block(step: str) -> None:
+    doing, why, result = STEP_CONTEXT[step]
+    st.markdown(f'<div class="workflow-context"><b>Что делаем</b><br>{doing}<br><b>Зачем</b><br>{why}<br><b>Что получится</b><br>{result}</div>', unsafe_allow_html=True)
+
+
+def render_workflow_stepper(model: Mapping[str, Any] | None, session_state: Mapping[str, Any]) -> None:
+    state = state_from_session(model, session_state)
+    symbols = {"completed": "✓", "current": "●", "available": "○", "blocked": "—", "stale": "↻"}
+    items = "".join(f'<span class="workflow-step {item["status"]}">{item["number"]}. {item["name"]} {symbols[item["status"]]}</span>' for item in state["steps"])
+    st.markdown(f'<div class="workflow-stepper">{items}</div>', unsafe_allow_html=True)
 
 
 def normalize_rule_selection(values: Mapping[str, Any]) -> dict[str, bool]:
@@ -81,10 +110,17 @@ def build_warehouse_zone_summary(model: Mapping[str, Any]) -> list[dict[str, Any
 def render_operational_workspace(model: dict | None, *, warehouse_renderer: Callable,
                                  data_renderer: Callable, rules_renderer: Callable,
                                  comparison_renderer: Callable, analytics_renderer: Callable) -> None:
+    st.markdown("""<style>
+    .stApp {background:#f6f7f9}.workflow-stepper{display:flex;gap:.45rem;flex-wrap:wrap;background:white;border:1px solid #e5e7eb;border-radius:10px;padding:.65rem .8rem;margin-bottom:.8rem}
+    .workflow-step{color:#64748b;padding:.15rem .35rem}.workflow-step.completed{color:#397354}.workflow-step.current{color:#1d4ed8;font-weight:650}.workflow-step.stale{color:#a16207}
+    .workflow-context{background:white;border:1px solid #e5e7eb;border-left:3px solid #94a3b8;border-radius:8px;padding:.7rem .9rem;line-height:1.45;margin:.25rem 0 1rem}
+    </style>""", unsafe_allow_html=True)
+    render_workflow_stepper(model, st.session_state)
     tabs = st.tabs(list(WORKSPACE_TABS))
-    for tab, renderer in zip(tabs, (warehouse_renderer, data_renderer, rules_renderer,
-                                    comparison_renderer, analytics_renderer)):
+    for tab, name, renderer in zip(tabs, WORKSPACE_TABS, (warehouse_renderer, data_renderer, rules_renderer,
+                                          comparison_renderer, analytics_renderer)):
         with tab:
+            render_context_block(name)
             renderer(model)
 
 
@@ -101,7 +137,7 @@ def render_rules_control_panel(model: Mapping[str, Any] | None, session_state: M
             st.caption("Заблокировано: требуется правило «Комплектация / хранение».")
         else:
             st.caption("Готово" if model else "Нет данных")
-    minimum = st.number_input("minimum_positions_per_sku", min_value=1, value=1, step=1,
+    minimum = st.number_input("Минимум позиций комплектации на SKU", min_value=1, value=1, step=1,
                               disabled=not values["base_sku_capacity"])
     config = build_workspace_rule_config(values, minimum)
     # Persist configuration only; rendering never starts a scenario.

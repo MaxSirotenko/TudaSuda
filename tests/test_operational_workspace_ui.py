@@ -1,6 +1,7 @@
 from warehouse_workspace_ui import (
     WORKSPACE_TABS, SUPPORTED_RULES, UNSUPPORTED_RULES, RULE_CARDS,
     build_warehouse_zone_summary, build_workspace_rule_config, normalize_rule_selection,
+    deep_lane_edit_issue,
 )
 
 
@@ -32,3 +33,12 @@ def test_zone_summary_uses_canonical_zone_ids_and_physical_capacity():
     rows = build_warehouse_zone_summary(model)
     assert [row["ID зоны"] for row in rows] == ["heavy", "medium_light", "unassigned"]
     assert rows[1]["Количество ячеек"] == 1 and rows[1]["Deep lane"] == 4
+
+
+def test_normal_row_deep_controls_have_actionable_regression_message():
+    width = deep_lane_edit_issue("normal", 5, "")
+    access = deep_lane_edit_issue("normal", 1, "left")
+    assert "Сначала измените тип ряда" in width["solution"]
+    assert "Изменений нет" not in width["message"]
+    assert "Сначала измените тип ряда" in access["solution"]
+    assert deep_lane_edit_issue("deep_lane", 5, "left") is None
