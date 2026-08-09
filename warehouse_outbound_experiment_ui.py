@@ -29,10 +29,12 @@ from warehouse_outbound_orders import (
     detect_outbound_columns, get_outbound_sheet_names, normalize_outbound_table,
     read_outbound_table,
 )
+from warehouse_placement_zones import get_assignable_placement_zones, get_placement_zone_label
 from warehouse_state_cache import load_outbound_orders_cached, load_receipts_state_cached
+from warehouse_scenario_comparison_ui import render_scenario_comparison
 
 
-ZONE_TO_CODE = {"Тяжёлое": "heavy", "Среднее": "medium", "Лёгкое": "light", "Хрупкое": "fragile"}
+ZONE_TO_CODE = {get_placement_zone_label(zone): zone for zone in get_assignable_placement_zones()}
 CODE_TO_ZONE = {value: key for key, value in ZONE_TO_CODE.items()}
 SESSION_KEYS = (
     "outbound_experiment_input_state", "outbound_experiment_input_diagnostics",
@@ -242,6 +244,16 @@ def render_outbound_experiment(model: dict[str, Any]) -> None:
             opening_rows = selection.get("inventory_rows", [])
             st.caption(f"Выбрано строк остатков: {selection_diag.get('selected_inventory_rows', 0)}")
 
+    loaded_receipts_result = load_receipts_state_cached(model)
+    loaded_receipts = loaded_receipts_result[0] if isinstance(loaded_receipts_result, tuple) else loaded_receipts_result
+    loaded_receipts = loaded_receipts if isinstance(loaded_receipts, Mapping) else {}
+    loaded_classifications = loaded_receipts.get("receipts", [])
+    render_scenario_comparison(
+        model, operational_date=operational_date, selected_warehouse=selected_warehouse,
+        start_state=start_state, opening_rows=opening_rows,
+        classification_rows=loaded_classifications,
+    )
+
     loaded_orders = load_outbound_orders_cached(model)
     application_rows = loaded_orders.get("rows", []) if isinstance(loaded_orders, dict) else []
     sources = ["Загруженные в приложении", "Отдельный файл"]
@@ -258,8 +270,6 @@ def render_outbound_experiment(model: dict[str, Any]) -> None:
             outbound_rows, outbound_diag = normalize_outbound_table(table, detect_outbound_columns(table))
             if outbound_diag: st.json(outbound_diag)
 
-    loaded_receipts_result = load_receipts_state_cached(model)
-    loaded_receipts = loaded_receipts_result[0] if isinstance(loaded_receipts_result, tuple) else loaded_receipts_result
     classifications = {r.get("sku_key"): r.get("calculated_zone") for r in loaded_receipts.get("receipts", [])
                        if r.get("calculated_zone") in CODE_TO_ZONE}
     editor_rows = [{"SKU": b.get("sku_key"), "Номенклатура": b.get("nomenclature"),
