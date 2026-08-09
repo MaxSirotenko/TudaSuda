@@ -263,7 +263,6 @@ def render_scenario_comparison(
     start_state: dict[str, Any] | None, opening_rows: list[dict[str, Any]],
     classification_rows: Sequence[Mapping[str, Any]] | None,
     outbound_rows: Sequence[Mapping[str, Any]] | None = None,
-    adjacency_rows: list[dict[str, Any]] | None = None,
     gate_state: dict[str, Any] | None = None,
 ) -> None:
     """Render the independent placement preview before the outbound replay UI."""
@@ -306,9 +305,7 @@ def render_scenario_comparison(
                                              picking_storage_enabled=picking_storage_enabled,
                                              deep_lane_optimization_enabled=deep_lane_enabled,
                                              replenishment_enabled=replenishment_enabled)
-    adjacency_profile, adjacency_diagnostics = build_sku_adjacency_profile(adjacency_rows)
-    if adjacency_enabled and not adjacency_rows:
-        st.caption("Связанные товарные группы не загружены — используется только компактное размещение одинаковых SKU.")
+    adjacency_profile, adjacency_diagnostics = build_sku_adjacency_profile(baseline)
     velocity_profile = None
     velocity_diagnostics: dict[str, Any] = {"valid": True, "errors": [], "warnings": []}
     if velocity_enabled:
@@ -338,7 +335,6 @@ def render_scenario_comparison(
         scenario, diagnostics = build_proposed_scenario(
             model, baseline, rule_config, sku_zone_rows=sku_zone_rows,
             sku_velocity_rows=velocity_profile.get("rows", []) if velocity_profile else None,
-            sku_adjacency_rows=adjacency_rows,
             gate_state=gate_state,
         )
         st.session_state[f"{SESSION_PREFIX}_baseline"] = baseline
@@ -389,12 +385,12 @@ def render_scenario_comparison(
         _show_metrics(summarize_scenario_ui_metrics(scenario, baseline, sku_zone_rows))
         if adjacency_enabled:
             summary = scenario.get("summary", {})
-            st.caption(f"SKU с несколькими размещениями: {summary.get('multi_unit_skus', 0)} · "
-                       f"Explicit adjacency groups: {summary.get('adjacency_groups_total', 0)} · "
-                       f"Фрагментов одинаковых SKU: до {summary.get('same_sku_fragments_before', 0)}, "
-                       f"после {summary.get('same_sku_fragments_after', 0)} · "
-                       f"Фрагментов групп: до {summary.get('adjacency_group_fragments_before', 0)}, "
-                       f"после {summary.get('adjacency_group_fragments_after', 0)}")
+            st.caption(f"Групп характеристик: {summary.get('conflicting_characteristic_groups', 0)} · "
+                       f"SKU: {summary.get('adjacency_skus_involved', 0)} · "
+                       f"Конфликтов: до {summary.get('adjacency_conflicts_before', 0)}, "
+                       f"после {summary.get('adjacency_conflicts_after', 0)} · "
+                       f"Неустранимых фиксированных: "
+                       f"{summary.get('adjacency_unresolved_fixed_conflicts', 0)}")
         if base_capacity_enabled:
             summary = scenario.get("summary", {})
             st.caption(f"SKU обеспечено: {summary.get('capacity_skus_satisfied', 0)} / "

@@ -34,12 +34,11 @@ def build_proposed_scenario(
     *,
     sku_zone_rows: list[dict[str, Any]] | None = None,
     sku_velocity_rows: list[dict[str, Any]] | None = None,
-    sku_adjacency_rows: list[dict[str, Any]] | None = None,
     gate_state: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Run RuleSet -> Plan -> ProposedState, always from ``baseline_state``."""
     rule_set, rule_validation = build_placement_rule_set(rule_config)
-    adjacency_profile, adjacency_validation = build_sku_adjacency_profile(sku_adjacency_rows)
+    adjacency_profile, adjacency_validation = build_sku_adjacency_profile(baseline_state)
     plan, plan_validation = build_proposed_placement_plan(
         model, baseline_state, rule_set, sku_zone_rows or [],
         sku_velocity_rows=sku_velocity_rows, adjacency_profile=adjacency_profile, gate_state=gate_state,
@@ -63,10 +62,10 @@ def build_proposed_scenario(
         **{key: plan_summary.get(key, 0) for key in (
             "placement_units_total", "units_kept", "units_moved", "fixed_units", "unresolved_units",
             "velocity_profile_skus", "velocity_ranked_units", "velocity_unranked_units", "velocity_units_moved",
-            "adjacency_profile_skus", "adjacency_groups_total", "multi_unit_skus",
+            "adjacency_profile_skus", "conflicting_characteristic_groups", "adjacency_skus_involved",
+            "adjacency_conflicts_before", "adjacency_conflicts_after", "adjacency_unresolved_fixed_conflicts", "multi_unit_skus",
             "same_sku_fragments_before", "same_sku_fragments_after",
-            "adjacency_group_fragments_before", "adjacency_group_fragments_after",
-            "same_sku_fragment_reduction", "adjacency_group_fragment_reduction", "adjacency_units_moved",
+            "same_sku_fragment_reduction", "adjacency_units_moved",
             "capacity_skus_total", "capacity_skus_satisfied", "capacity_skus_short",
             "capacity_positions_required", "capacity_positions_occupied", "capacity_positions_reserved",
             "capacity_shortage_positions",
