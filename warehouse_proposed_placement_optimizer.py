@@ -387,9 +387,15 @@ def build_proposed_placement_plan(
 
 def validate_proposed_placement_plan(
     plan: dict[str, Any], model: dict[str, Any], baseline_state: dict[str, Any],
-    placement_rule_set: dict[str, Any], sku_zone_rows: list[dict[str, Any]],
+    placement_rule_set: dict[str, Any] | None = None,
+    sku_zone_rows: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Validate plan identity and physical target-layout invariants."""
+    """Validate plan identity and physical target-layout invariants.
+
+    The planning inputs are optional for downstream consumers which receive an
+    already-built plan.  When supplied, rule and zone-decision consistency is
+    validated in addition to the self-contained physical plan contract.
+    """
     errors: list[dict[str, Any]] = []
     def error(code: str, **details: Any) -> None:
         errors.append({"code": code, **details})
@@ -401,12 +407,13 @@ def validate_proposed_placement_plan(
         error("baseline_state_id_mismatch")
     if plan.get("model_id") != model.get("model_id"):
         error("model_id_mismatch")
-    rule_validation = validate_placement_rule_set(placement_rule_set)
-    if not rule_validation["valid"]:
-        errors.extend(rule_validation["errors"])
-    elif plan.get("placement_rule_set_id") != compute_placement_rule_set_id(placement_rule_set):
-        error("placement_rule_set_id_mismatch")
-    assignments, mapping_errors = _canonical_sku_zones(sku_zone_rows)
+    rule_validation = validate_placement_rule_set(placement_rule_set) if placement_rule_set is not None else None
+    if rule_validation is not None:
+        if not rule_validation["valid"]:
+            errors.extend(rule_validation["errors"])
+        elif plan.get("placement_rule_set_id") != compute_placement_rule_set_id(placement_rule_set):
+            error("placement_rule_set_id_mismatch")
+    assignments, mapping_errors = _canonical_sku_zones(sku_zone_rows) if sku_zone_rows is not None else ({}, [])
     errors.extend(mapping_errors)
     cells = {_cell_key(cell): cell for cell in model.get("cells", []) or []}
     positions = {position.get("position_id"): position for position in baseline_state.get("physical_positions", []) or []}
@@ -419,7 +426,8 @@ def validate_proposed_placement_plan(
         error("duplicate_target_position_id")
     fixed_positions = {unit.get("origin_position_id") for unit in plan.get("fixed_units", []) or [] if unit.get("origin_position_id")}
     fixed_unit_ids = {unit.get("placement_unit_id") for unit in plan.get("fixed_units", []) or []}
-    weight_enabled = rule_validation["valid"] and "weight_zones" in get_enabled_rule_ids(placement_rule_set)
+    weight_enabled = bool(rule_validation and rule_validation["valid"]
+                          and "weight_zones" in get_enabled_rule_ids(placement_rule_set))
     for row in placements:
         origin, target = positions.get(row.get("origin_position_id")), positions.get(row.get("target_position_id"))
         if not origin:
