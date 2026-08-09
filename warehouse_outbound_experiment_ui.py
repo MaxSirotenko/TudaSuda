@@ -248,12 +248,6 @@ def render_outbound_experiment(model: dict[str, Any]) -> None:
     loaded_receipts = loaded_receipts_result[0] if isinstance(loaded_receipts_result, tuple) else loaded_receipts_result
     loaded_receipts = loaded_receipts if isinstance(loaded_receipts, Mapping) else {}
     loaded_classifications = loaded_receipts.get("receipts", [])
-    render_scenario_comparison(
-        model, operational_date=operational_date, selected_warehouse=selected_warehouse,
-        start_state=start_state, opening_rows=opening_rows,
-        classification_rows=loaded_classifications,
-    )
-
     loaded_orders = load_outbound_orders_cached(model)
     application_rows = loaded_orders.get("rows", []) if isinstance(loaded_orders, dict) else []
     sources = ["Загруженные в приложении", "Отдельный файл"]
@@ -303,6 +297,13 @@ def render_outbound_experiment(model: dict[str, Any]) -> None:
         gate_confirmed = st.checkbox("Использовать эти координаты ворот")
         gate_config = {"gate_key": "experiment_gate", "gate_name": "Ворота эксперимента",
                        "road_type": road.get("road_type"), "x": float(x), "y": float(y)}
+
+    render_scenario_comparison(
+        model, operational_date=operational_date, selected_warehouse=selected_warehouse,
+        start_state=start_state, opening_rows=opening_rows,
+        classification_rows=loaded_classifications, outbound_rows=outbound_rows,
+        gate_state={"model_id": model.get("model_id"), "gates": [gate_config]} if gate_confirmed else None,
+    )
 
     signature = build_experiment_ui_signature(
         receipt_hash=receipt_hash, receipt_sheet=receipt_sheet, operational_date=operational_date,
