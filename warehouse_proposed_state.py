@@ -20,7 +20,8 @@ from warehouse_simulation_state import refresh_simulation_state, validate_simula
 _LIMITATIONS = [
     "logical_target_layout_only",
     "no_relocation_sequence_or_distance",
-    "no_deep_lane_placement",
+    "deep_lane_target_is_counterfactual_not_relocation_sequence",
+    "no_deep_lane_replenishment",
     "no_event_execution",
 ]
 
@@ -78,6 +79,13 @@ def apply_proposed_placement_plan(
     if plan_id != compute_proposed_placement_plan_id(proposed_placement_plan):
         return _blocked("proposed_placement_plan_id_mismatch", baseline_id=baseline_id, plan_id=plan_id)
 
+    cells_by_key = {cell.get("cell_key"): cell for cell in model.get("cells", []) or []}
+    for row in proposed_placement_plan.get("placements", []) or []:
+        target_cell = cells_by_key.get(row.get("target_cell_key"), {})
+        target_storage = target_cell.get("storage_type") or target_cell.get("row_storage_type") or "normal"
+        if row.get("moved") and target_storage == "deep_lane" and row.get("unit_type") != "pallet":
+            return _blocked("deep_lane_unit_moved", baseline_id=baseline_id, plan_id=plan_id)
+
     plan_validation = validate_proposed_placement_plan(
         proposed_placement_plan, model, baseline_state
     )
@@ -107,10 +115,8 @@ def apply_proposed_placement_plan(
         origin_cell, target_cell = cells.get(origin.get("cell_key"), {}), cells.get(target.get("cell_key"), {})
         origin_storage = origin_cell.get("storage_type") or origin_cell.get("row_storage_type") or "normal"
         target_storage = target_cell.get("storage_type") or target_cell.get("row_storage_type") or "normal"
-        if row.get("moved") and (origin_storage == "deep_lane" or target_storage == "deep_lane"
-                                 or origin_cell.get("capacity_pallets", 1) != 1
-                                 or target_cell.get("capacity_pallets", 1) != 1):
-            return _blocked("deep_lane_unit_moved", baseline_id=baseline_id, plan_id=plan_id)
+        if (origin_storage == "deep_lane" or target_storage == "deep_lane") and unit_type != "pallet":
+            return _blocked("deep_lane_requires_authoritative_pallet", baseline_id=baseline_id, plan_id=plan_id)
         if row.get("moved") and target.get("status") == "occupied" and target_id not in origins:
             return _blocked("fixed_reserved_position_reused", baseline_id=baseline_id, plan_id=plan_id)
         lot_ids = row.get("stock_lot_ids")
