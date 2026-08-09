@@ -386,6 +386,7 @@ def build_proposed_placement_plan(
     picking_enabled = "picking_storage" in enabled
     deep_enabled = "deep_lane_optimization" in enabled
     deep_lanes, locked_deep_lanes = _deep_lane_inventory(cells, positions, units, unresolved, occupancy_by_cell)
+    eligible_deep_cells = {lane["cell_key"] for lane in deep_lanes}
     minimum_positions = next(
         (rule["parameters"]["minimum_positions_per_sku"] for rule in placement_rule_set["rules"]
          if rule["rule_id"] == "base_sku_capacity"), 1)
@@ -461,7 +462,8 @@ def build_proposed_placement_plan(
             reason = None
             if picking_enabled and _text(unit.get("sku_key")) in ambiguous_picking_skus:
                 reason = "ambiguous_picking_weight_zone"
-            if storage == "deep_lane" or cell.get("capacity_pallets", 1) != 1:
+            if ((storage == "deep_lane" or cell.get("capacity_pallets", 1) != 1)
+                    and not (deep_enabled and unit.get("origin_cell_key") in eligible_deep_cells)):
                 reason = ("deep_lane_adjacency_optimization_not_implemented" if adjacency_enabled
                           else "deep_lane_optimization_not_enabled")
             elif position.get("status") == "unknown":
@@ -470,7 +472,8 @@ def build_proposed_placement_plan(
                 reason = "occupancy_conflict"
             elif not cell or not position or position.get("cell_key") != unit.get("origin_cell_key"):
                 reason = "invalid_physical_reference"
-            elif (velocity_enabled or picking_enabled) and unit.get("origin_cell_key") not in distances:
+            elif ((velocity_enabled or picking_enabled) and storage != "deep_lane"
+                  and unit.get("origin_cell_key") not in distances):
                 reason = "picking_unreachable_position" if picking_enabled else "velocity_unreachable_position"
             elif weight_enabled and unit.get("sku_key") not in assignments:
                 reason = "missing_sku_zone_assignment"
@@ -486,7 +489,8 @@ def build_proposed_placement_plan(
                 identity_units.append(unit)
                 continue
             target_zone = assignments[unit["sku_key"]] if weight_enabled else normalize_placement_zone(cell.get("weight_zone"))
-            if not velocity_enabled and not adjacency_enabled and not picking_enabled and normalize_placement_zone(cell.get("weight_zone")) == target_zone:
+            if (not deep_enabled and not velocity_enabled and not adjacency_enabled and not picking_enabled
+                    and normalize_placement_zone(cell.get("weight_zone")) == target_zone):
                 kept.append((unit, target_zone))
             else:
                 applicable.append((unit, target_zone))
@@ -516,7 +520,60 @@ def build_proposed_placement_plan(
         available[zone].sort(key=lambda p: ((distances.get(p.get("cell_key"), float("inf")), _position_key(p, cells))
                                             if (velocity_enabled or picking_enabled) else _position_key(p, cells)))
 
-    needed = Counter(zone for _, zone in applicable)
+    # Secure one normal picking target per SKU first, then allocate only storage
+    # pallets to whole deep lanes.  Deep slots deliberately never enter the
+    # generic free-position pool: ownership and suffix packing are decided here.
+    picking_unit_ids: set[str] = set()
+    if picking_enabled:
+        first_by_sku: dict[str, tuple[dict[str, Any], str]] = {}
+        for item in sorted(applicable, key=lambda item: (
+                velocities.get(_text(item[0].get("sku_key")), {}).get("velocity_rank") or 7,
+                _text(item[0].get("sku_key")),
+                _position_key(positions.get(item[0].get("origin_position_id"), {}), cells),
+                _text(item[0].get("placement_unit_id")))):
+            first_by_sku.setdefault(_text(item[0].get("sku_key")), item)
+        picking_unit_ids = {item[0]["placement_unit_id"] for item in first_by_sku.values()}
+
+    deep_target_by_unit: dict[str, Mapping[str, Any]] = {}
+    if deep_enabled:
+        storage_by_sku_zone: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+        for unit, zone in applicable:
+            if unit.get("unit_type") == "pallet" and unit["placement_unit_id"] not in picking_unit_ids:
+                storage_by_sku_zone[(_text(unit.get("sku_key")), zone)].append(unit)
+        claimed_lanes: set[str] = set()
+        preliminary_normal_need = Counter(zone for _, zone in applicable)
+        preliminary_normal_need.subtract(Counter(
+            zone for unit, zone in applicable if unit["placement_unit_id"] not in picking_unit_ids
+            and unit.get("origin_cell_key") in eligible_deep_cells))
+        for (sku, zone), sku_units in sorted(storage_by_sku_zone.items()):
+            sku_units.sort(key=lambda unit: (
+                unit.get("origin_cell_key") not in eligible_deep_cells,
+                _position_key(positions.get(unit.get("origin_position_id"), {}), cells),
+                _text(unit.get("placement_unit_id"))))
+            compatible = [lane for lane in deep_lanes
+                          if normalize_placement_zone(lane["cell"].get("weight_zone")) == zone]
+            same = [lane for lane in compatible if lane.get("sku_key") == sku]
+            empty = [lane for lane in compatible if not lane.get("units")]
+            lane_order = sorted(same, key=lambda lane: _cell_key(lane["cell"]))
+            normal_short = max(0, preliminary_normal_need[zone] - len(available[zone]))
+            # Opening an empty lane for a single otherwise-placeable pallet is
+            # churn, not useful compaction. Existing same-SKU lanes are always
+            # filled before an empty lane is considered.
+            if len(sku_units) >= 2 or normal_short:
+                lane_order += sorted(empty, key=lambda lane: _cell_key(lane["cell"]))
+            remaining_units = list(sku_units)
+            for lane in lane_order:
+                if lane["cell_key"] in claimed_lanes or not remaining_units:
+                    continue
+                take = min(len(lane["positions"]), len(remaining_units))
+                selected, remaining_units = remaining_units[:take], remaining_units[take:]
+                targets = lane["positions"][-take:]
+                for unit, target in zip(selected, targets):
+                    deep_target_by_unit[unit["placement_unit_id"]] = target
+                claimed_lanes.add(lane["cell_key"])
+
+    needed = Counter(zone for unit, zone in applicable
+                     if unit["placement_unit_id"] not in deep_target_by_unit)
     shortages = {zone: max(0, needed[zone] - len(available[zone])) for zone in ASSIGNABLE_PLACEMENT_ZONE_IDS}
     zone_summary = []
     fixed_positions = Counter(normalize_placement_zone(cells.get(unit.get("origin_cell_key"), {}).get("weight_zone")) for unit in fixed)
@@ -570,25 +627,23 @@ def build_proposed_placement_plan(
                          origin_order.get(item[0]["placement_unit_id"], ()),
                          _text(item[0].get("placement_unit_id"))))
         remaining = {zone: list(values) for zone, values in available.items()}
-        picking_unit_ids: set[str] = set()
         allocation_order = ordered
         if picking_enabled:
-            first_by_sku: dict[str, tuple[dict[str, Any], str]] = {}
-            for item in ordered:
-                first_by_sku.setdefault(_text(item[0].get("sku_key")), item)
-            picking_items = sorted(first_by_sku.values(), key=lambda item: (
+            picking_items = sorted((item for item in ordered
+                                    if item[0]["placement_unit_id"] in picking_unit_ids), key=lambda item: (
                 velocities.get(_text(item[0].get("sku_key")), {}).get("velocity_rank") or 7,
                 _text(item[0].get("sku_key")), _text(item[0].get("placement_unit_id"))))
-            picking_unit_ids = {item[0]["placement_unit_id"] for item in picking_items}
             allocation_order = picking_items + [item for item in ordered if item[0]["placement_unit_id"] not in picking_unit_ids]
         for unit, zone in allocation_order:
             is_picking = unit["placement_unit_id"] in picking_unit_ids
+            deep_target = deep_target_by_unit.get(unit["placement_unit_id"])
             origin = None
-            if (not is_picking and not adjacency_enabled
+            if (deep_target is None and not is_picking and not adjacency_enabled
                     and not velocities.get(_text(unit.get("sku_key")), {}).get("velocity_rank")):
                 origin = next((p for p in remaining[zone] if p.get("position_id") == unit.get("origin_position_id")), None)
-            target = origin or remaining[zone][0]
-            remaining[zone].remove(target)
+            target = deep_target or origin or remaining[zone][0]
+            if deep_target is None:
+                remaining[zone].remove(target)
             sku = _text(unit.get("sku_key"))
             velocity = velocities.get(sku, {"velocity_rank": None, "velocity_class": "no_history"})
             row = _placement_row(unit, target, cells, velocity if velocity_enabled else None, distances,
@@ -794,6 +849,27 @@ def build_proposed_placement_plan(
         "storage_positions": len(storage_rows),
         "skus_without_supported_picking_position": len(represented_skus - picking_skus) if picking_enabled else 0,
     })
+    if deep_enabled:
+        before_deep = [unit for unit in units if unit.get("origin_cell_key") in eligible_deep_cells]
+        after_deep = [row for row in placements if row.get("target_cell_key") in eligible_deep_cells]
+        before_cells = {unit.get("origin_cell_key") for unit in before_deep}
+        after_cells = {row.get("target_cell_key") for row in after_deep}
+        plan["summary"].update({
+            "deep_lane_eligible_cells": len(deep_lanes),
+            "deep_lane_locked_or_unconfigured_cells": len(locked_deep_lanes),
+            "deep_lane_pallets_before": len(before_deep), "deep_lane_pallets_after": len(after_deep),
+            "deep_lane_cells_used_before": len(before_cells), "deep_lane_cells_used_after": len(after_cells),
+            "deep_lane_units_moved_into": sum(row.get("origin_cell_key") not in eligible_deep_cells for row in after_deep),
+            "deep_lane_units_moved_out": sum(row.get("target_cell_key") not in eligible_deep_cells
+                                              for row in placements if row.get("origin_cell_key") in eligible_deep_cells),
+            "deep_lane_units_moved_within": sum(row.get("moved") and row.get("origin_cell_key") in eligible_deep_cells
+                                                 and row.get("target_cell_key") in eligible_deep_cells for row in placements),
+            "deep_lane_affected_skus": sorted({_text(row.get("sku_key")) for row in placements
+                                                 if row.get("moved") and (row.get("origin_cell_key") in eligible_deep_cells
+                                                                          or row.get("target_cell_key") in eligible_deep_cells)}),
+            "deep_lane_unresolved_skus": sorted({_text(row.get("sku_key")) for row in unresolved
+                                                   if _text(row.get("sku_key"))}),
+        })
     velocity_rows = [row for row in placements if "velocity_rank" in row]
     ranked_rows = [row for row in velocity_rows if row.get("velocity_rank") is not None]
     def average(rows: list[dict[str, Any]], key: str) -> float | None:
@@ -812,15 +888,20 @@ def build_proposed_placement_plan(
         plan["summary"][f"rank_{rank}_average_gate_distance_after_m"] = average(rank_rows, "target_gate_distance_m")
     if velocity_enabled:
         plan["limitations"] = [item for item in plan["limitations"] if item != "weight_zones_only"]
-        plan["limitations"].extend(["velocity_priority_uses_gate_distance_not_global_route_optimization",
-                                    "deep_lane_velocity_optimization_not_implemented"])
+        plan["limitations"].append("velocity_priority_uses_gate_distance_not_global_route_optimization")
+        if not deep_enabled:
+            plan["limitations"].append("deep_lane_velocity_optimization_not_implemented")
     if adjacency_enabled:
         plan["limitations"] = [item for item in plan["limitations"] if item != "weight_zones_only"]
         plan["limitations"].extend(["physical_order_contiguity_v1", "cross_rank_adjacency_not_optimized_v1",
-                                    "deep_lane_adjacency_optimization_not_implemented",
                                     "explicit_adjacency_groups_only_no_fuzzy_matching"])
+        if not deep_enabled:
+            plan["limitations"].append("deep_lane_adjacency_optimization_not_implemented")
+    if deep_enabled:
+        plan["limitations"].extend(["counterfactual_target_not_relocation_sequence", "no_deep_lane_replenishment"])
     plan["proposed_placement_plan_id"] = compute_proposed_placement_plan_id(plan)
     validation = validate_proposed_placement_plan(plan, model, baseline_state, placement_rule_set, sku_zone_rows)
+    validation["warnings"] = sorted(locked_deep_lanes, key=_canonical_json) if deep_enabled else []
     return plan, validation
 
 

@@ -411,3 +411,48 @@ def test_deep_lane_rule_compacts_exact_pallets_to_authoritative_depth_suffix():
     assert diagnostics["valid"] and plan["status"] == "ready"
     assert sorted(row["target_depth_index"] for row in plan["placements"]) == [4, 5]
     assert plan["summary"]["deep_lane_units_moved_within"] == 1
+
+
+def test_picking_storage_combined_uses_deep_capacity_after_normal_picking_target():
+    model, state, gate, _ = velocity_fixture()
+    deep_cell = {"cell_key": "deep", "row_number": "1", "cell_number": 3, "tier": 1,
+                 "physical_index": 3, "weight_zone": "heavy", "storage_type": "deep_lane",
+                 "capacity_pallets": 2, "deep_lane_access_side": "left",
+                 "physical_slots": [{"slot_index": 1}, {"slot_index": 2}]}
+    model["cells"].append(deep_cell)
+    state["physical_positions"].extend([
+        {"position_id": "D1", "cell_key": "deep", "slot_index": 99, "depth_index": 1, "status": "free"},
+        {"position_id": "D2", "cell_key": "deep", "slot_index": 98, "depth_index": 2, "status": "free"},
+    ])
+    state["cell_occupancy"].append({"cell_key": "deep", "storage_type": "deep_lane",
+                                     "exact_occupied_positions": 0, "occupancy_conflict": False})
+    # Make all three represented units authoritative pallets at unique origins.
+    state["stock_lots"] = [
+        {"stock_lot_id": f"lot-{index}", "sku_key": "A", "qty_boxes": 10,
+         "location_status": "located", "cell_key": cell, "position_id": position,
+         "pallet_unit_id": f"p{index}"}
+        for index, (cell, position) in enumerate((("near", "P_NEAR"), ("far", "P_FAR")), 1)
+    ] + [{"stock_lot_id": "lot-3", "sku_key": "A", "qty_boxes": 10,
+          "location_status": "located", "cell_key": "deep", "position_id": "D2", "pallet_unit_id": "p3"}]
+    state["physical_positions"][-1]["status"] = "occupied"
+    state["cell_occupancy"][-1]["exact_occupied_positions"] = 1
+    state["pallet_units"] = [
+        {"pallet_unit_id": f"p{index}", "sku_key": "A", "remaining_boxes": 10,
+         "physical_status": "active", "location_status": "located", "cell_key": cell,
+         "position_id": position}
+        for index, (cell, position) in enumerate((("near", "P_NEAR"), ("far", "P_FAR"), ("deep", "D2")), 1)
+    ]
+    for position in state["physical_positions"]:
+        matching = next((p for p in state["pallet_units"] if p["position_id"] == position["position_id"]), None)
+        position["pallet_unit_id"] = matching["pallet_unit_id"] if matching else None
+        position["occupied_stock_lot_ids"] = [f"lot-{matching['pallet_unit_id'][1:]}"] if matching else []
+
+    plan, diagnostics = build_proposed_placement_plan(
+        model, state, rules(picking_storage=True, deep_lane_optimization=True), [], gate_state=gate)
+    picking = [row for row in plan["placements"] if row["stock_role"] == "picking"]
+    storage = [row for row in plan["placements"] if row["stock_role"] == "storage"]
+    assert diagnostics["valid"] and plan["status"] == "ready"
+    assert len(picking) == 1 and picking[0]["target_position_id"] == "P_NEAR"
+    assert len(storage) == 2 and {row["target_depth_index"] for row in storage} == {1, 2}
+    assert {row["target_cell_key"] for row in storage} == {"deep"}
+    assert plan["summary"]["deep_lane_pallets_after"] == 2
