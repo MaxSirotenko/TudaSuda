@@ -9,6 +9,12 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+from warehouse_business_identity import canonical_sku_key
+from warehouse_placement_zones import (
+    UNASSIGNED_ZONE,
+    is_assignable_placement_zone,
+    normalize_placement_zone,
+)
 
 RECEIPTS_PATH = Path("data/last_import/receipts.json")
 
@@ -125,21 +131,11 @@ def parse_weight_value(value: Any) -> tuple[str, float | None, str, str]:
 
 
 def make_sku_key(item: dict[str, Any]) -> str:
-    sku_code = _display_value(item.get("sku_code"))
-    sku_name = _display_value(item.get("sku_name"))
-    characteristic_code = _display_value(item.get("characteristic_code"))
-    characteristic_name = _display_value(item.get("characteristic_name") or item.get("characteristic"))
-    if sku_code and characteristic_code:
-        return f"code:{sku_code}|char_code:{characteristic_code}"
-    if sku_code and characteristic_name:
-        return f"code:{sku_code}|char_name:{characteristic_name}"
-    if sku_name and characteristic_name:
-        return f"name:{sku_name}|char_name:{characteristic_name}"
-    if sku_name:
-        return f"name:{sku_name}"
-    if sku_code:
-        return f"code:{sku_code}"
-    return ""
+    """Compatibility name for the central, name/characteristic based v2 key."""
+    return canonical_sku_key({"nomenclature": item.get("sku_name") or item.get("nomenclature"),
+                              "characteristic": item.get("characteristic_name") or item.get("characteristic"),
+                              "nomenclature_code": item.get("sku_code"),
+                              "characteristic_code": item.get("characteristic_code")})
 
 
 def make_receipt_line_id(item: dict[str, Any]) -> str:
@@ -155,8 +151,6 @@ def default_zone_classification_settings() -> dict[str, Any]:
         "weight_column": None,
         "fragile_column": None,
         "source_zone_column": None,
-        "max_light_weight_kg": 5.0,
-        "max_medium_weight_kg": 15.0,
         "calculated_at": "",
         "settings_hash": "",
     }
@@ -167,8 +161,6 @@ def zone_classification_settings_hash(settings: dict[str, Any]) -> str:
         "weight_column": _display_value(settings.get("weight_column")),
         "fragile_column": _display_value(settings.get("fragile_column")),
         "source_zone_column": _display_value(settings.get("source_zone_column")),
-        "max_light_weight_kg": _safe_float(settings.get("max_light_weight_kg")),
-        "max_medium_weight_kg": _safe_float(settings.get("max_medium_weight_kg")),
     }
     return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
@@ -182,16 +174,20 @@ def detect_zone_classification_columns(df: pd.DataFrame) -> dict[str, str | None
     }
 
 
-def _calculated_zone_for(weight: float | None, fragile: bool, light_limit: float, medium_limit: float) -> tuple[str, str]:
-    if fragile:
-        return "fragile", "Признак хрупкости"
+def _calculated_zone_for(weight: float | None) -> tuple[str, str]:
     if weight is None:
-        return "unclassified", "Вес отсутствует"
-    if weight <= light_limit:
-        return "light", "Вес входит в диапазон лёгкого"
-    if weight <= medium_limit:
-        return "medium", "Вес входит в диапазон среднего"
-    return "heavy", "Вес выше границы среднего"
+        return UNASSIGNED_ZONE, "Вес отсутствует или некорректен"
+    # Confirmed business ranges. Decimal boundaries are intentionally literal;
+    # values in the unconfirmed gaps remain unresolved rather than guessed.
+    if 0.003 <= weight <= 0.250:
+        return "small_and_bulky", "Подтверждённый диапазон веса 0.003–0.250 кг"
+    if 0.251 <= weight <= 0.999:
+        return "bulky", "Подтверждённый диапазон веса 0.251–0.999 кг"
+    if 1.000 <= weight <= 2.500:
+        return "fragile", "Подтверждённый диапазон веса 1.000–2.500 кг"
+    if 2.501 <= weight <= 3.500:
+        return "light", "Подтверждённый диапазон веса 2.501–3.500 кг"
+    return UNASSIGNED_ZONE, "Вес вне подтверждённых диапазонов"
 
 
 def _median(values: list[float]) -> float:
@@ -212,22 +208,21 @@ def _weight_conflict(values: list[float]) -> tuple[bool, float | None]:
 
 
 def calculate_receipt_zones(receipts: list[dict[str, Any]], settings: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    light_limit = _safe_float(settings.get("max_light_weight_kg"), 0.0)
-    medium_limit = _safe_float(settings.get("max_medium_weight_kg"), 0.0)
     rows = [dict(item) for item in receipts]
     by_sku: dict[str, dict[str, Any]] = {}
     for item in rows:
-        sku_key = _display_value(item.get("sku_key")) or make_sku_key(item)
+        sku_key = make_sku_key(item)
         item["sku_key"] = sku_key
         item["receipt_line_id"] = _display_value(item.get("receipt_line_id")) or make_receipt_line_id(item)
         if not sku_key:
             continue
         weight = _safe_float(item.get("source_weight"), None) if item.get("weight_parse_status") == "ok" else None
-        fragile = bool(item.get("fragile_flag"))
-        bucket = by_sku.setdefault(sku_key, {"weights": [], "fragile": set(), "receipts": set(), "rows": 0, "qty_pallets": 0.0})
+        explicit = normalize_placement_zone(item.get("source_zone"))
+        bucket = by_sku.setdefault(sku_key, {"weights": [], "explicit_zones": set(), "receipts": set(), "rows": 0, "qty_pallets": 0.0})
         if weight is not None and weight > 0:
             bucket["weights"].append(weight)
-        bucket["fragile"].add(fragile)
+        if is_assignable_placement_zone(explicit):
+            bucket["explicit_zones"].add(explicit)
         if item.get("receipt_number"):
             bucket["receipts"].add(_display_value(item.get("receipt_number")))
         bucket["rows"] += 1
@@ -236,26 +231,32 @@ def calculate_receipt_zones(receipts: list[dict[str, Any]], settings: dict[str, 
     sku_result: dict[str, tuple[str, str, str]] = {}
     for sku_key, values in by_sku.items():
         has_weight_conflict, median_weight = _weight_conflict(values["weights"])
-        has_fragile_conflict = len(values["fragile"]) > 1
-        if has_weight_conflict or has_fragile_conflict:
+        explicit_zones = values["explicit_zones"]
+        if len(explicit_zones) > 1:
             conflicts.add(sku_key)
-            sku_result[sku_key] = ("unclassified", "Конфликт данных SKU", "conflict")
+            sku_result[sku_key] = (UNASSIGNED_ZONE, "Конфликт явных зон SKU", "conflict")
             continue
-        fragile = next(iter(values["fragile"]), False)
-        zone, reason = _calculated_zone_for(median_weight, fragile, light_limit, medium_limit)
-        status = "ok" if zone != "unclassified" else "error"
+        if explicit_zones:
+            zone, reason = next(iter(explicit_zones)), "Явная авторитетная зона источника"
+        elif has_weight_conflict:
+            conflicts.add(sku_key)
+            zone, reason = UNASSIGNED_ZONE, "Конфликт веса SKU"
+        else:
+            zone, reason = _calculated_zone_for(median_weight)
+        status = "ok" if is_assignable_placement_zone(zone) else "error"
         sku_result[sku_key] = (zone, reason, status)
     mismatches = 0
     for item in rows:
-        sku_key = _display_value(item.get("sku_key")) or make_sku_key(item)
-        zone, reason, status = sku_result.get(sku_key, ("unclassified", "Вес отсутствует", "error"))
-        source_zone = _normalize_weight_class(item.get("source_zone"))
-        if source_zone != "unclassified" and source_zone != zone:
+        sku_key = make_sku_key(item)
+        item["sku_key"] = sku_key
+        zone, reason, status = sku_result.get(sku_key, (UNASSIGNED_ZONE, "Недостаточно метаданных SKU", "error"))
+        source_zone = normalize_placement_zone(item.get("source_zone"))
+        if is_assignable_placement_zone(source_zone) and source_zone != zone:
             mismatches += 1
         item["calculated_zone"] = zone
         item["weight_class"] = zone
         item["zone_calculation_reason"] = reason
-        item["zone_calculation_status"] = status if source_zone in {"unclassified", zone} else "mismatch"
+        item["zone_calculation_status"] = status if source_zone in {UNASSIGNED_ZONE, zone, None} else "mismatch"
     sku_zones = {sku_key: result[0] for sku_key, result in sku_result.items()}
     multi_receipt_sku = sorted([sku_key for sku_key, values in by_sku.items() if len(values["receipts"]) > 1])
     repeated_rows = sum(max(int(values["rows"]) - 1, 0) for values in by_sku.values())
@@ -267,7 +268,7 @@ def calculate_receipt_zones(receipts: list[dict[str, Any]], settings: dict[str, 
         "Средних SKU": sum(1 for value in sku_zones.values() if value == "medium"),
         "Тяжёлых SKU": sum(1 for value in sku_zones.values() if value == "heavy"),
         "Хрупких SKU": sum(1 for value in sku_zones.values() if value == "fragile"),
-        "SKU без рассчитанной категории": sum(1 for value in sku_zones.values() if value == "unclassified"),
+        "SKU без рассчитанной категории": sum(1 for value in sku_zones.values() if value == UNASSIGNED_ZONE),
         "Конфликтов данных": len(conflicts),
         "SKU в нескольких приходах": len(multi_receipt_sku),
         "Повторных строк одинакового SKU": repeated_rows,
@@ -385,9 +386,9 @@ def normalize_receipt_table(df: pd.DataFrame, mapping: dict[str, str | None]) ->
             "placement_status": "not_placed",
             "placement_mode": "not_calculated",
             "comment": _display_value(row.get(mapping.get("comment"))) if mapping.get("comment") else "",
-            "weight_class": "unclassified",
+            "weight_class": UNASSIGNED_ZONE,
             "source_zone": _display_value(row.get(mapping.get("source_zone"))) if mapping.get("source_zone") else (_display_value(row.get(mapping.get("weight_class"))) if mapping.get("weight_class") else ""),
-            "calculated_zone": "unclassified",
+            "calculated_zone": UNASSIGNED_ZONE,
             "zone_calculation_reason": "Вес отсутствует",
             "source_weight_raw": weight_raw,
             "source_weight": parsed_weight if parsed_weight is not None else "",
@@ -511,7 +512,9 @@ def load_receipts_state(model: dict[str, Any] | None = None) -> tuple[dict[str, 
     state.setdefault("receipts", [])
     for index, receipt in enumerate(state["receipts"], start=1):
         receipt.setdefault("source_row_number", index)
-        receipt.setdefault("sku_key", make_sku_key(receipt))
+        # Persisted legacy keys are evidence only. Rebuild from factual names;
+        # an absent name deliberately produces an unresolved empty key.
+        receipt["sku_key"] = make_sku_key(receipt)
         receipt.setdefault("receipt_line_id", make_receipt_line_id(receipt))
         if "source_weight_raw" not in receipt:
             receipt["source_weight_raw"] = _display_value(receipt.get("source_weight"))

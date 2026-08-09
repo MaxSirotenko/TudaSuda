@@ -205,6 +205,10 @@ def replay_outbound_on_simulation_states(model: dict[str, Any], current_state: d
     try: proposed_enabled = _enabled(placement_rule_set)
     except ValueError as error: diagnostics["configuration_errors"].append(str(error)); proposed_enabled = set()
     orders = outbound_demand_state.get("orders", []) if isinstance(outbound_demand_state, Mapping) else []
+    sequence_ready = (outbound_demand_state.get("readiness", {}).get("route_sequence_authoritative") is True
+                      if isinstance(outbound_demand_state, Mapping) else False)
+    if not sequence_ready:
+        diagnostics["configuration_errors"].append("factual_pick_sequence_missing_or_invalid")
     if len(links) != 1: diagnostics["configuration_errors"].append("exactly_one_mapped_gate_required")
     if not isinstance(orders, list): diagnostics["configuration_errors"].append("invalid_outbound_demand_orders")
     if diagnostics["configuration_errors"]: return {}, diagnostics
