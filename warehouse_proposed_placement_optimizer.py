@@ -476,19 +476,48 @@ def build_proposed_placement_plan(
     plan["placements"], plan["fixed_units"], plan["unresolved_units"] = placements, fixed, unresolved
     capacity_allocations: list[dict[str, Any]] = []
     if capacity_enabled and plan["status"] != "blocked":
-        placement_by_sku: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        for row in placements:
-            placement_by_sku[_text(row.get("sku_key"))].append(row)
         final_targets = {row["target_position_id"] for row in placements}
-        reusable_origins = {unit.get("origin_position_id") for unit in units}
+        placement_by_unit = {row["placement_unit_id"]: row for row in placements}
+        actual_positions_by_sku: dict[str, set[str]] = defaultdict(set)
+        for unit in units:
+            placement = placement_by_unit.get(unit["placement_unit_id"])
+            position_id = placement.get("target_position_id") if placement else unit.get("origin_position_id")
+            if position_id in positions and (
+                    placement or positions[position_id].get("cell_key") == unit.get("origin_cell_key")):
+                actual_positions_by_sku[_text(unit.get("sku_key"))].add(position_id)
+
+        # Unsupported footprints can still provide reliable capacity evidence: an
+        # explicit physical origin, or one occupied position for one SKU in a cell.
+        unresolved_by_cell: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for row in unresolved:
+            position = positions.get(row.get("origin_position_id"))
+            if position and position.get("cell_key") == row.get("origin_cell_key"):
+                actual_positions_by_sku[_text(row.get("sku_key"))].add(position["position_id"])
+            elif row.get("origin_cell_key"):
+                unresolved_by_cell[row["origin_cell_key"]].append(row)
+        for cell_key, rows in unresolved_by_cell.items():
+            occupied = [p for p in positions.values()
+                        if p.get("cell_key") == cell_key and p.get("status") == "occupied"]
+            skus = {_text(row.get("sku_key")) for row in rows if _text(row.get("sku_key"))}
+            if len(occupied) == 1 and len(skus) == 1:
+                actual_positions_by_sku[next(iter(skus))].add(occupied[0]["position_id"])
+
+        fixed_origins = {unit.get("origin_position_id") for unit in fixed}
+        released_origins = {
+            unit.get("origin_position_id") for unit in units
+            if unit.get("origin_position_id") not in fixed_origins
+            and placement_by_unit.get(unit["placement_unit_id"], {}).get("target_position_id")
+            != unit.get("origin_position_id")
+        }
         capacity_candidates: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
         for position in positions.values():
             cell = cells.get(position.get("cell_key"), {})
             storage = _text(cell.get("storage_type") or cell.get("row_storage_type") or "normal")
             zone = normalize_placement_zone(cell.get("weight_zone"))
             position_id = position.get("position_id")
-            is_vacant = position.get("status") == "free" or position_id in reusable_origins
+            is_vacant = position.get("status") == "free" or position_id in released_origins
             if (position_id not in final_targets and is_vacant and storage != "deep_lane"
+                    and position_id not in fixed_origins and position.get("status") != "unknown"
                     and cell.get("capacity_pallets", 1) == 1 and zone in ASSIGNABLE_PLACEMENT_ZONE_IDS
                     and (not velocity_enabled or position.get("cell_key") in distances)):
                 capacity_candidates[zone].append(position)
@@ -499,12 +528,13 @@ def build_proposed_placement_plan(
             capacity_rank.update({p.get("position_id"): index for index, p in enumerate(
                 sorted(all_zone_positions, key=lambda item: _position_key(item, cells)))})
         claimed: set[str] = set()
-        for sku, sku_rows in sorted(placement_by_sku.items(),
-                                    key=lambda item: (velocities.get(item[0], {}).get("velocity_rank") or 7,
-                                                      item[0])):
-            occupied_ids = sorted(row["target_position_id"] for row in sku_rows)
-            occupied_zones = {row.get("target_zone") for row in sku_rows
-                              if row.get("target_zone") in ASSIGNABLE_PLACEMENT_ZONE_IDS}
+        for sku in sorted(actual_positions_by_sku,
+                          key=lambda item: (velocities.get(item, {}).get("velocity_rank") or 7, item)):
+            occupied_ids = sorted(actual_positions_by_sku[sku])
+            occupied_zones = {normalize_placement_zone(
+                cells.get(positions[position_id].get("cell_key"), {}).get("weight_zone"))
+                              for position_id in occupied_ids}
+            occupied_zones &= set(ASSIGNABLE_PLACEMENT_ZONE_IDS)
             target_zone = assignments.get(sku) if weight_enabled else (
                 next(iter(occupied_zones)) if len(occupied_zones) == 1 else None)
             required = max(len(occupied_ids), minimum_positions)
@@ -699,6 +729,10 @@ def validate_proposed_placement_plan(
         error("duplicate_reserved_capacity_position")
     if set(reserved_capacity) & set(targets):
         error("reserved_capacity_overlaps_stock")
+    fixed_positions = {unit.get("origin_position_id") for unit in plan.get("fixed_units", []) or []
+                       if unit.get("origin_position_id")}
+    if set(reserved_capacity) & fixed_positions:
+        error("reserved_capacity_overlaps_fixed_stock")
     for position_id in reserved_capacity:
         position = positions.get(position_id)
         cell = cells.get((position or {}).get("cell_key"), {})
@@ -707,7 +741,6 @@ def validate_proposed_placement_plan(
             error("invalid_reserved_capacity_position", position_id=position_id)
         elif position.get("status") == "unknown" or storage == "deep_lane" or cell.get("capacity_pallets", 1) != 1:
             error("ineligible_reserved_capacity_position", position_id=position_id)
-    fixed_positions = {unit.get("origin_position_id") for unit in plan.get("fixed_units", []) or [] if unit.get("origin_position_id")}
     fixed_unit_ids = {unit.get("placement_unit_id") for unit in plan.get("fixed_units", []) or []}
     weight_enabled = bool(rule_validation and rule_validation["valid"]
                           and "weight_zones" in get_enabled_rule_ids(placement_rule_set))

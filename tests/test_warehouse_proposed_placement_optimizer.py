@@ -6,6 +6,7 @@ import inspect
 from warehouse_placement_rules import build_placement_rule_set
 from warehouse_proposed_placement_optimizer import (
     build_proposed_placement_plan,
+    compute_proposed_placement_plan_id,
     validate_proposed_placement_plan,
 )
 
@@ -208,6 +209,55 @@ def test_capacity_permutation_identity_and_actual_placement_priority():
     actual_targets = {row["target_position_id"] for row in first["placements"]}
     reserved = {position for row in first["sku_capacity_allocations"] for position in row["reserved_position_ids"]}
     assert len(actual_targets) == 2 and not actual_targets & reserved
+
+
+def test_fixed_origin_is_counted_and_cannot_be_reserved_or_validated_as_reserve():
+    model, state = fixture([("P1", "heavy", "A")], free=[("P2", "heavy")])
+    state["cell_occupancy"][0]["occupancy_conflict"] = True
+    configured = rules(True, base_sku_capacity={"enabled": True,
+        "parameters": {"minimum_positions_per_sku": 2}})
+    mapping = zones(("A", "heavy"))
+    plan, diagnostics = build_proposed_placement_plan(model, state, configured, mapping)
+    allocation = plan["sku_capacity_allocations"][0]
+    assert diagnostics["valid"] and allocation["occupied_target_position_ids"] == ["P1"]
+    assert allocation["reserved_position_ids"] == ["P2"]
+
+    invalid = copy.deepcopy(plan)
+    invalid["sku_capacity_allocations"][0]["reserved_position_ids"] = ["P1"]
+    invalid["proposed_placement_plan_id"] = compute_proposed_placement_plan_id(invalid)
+    validation = validate_proposed_placement_plan(invalid, model, state, configured, mapping)
+    assert "reserved_capacity_overlaps_fixed_stock" in {
+        error["code"] for error in validation["errors"]}
+
+
+def test_deep_lane_position_counts_with_normal_position_and_is_never_reserved():
+    model, state = fixture([("P1", "heavy", "A")], free=[("P2", "heavy")],
+                           deep=[("D1", "heavy", "A")])
+    configured = rules(base_sku_capacity={"enabled": True,
+        "parameters": {"minimum_positions_per_sku": 2}})
+    plan, diagnostics = build_proposed_placement_plan(model, state, configured, [])
+    allocation = plan["sku_capacity_allocations"][0]
+    assert diagnostics["valid"]
+    assert allocation["occupied_target_position_ids"] == ["D1", "P1"]
+    assert allocation["stock_positions_required"] == 2
+    assert allocation["reserved_position_ids"] == []
+
+
+def test_unknown_represented_origin_is_counted_but_never_released_for_reservation():
+    model, state = fixture([], free=[("P2", "heavy")], unknown=[("P1", "heavy")])
+    state["physical_positions"][1].update(pallet_unit_id="pallet-1")
+    state["stock_lots"] = [{"stock_lot_id": "lot-1", "sku_key": "A", "qty_boxes": 10,
+                            "location_status": "located", "cell_key": "cell:P1",
+                            "position_id": "P1", "pallet_unit_id": "pallet-1"}]
+    state["pallet_units"] = [{"pallet_unit_id": "pallet-1", "sku_key": "A", "remaining_boxes": 10,
+                              "physical_status": "active", "location_status": "located",
+                              "position_id": "P1", "cell_key": "cell:P1"}]
+    configured = rules(base_sku_capacity={"enabled": True,
+        "parameters": {"minimum_positions_per_sku": 2}})
+    plan, diagnostics = build_proposed_placement_plan(model, state, configured, [])
+    allocation = plan["sku_capacity_allocations"][0]
+    assert diagnostics["valid"] and allocation["stock_positions_required"] == 1
+    assert allocation["reserved_position_ids"] == ["P2"]
 
 
 def velocity_fixture():
