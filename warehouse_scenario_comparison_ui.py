@@ -84,12 +84,14 @@ def build_weight_zone_rule_config(enabled: bool) -> dict[str, dict[str, Any]]:
 def build_scenario_rule_config(*, weight_zones_enabled: bool, velocity_enabled: bool,
                                adjacency_enabled: bool = False,
                                base_sku_capacity_enabled: bool = False,
-                               picking_storage_enabled: bool = False) -> dict[str, dict[str, Any]]:
+                               picking_storage_enabled: bool = False,
+                               replenishment_enabled: bool = False) -> dict[str, dict[str, Any]]:
     """Translate the supported UI toggles into the backend rule contract."""
     return {"weight_zones": {"enabled": bool(weight_zones_enabled)},
             "velocity": {"enabled": bool(velocity_enabled)},
             "adjacency": {"enabled": bool(adjacency_enabled)},
             "picking_storage": {"enabled": bool(picking_storage_enabled)},
+            "replenishment": {"enabled": bool(replenishment_enabled and picking_storage_enabled)},
             "base_sku_capacity": {"enabled": bool(base_sku_capacity_enabled),
                                   "parameters": {"minimum_positions_per_sku": 1}}}
 
@@ -228,6 +230,15 @@ def _show_distance_comparison(comparison: Mapping[str, Any]) -> None:
                ("Экономия, м", "distance_saved_m"), ("Экономия, %", "distance_saved_percent"))
     for column, (label, key) in zip(st.columns(4), primary):
         column.metric(label, f"{float(summary.get(key) or 0):,.2f}".replace(",", " "))
+    st.caption(
+        f"Пополнение: {float(summary.get('proposed_replenishment_distance_m') or 0):,.2f} м · "
+        f"Общее движение CURRENT / PROPOSED: "
+        f"{float(summary.get('current_total_movement_distance_m') or 0):,.2f} / "
+        f"{float(summary.get('proposed_total_movement_distance_m') or 0):,.2f} м · "
+        f"Событий: {summary.get('replenishment_event_count', 0)} · "
+        f"Fallback: {summary.get('replenishment_fallback_count', 0)} · "
+        f"Покрытие: {float(summary.get('replenishment_modeled_coverage_percent', 100)):,.1f}%"
+    )
     for title, prefix in (("Средний пробег / РО", "average"), ("Медианный пробег / РО", "median")):
         st.markdown(f"**{title}**")
         values = (("CURRENT", f"{prefix}_current_distance_per_order_m"),
@@ -283,11 +294,14 @@ def render_scenario_comparison(
     velocity_enabled = st.checkbox("Оборачиваемость / частота отбора", key=f"{SESSION_PREFIX}_velocity")
     adjacency_enabled = st.checkbox("Товарное соседство", key=f"{SESSION_PREFIX}_adjacency")
     picking_storage_enabled = st.checkbox("Комплектация / хранение", key=f"{SESSION_PREFIX}_picking_storage")
+    replenishment_enabled = st.checkbox("Пополнение комплектации", disabled=not picking_storage_enabled,
+                                        key=f"{SESSION_PREFIX}_replenishment")
     base_capacity_enabled = st.checkbox("Базовое место для SKU", key=f"{SESSION_PREFIX}_base_capacity")
     rule_config = build_scenario_rule_config(weight_zones_enabled=weight_zones, velocity_enabled=velocity_enabled,
                                              adjacency_enabled=adjacency_enabled,
                                              base_sku_capacity_enabled=base_capacity_enabled,
-                                             picking_storage_enabled=picking_storage_enabled)
+                                             picking_storage_enabled=picking_storage_enabled,
+                                             replenishment_enabled=replenishment_enabled)
     adjacency_profile, adjacency_diagnostics = build_sku_adjacency_profile(adjacency_rows)
     if adjacency_enabled and not adjacency_rows:
         st.caption("Связанные товарные группы не загружены — используется только компактное размещение одинаковых SKU.")
@@ -410,7 +424,8 @@ def render_scenario_comparison(
         if st.button("Рассчитать пробег CURRENT / PROPOSED", disabled=not distance_ready,
                      key=f"{SESSION_PREFIX}_distance_calculate"):
             replay, replay_diagnostics = replay_outbound_on_simulation_states(
-                model, baseline, proposed, demand, gate_state or {})
+                model, baseline, proposed, demand, gate_state or {},
+                placement_rule_set=scenario.get("placement_rule_set"))
             comparison, comparison_diagnostics = compare_simulation_outbound_replay(replay) if replay else ({}, {})
             st.session_state[f"{SESSION_PREFIX}_distance_replay"] = replay
             st.session_state[f"{SESSION_PREFIX}_distance_comparison"] = comparison
