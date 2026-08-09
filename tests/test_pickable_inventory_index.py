@@ -10,6 +10,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from warehouse_inventory_placement import make_sku_key
+from warehouse_business_identity import canonical_sku_key
 from warehouse_pick_inventory import build_pickable_inventory_index
 
 
@@ -64,7 +65,7 @@ def test_characteristics_form_distinct_canonical_skus_without_stored_key():
     red.pop("sku_key")
     blue.pop("sku_key")
     result = build_pickable_inventory_index(_model([_cell()]), {"placements": [red, blue]})
-    assert set(result["by_sku"]) == {"code:SKU-1|char_name:Red", "code:SKU-1|char_name:Blue"}
+    assert set(result["by_sku"]) == {canonical_sku_key({"nomenclature": "Product", "characteristic": "Red"}), canonical_sku_key({"nomenclature": "Product", "characteristic": "Blue"})}
 
 
 def test_duplicates_sum_stock_fields_separately_and_report_metadata_conflict():

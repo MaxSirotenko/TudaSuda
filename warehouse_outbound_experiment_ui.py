@@ -23,8 +23,6 @@ from warehouse_inventory_results_import import (
     get_inventory_results_sheet_names, read_inventory_results_table,
     select_inventory_rows_for_opening_stock,
 )
-from warehouse_outbound_experiment_inputs import build_outbound_experiment_inputs
-from warehouse_outbound_experiment_pipeline import run_outbound_distance_experiment
 from warehouse_outbound_orders import (
     detect_outbound_columns, get_outbound_sheet_names, normalize_outbound_table,
     read_outbound_table,
@@ -114,25 +112,10 @@ def build_experiment_quality_rows(experiment_state: dict[str, Any]) -> list[dict
 def experiment_inputs_ready(*, day_receipt_state: Any, start_state: Any, end_state: Any,
                             opening_inventory_rows: Any, outbound_rows: Any, gate_confirmed: bool) -> bool:
     """UI readiness only; absent slotting is deliberately not a blocker."""
-    return bool(isinstance(day_receipt_state, Mapping) and day_receipt_state.get("receipt_sku_batches")
-                and isinstance(start_state, Mapping) and start_state.get("placements")
-                and isinstance(end_state, Mapping) and end_state.get("placements")
+    # Receipts and END are optional validation inputs in the V1 opening-stock replay.
+    del day_receipt_state, end_state
+    return bool(isinstance(start_state, Mapping) and start_state.get("placements")
                 and opening_inventory_rows and outbound_rows and gate_confirmed)
-
-
-def calculate_outbound_experiment(model: dict[str, Any], day_receipt_state: dict[str, Any],
-                                  start_state: dict[str, Any], end_state: dict[str, Any],
-                                  opening_rows: list[dict[str, Any]], outbound_rows: list[dict[str, Any]],
-                                  slotting_rows: list[dict[str, Any]], gate_config: dict[str, Any]):
-    """One-button orchestration seam, intentionally containing no business calculations."""
-    input_state, input_diagnostics = build_outbound_experiment_inputs(
-        model, day_receipt_state, start_state, end_state, opening_rows,
-        outbound_rows, slotting_rows, gate_config,
-    )
-    if input_state.get("pipeline_inputs_ready") is not True:
-        return input_state, input_diagnostics, None, None
-    state, diagnostics = run_outbound_distance_experiment(**input_state["pipeline_inputs"])
-    return input_state, input_diagnostics, state, diagnostics
 
 
 def _hash_bytes(data: bytes) -> str:
@@ -198,8 +181,9 @@ def _render_results(state: dict[str, Any], diagnostics: dict[str, Any], input_st
 
 
 def render_outbound_experiment(model: dict[str, Any]) -> None:
-    """Render the independent, read-only outbound distance experiment."""
-    st.subheader("CURRENT vs PROPOSED")
+    """Render the authoritative SimulationState CURRENT/PROPOSED benchmark."""
+    st.subheader("Авторитетный CURRENT vs PROPOSED")
+    st.caption("V1: начальный остаток → расходные ордера; приход внутри дня не моделируется. END — только независимая валидация.")
     receipt_state, receipt_diag, receipt_hash, receipt_sheet = _excel_upload(
         "Дневной приход", "experiment_receipts", get_day_receipts_sheet_names,
         read_day_receipts_table, detect_day_receipts_columns, build_day_receipts_import)
@@ -215,12 +199,16 @@ def render_outbound_experiment(model: dict[str, Any]) -> None:
             day_state, day_diag = build_day_receipt_scenario_inputs(
                 receipt_state, operational_date=operational_date, selected_warehouses=[selected_warehouse])
             if day_diag.get("configuration_errors"): st.error(day_diag["configuration_errors"])
+    else:
+        st.info("Дневной приход не обязателен для V1 benchmark.")
+        operational_date = st.date_input("Операционный день", key="benchmark_day_without_receipts")
+        selected_warehouse = st.text_input("Склад", key="benchmark_warehouse_without_receipts").strip() or None
 
     start_state, start_diag, start_hash, start_sheet = _excel_upload(
         "Фактическое размещение — НАЧАЛО дня", "experiment_start", get_actual_inventory_sheet_names,
         read_actual_inventory_table, detect_actual_inventory_columns, build_actual_inventory_placement_state, model)
     end_state, end_diag, end_hash, end_sheet = _excel_upload(
-        "Фактическое размещение — КОНЕЦ дня", "experiment_end", get_actual_inventory_sheet_names,
+        "Фактическое размещение — КОНЕЦ дня (необязательно, только валидация)", "experiment_end", get_actual_inventory_sheet_names,
         read_actual_inventory_table, detect_actual_inventory_columns, build_actual_inventory_placement_state, model)
     for title, diag in (("START", start_diag), ("END", end_diag)):
         if diag:
@@ -303,37 +291,5 @@ def render_outbound_experiment(model: dict[str, Any]) -> None:
         start_state=start_state, opening_rows=opening_rows,
         classification_rows=loaded_classifications, outbound_rows=outbound_rows,
         gate_state={"model_id": model.get("model_id"), "gates": [gate_config]} if gate_confirmed else None,
+        end_snapshot=end_state,
     )
-
-    signature = build_experiment_ui_signature(
-        receipt_hash=receipt_hash, receipt_sheet=receipt_sheet, operational_date=operational_date,
-        warehouse=selected_warehouse, start_hash=start_hash, start_sheet=start_sheet,
-        end_hash=end_hash, end_sheet=end_sheet, inventory_hash=inventory_hash,
-        inventory_sheet=inventory_sheet, inventory_document_keys=inventory_keys,
-        outbound_source=source, outbound_hash=outbound_hash, outbound_sheet=outbound_sheet,
-        slotting_rows=slotting_rows, gate_config=gate_config)
-    readiness = {
-        "Дневной приход": bool(day_state.get("receipt_sku_batches")), "START snapshot": bool(start_state and start_state.get("placements")),
-        "END snapshot": bool(end_state and end_state.get("placements")), "Opening inventory": bool(opening_rows),
-        "Расходные ордера": bool(outbound_rows), "Slotting": bool(slotting_rows) if editor_rows else False,
-        "Ворота": gate_confirmed,
-    }
-    st.markdown("#### Готовность данных")
-    st.write(" · ".join(f"{'✓' if ready else ('⚠' if name == 'Slotting' else '✗')} {name}" for name, ready in readiness.items()))
-    ready = experiment_inputs_ready(day_receipt_state=day_state, start_state=start_state, end_state=end_state,
-                                    opening_inventory_rows=opening_rows, outbound_rows=outbound_rows,
-                                    gate_confirmed=gate_confirmed)
-    if st.button("Рассчитать эксперимент", type="primary", disabled=not ready):
-        results = calculate_outbound_experiment(model, day_state, start_state, end_state, opening_rows,
-                                                outbound_rows, slotting_rows, gate_config)
-        for key, value in zip(SESSION_KEYS[:4], results): st.session_state[key] = value
-        st.session_state[SESSION_KEYS[4]] = signature
-        if results[0].get("pipeline_inputs_ready") is not True:
-            st.error(results[1].get("configuration_errors", []))
-
-    saved_signature = st.session_state.get(SESSION_KEYS[4])
-    if experiment_result_is_stale(signature, saved_signature):
-        st.warning("Исходные данные изменены. Пересчитайте эксперимент.")
-    elif st.session_state.get(SESSION_KEYS[2]):
-        _render_results(st.session_state[SESSION_KEYS[2]], st.session_state.get(SESSION_KEYS[3], {}),
-                        st.session_state.get(SESSION_KEYS[0], {}))

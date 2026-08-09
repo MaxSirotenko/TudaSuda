@@ -76,7 +76,7 @@ def test_keys_sku_key_quantity_sources_and_pallet_audit():
     empty_pallet, _ = build([row(КоличествоПаллет=None)])
     assert empty_pallet["accepted_rows"][0]["reported_pallets"] is None
     mapped = mod.build_day_receipts_import(pd.DataFrame([row(sku_key="ready")]), {**mod.detect_day_receipts_columns(pd.DataFrame([row(sku_key="ready")])), "sku_key": "sku_key"})[0]
-    assert mapped["accepted_rows"][0]["sku_key"] == "ready"
+    assert mapped["accepted_rows"][0]["sku_key"] == make_outbound_sku_key("SKU X", "RED")
 
 
 def test_box_quantity_validation_controls_and_terminal_flags():

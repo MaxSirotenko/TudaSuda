@@ -28,8 +28,7 @@ from warehouse_placement_zones import is_assignable_placement_zone, normalize_pl
 from warehouse_proposed_scenario import build_proposed_scenario
 from warehouse_sku_velocity import build_sku_velocity_profile
 from warehouse_sku_adjacency import build_sku_adjacency_profile
-from warehouse_simulation_distance_comparison import compare_simulation_outbound_replay
-from warehouse_simulation_outbound_replay import replay_outbound_on_simulation_states
+from warehouse_day_benchmark import run_warehouse_day_benchmark
 from warehouse_simulation_render import build_simulation_dynamic_payload
 from warehouse_simulation_state import build_initial_simulation_state
 
@@ -241,11 +240,15 @@ def build_distance_order_rows(comparison: Mapping[str, Any]) -> list[dict[str, A
 
 def _show_distance_comparison(comparison: Mapping[str, Any]) -> None:
     summary, coverage = comparison.get("summary", {}), comparison.get("coverage", {})
-    st.markdown("### Экономия пробега")
-    primary = (("CURRENT, м", "current_total_distance_m"), ("PROPOSED, м", "proposed_total_distance_m"),
-               ("Экономия, м", "distance_saved_m"), ("Экономия, %", "distance_saved_percent"))
-    for column, (label, key) in zip(st.columns(4), primary):
-        column.metric(label, f"{float(summary.get(key) or 0):,.2f}".replace(",", " "))
+    authoritative = comparison.get("authoritative_summary", {})
+    st.markdown("### Экономия пробега комплектовщика")
+    if comparison.get("full_day_effect_valid"):
+        primary = (("CURRENT, м", "current_picker_distance_m"), ("PROPOSED, м", "proposed_picker_distance_m"),
+                   ("Экономия, м", "picker_distance_saved_m"), ("Экономия, %", "picker_distance_saved_percent"))
+        for column, (label, key) in zip(st.columns(4), primary):
+            column.metric(label, f"{float(authoritative.get(key) or 0):,.2f}".replace(",", " "))
+    else:
+        st.error("Headline экономии скрыт: полный день не прошёл строгую эквивалентность сервиса и маршрутов.")
     st.caption(
         f"Пополнение: {float(summary.get('proposed_replenishment_distance_m') or 0):,.2f} м · "
         f"Общее движение CURRENT / PROPOSED: "
@@ -278,6 +281,7 @@ def render_scenario_comparison(
     classification_rows: Sequence[Mapping[str, Any]] | None,
     outbound_rows: Sequence[Mapping[str, Any]] | None = None,
     gate_state: dict[str, Any] | None = None,
+    end_snapshot: dict[str, Any] | None = None,
 ) -> None:
     """Render the independent placement preview before the outbound replay UI."""
     st.divider()
@@ -450,16 +454,18 @@ def render_scenario_comparison(
         distance_signature = _hash({"model_id": model.get("model_id"), "current": baseline.get("simulation_state_id"),
                                     "proposed": scenario.get("proposed_state_id"), "demand": demand,
                                     "gate": gate_state, "zone_order": "default"})
-        if st.button("Рассчитать пробег CURRENT / PROPOSED", disabled=not distance_ready,
+        if st.button("Рассчитать CURRENT / PROPOSED", disabled=not distance_ready,
                      key=f"{SESSION_PREFIX}_distance_calculate"):
-            replay, replay_diagnostics = replay_outbound_on_simulation_states(
-                model, baseline, proposed, demand, gate_state or {},
-                placement_rule_set=scenario.get("placement_rule_set"))
-            comparison, comparison_diagnostics = compare_simulation_outbound_replay(replay) if replay else ({}, {})
+            benchmark, benchmark_diagnostics = run_warehouse_day_benchmark(
+                model, baseline, demand, gate_state or {}, rule_config,
+                sku_zone_rows=sku_zone_rows,
+                sku_velocity_rows=velocity_profile.get("rows", []) if velocity_profile else None,
+                end_snapshot=end_snapshot)
+            replay = benchmark.get("replay", {})
+            comparison = benchmark.get("comparison", {})
             st.session_state[f"{SESSION_PREFIX}_distance_replay"] = replay
             st.session_state[f"{SESSION_PREFIX}_distance_comparison"] = comparison
-            st.session_state[f"{SESSION_PREFIX}_distance_diagnostics"] = {
-                "replay": replay_diagnostics, "comparison": comparison_diagnostics}
+            st.session_state[f"{SESSION_PREFIX}_distance_diagnostics"] = benchmark_diagnostics
             st.session_state[f"{SESSION_PREFIX}_distance_signature"] = distance_signature
         saved_distance_signature = st.session_state.get(f"{SESSION_PREFIX}_distance_signature")
         if saved_distance_signature and saved_distance_signature != distance_signature:

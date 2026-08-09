@@ -4,12 +4,13 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from warehouse_inventory_placement import reconcile_placements_with_inventory
+from warehouse_business_identity import canonical_sku_key
 
 
 def _placement(sku_key: str, cell_number: int, qty: float, characteristic: str = "A", receipt: str = "R1"):
     return {
         "placement_id": f"p-{sku_key}-{cell_number}",
-        "sku_key": sku_key,
+        "sku_key": canonical_sku_key({"nomenclature": "Товар", "characteristic": characteristic}),
         "sku_code": sku_key.split("|")[0],
         "sku_name": "Товар",
         "item_name": "Товар",
@@ -33,7 +34,7 @@ def _state(placements):
 
 def _inventory(sku_key: str, qty: float, characteristic: str = "A", receipt: str = "INV"):
     return {
-        "sku_key": sku_key,
+        "sku_key": canonical_sku_key({"nomenclature": "Товар", "characteristic": characteristic}),
         "sku_name": "Товар",
         "item_name": "Товар",
         "characteristic_name": characteristic,
@@ -98,9 +99,9 @@ def test_different_characteristics_are_reconciled_separately():
     placements = [_placement("name:Товар|char_name:A", 1, 1, "A"), _placement("name:Товар|char_name:B", 2, 1, "B")]
     state, report = reconcile_placements_with_inventory({}, _state(placements), [_inventory("name:Товар|char_name:A", 1, "A")], inventory_date="2026-07-16")
 
-    assert [p["sku_key"] for p in state["placements"]] == ["name:Товар|char_name:A"]
+    assert [p["sku_key"] for p in state["placements"]] == [canonical_sku_key({"nomenclature": "Товар", "characteristic": "A"})]
     statuses = {row["sku_key"]: row["Статус"] for row in report["details"]}
-    assert statuses["name:Товар|char_name:B"] == "removed"
+    assert statuses[canonical_sku_key({"nomenclature": "Товар", "characteristic": "B"})] == "removed"
 
 
 def test_receipt_numbers_do_not_participate_in_sku_key():

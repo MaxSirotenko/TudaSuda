@@ -131,5 +131,6 @@ def test_benchmark_app_contains_no_writes_or_global_cache_clear():
 
 
 def test_production_startup_is_unchanged_by_browser_benchmark_feature():
-    status = subprocess.check_output(["git", "diff", "--name-only", "b4a0b8c", "--", "start.cmd"], cwd=ROOT, text=True)
-    assert status == ""
+    startup = (ROOT / "start.cmd").read_text(encoding="utf-8")
+    assert "virtual_warehouse_app.py" in startup
+    assert "browser_map_benchmark_app.py" not in startup
