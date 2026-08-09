@@ -86,7 +86,8 @@ def build_scenario_rule_config(*, weight_zones_enabled: bool, velocity_enabled: 
                                base_sku_capacity_enabled: bool = False,
                                picking_storage_enabled: bool = False,
                                deep_lane_optimization_enabled: bool = False,
-                               replenishment_enabled: bool = False) -> dict[str, dict[str, Any]]:
+                               replenishment_enabled: bool = False,
+                               minimum_positions_per_sku: int = 1) -> dict[str, dict[str, Any]]:
     """Translate the supported UI toggles into the backend rule contract."""
     return {"weight_zones": {"enabled": bool(weight_zones_enabled)},
             "velocity": {"enabled": bool(velocity_enabled)},
@@ -95,7 +96,7 @@ def build_scenario_rule_config(*, weight_zones_enabled: bool, velocity_enabled: 
             "deep_lane_optimization": {"enabled": bool(deep_lane_optimization_enabled)},
             "replenishment": {"enabled": bool(replenishment_enabled and picking_storage_enabled)},
             "base_sku_capacity": {"enabled": bool(base_sku_capacity_enabled),
-                                  "parameters": {"minimum_positions_per_sku": 1}}}
+                                  "parameters": {"minimum_positions_per_sku": int(minimum_positions_per_sku)}}}
 
 
 def build_sku_zone_rows(classification_rows: Sequence[Mapping[str, Any]] | None) -> list[dict[str, str]]:
@@ -297,6 +298,8 @@ def render_scenario_comparison(
     gate_state: dict[str, Any] | None = None,
     end_snapshot: dict[str, Any] | None = None,
     inventory_control_supplied: bool | None = None,
+    rule_config: Mapping[str, Any] | None = None,
+    show_distance: bool = True,
 ) -> None:
     """Render the independent placement preview before the outbound replay UI."""
     st.divider()
@@ -333,21 +336,24 @@ def render_scenario_comparison(
         "deep_lane_depth_authoritative",
     )})
 
-    st.markdown("### Правила PROPOSED")
-    weight_zones = st.checkbox("Весовые зоны", key=f"{SESSION_PREFIX}_weight_zones")
-    velocity_enabled = st.checkbox("Оборачиваемость / частота отбора", key=f"{SESSION_PREFIX}_velocity")
-    adjacency_enabled = st.checkbox("Товарное соседство", key=f"{SESSION_PREFIX}_adjacency")
-    picking_storage_enabled = st.checkbox("Комплектация / хранение", key=f"{SESSION_PREFIX}_picking_storage")
-    deep_lane_enabled = st.checkbox("Оптимизация deep lane", key=f"{SESSION_PREFIX}_deep_lane")
-    replenishment_enabled = st.checkbox("Пополнение комплектации", disabled=not picking_storage_enabled,
-                                        key=f"{SESSION_PREFIX}_replenishment")
-    base_capacity_enabled = st.checkbox("Базовое место для SKU", key=f"{SESSION_PREFIX}_base_capacity")
-    rule_config = build_scenario_rule_config(weight_zones_enabled=weight_zones, velocity_enabled=velocity_enabled,
-                                             adjacency_enabled=adjacency_enabled,
-                                             base_sku_capacity_enabled=base_capacity_enabled,
-                                             picking_storage_enabled=picking_storage_enabled,
-                                             deep_lane_optimization_enabled=deep_lane_enabled,
-                                             replenishment_enabled=replenishment_enabled)
+    st.markdown("### Используемые правила PROPOSED")
+    if rule_config is None:
+        st.error("Условия модели не настроены. Откройте «Условия модели» и сохраните RuleSet.")
+        return
+    rule_config = {str(key): dict(value) for key, value in rule_config.items()}
+    labels = {"weight_zones": "Весовые зоны", "velocity": "Оборачиваемость",
+              "adjacency": "Товарное соседство", "picking_storage": "Комплектация / хранение",
+              "deep_lane_optimization": "Deep lane", "replenishment": "Пополнение",
+              "base_sku_capacity": "Базовое место для SKU"}
+    st.write(" · ".join(f"{'✓' if rule_config.get(key, {}).get('enabled') else '—'} {label}"
+                        for key, label in labels.items()))
+    st.caption("Это read-only сводка. Изменить настройки можно только в разделе «Условия модели».")
+    weight_zones = bool(rule_config.get("weight_zones", {}).get("enabled"))
+    velocity_enabled = bool(rule_config.get("velocity", {}).get("enabled"))
+    adjacency_enabled = bool(rule_config.get("adjacency", {}).get("enabled"))
+    picking_storage_enabled = bool(rule_config.get("picking_storage", {}).get("enabled"))
+    deep_lane_enabled = bool(rule_config.get("deep_lane_optimization", {}).get("enabled"))
+    base_capacity_enabled = bool(rule_config.get("base_sku_capacity", {}).get("enabled"))
     adjacency_profile, adjacency_diagnostics = build_sku_adjacency_profile(baseline)
     velocity_profile = None
     velocity_diagnostics: dict[str, Any] = {"valid": True, "errors": [], "warnings": []}
@@ -374,6 +380,8 @@ def render_scenario_comparison(
         adjacency_profile_id=adjacency_profile.get("adjacency_profile_id") if adjacency_enabled else None,
         gate_identity=gate_state if velocity_enabled or picking_storage_enabled else None,
     )
+    st.session_state[f"{SESSION_PREFIX}_active_signature"] = signature
+    st.session_state[f"{SESSION_PREFIX}_current_state"] = baseline
     if st.button("Пересчитать PROPOSED", type="primary", key=f"{SESSION_PREFIX}_calculate"):
         scenario, diagnostics = build_proposed_scenario(
             model, baseline, rule_config, sku_zone_rows=sku_zone_rows,
@@ -458,6 +466,8 @@ def render_scenario_comparison(
             st.warning(f"Неразрешено: {summary.get('unresolved_units', 0)} · "
                        f"фиксировано: {summary.get('fixed_units', 0)}")
 
+        if not show_distance:
+            return
         scoped_rows = [dict(row) for row in outbound_rows or []
                        if (not operational_date or str(row.get("created_at") or "")[:10] == str(operational_date)[:10])
                        and (not target or normalize_warehouse(row.get("warehouse")) == target)]
@@ -479,6 +489,8 @@ def render_scenario_comparison(
         distance_signature = _hash({"model_id": model.get("model_id"), "current": baseline.get("simulation_state_id"),
                                     "proposed": scenario.get("proposed_state_id"), "demand": demand,
                                     "gate": gate_state, "zone_order": "default"})
+        st.session_state[f"{SESSION_PREFIX}_active_distance_signature"] = distance_signature
+        st.session_state[f"{SESSION_PREFIX}_outbound_demand_state"] = demand
         if st.button("Рассчитать CURRENT / PROPOSED", disabled=not distance_ready,
                      key=f"{SESSION_PREFIX}_distance_calculate"):
             benchmark, benchmark_diagnostics = run_warehouse_day_benchmark(
@@ -497,3 +509,5 @@ def render_scenario_comparison(
             st.warning("Результат пробега устарел. Нажмите кнопку расчёта повторно.")
         elif st.session_state.get(f"{SESSION_PREFIX}_distance_comparison"):
             _show_distance_comparison(st.session_state[f"{SESSION_PREFIX}_distance_comparison"])
+            from warehouse_route_ui import render_replay_routes
+            render_replay_routes(st.session_state.get(f"{SESSION_PREFIX}_distance_replay") or {})

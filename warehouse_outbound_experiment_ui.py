@@ -31,6 +31,7 @@ from warehouse_business_identity import normalize_warehouse
 from warehouse_placement_zones import get_assignable_placement_zones, get_placement_zone_label
 from warehouse_state_cache import load_outbound_orders_cached, load_receipts_state_cached
 from warehouse_scenario_comparison_ui import render_scenario_comparison
+from warehouse_ui_messages import get_ui_message
 
 
 ZONE_TO_CODE = {get_placement_zone_label(zone): zone for zone in get_assignable_placement_zones()}
@@ -150,6 +151,25 @@ def validate_outbound_scope(rows: Any, warehouse: Any, operational_date: Any) ->
     return []
 
 
+def available_operational_dates(outbound_rows: Any, warehouse: Any) -> list[str]:
+    """V1 dates come only from accepted outbound demand, never optional receipts."""
+    target = normalize_warehouse(warehouse)
+    return sorted({str(row.get("created_at"))[:10] for row in outbound_rows or []
+                   if row.get("created_at") and normalize_warehouse(row.get("warehouse")) == target})
+
+
+def configured_gate_state(model: Mapping[str, Any], selected_gate_key: Any = None) -> dict[str, Any] | None:
+    """Select only a persistent model gate; never manufacture experiment coordinates."""
+    gates = [dict(gate) for gate in model.get("gates", []) or []
+             if gate.get("gate_key") and gate.get("x") is not None and gate.get("y") is not None]
+    if not gates:
+        return None
+    selected = next((gate for gate in gates if str(gate.get("gate_key")) == str(selected_gate_key)), None)
+    if selected is None and len(gates) == 1:
+        selected = gates[0]
+    return {"model_id": model.get("model_id"), "gates": [selected]} if selected else None
+
+
 def _hash_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -238,17 +258,7 @@ def render_outbound_experiment(model: dict[str, Any]) -> None:
                                           placeholder="Выберите один склад", key="experiment_start_warehouse")
     elif start_state:
         st.error("START не содержит нормализованного склада.")
-    if receipt_state:
-        accepted = receipt_state.get("accepted_rows", [])
-        dates = sorted({str(row.get("receipt_date"))[:10] for row in accepted if row.get("receipt_date")})
-        operational_date = st.selectbox("Операционный день", dates, key="experiment_day") if dates else None
-        if operational_date and selected_warehouse:
-            day_state, day_diag = build_day_receipt_scenario_inputs(
-                receipt_state, operational_date=operational_date, selected_warehouses=[selected_warehouse])
-            if day_diag.get("configuration_errors"): st.error(day_diag["configuration_errors"])
-    else:
-        st.info("Дневной приход не обязателен для V1 benchmark.")
-        operational_date = st.date_input("Операционный день", key="benchmark_day_without_receipts")
+    st.info("Дневной приход не обязателен для V1 benchmark и не определяет операционный день.")
     end_state, end_diag, end_hash, end_sheet = _excel_upload(
         "END snapshot — необязательно, только валидация", "experiment_end", get_actual_inventory_sheet_names,
         read_actual_inventory_table, detect_actual_inventory_columns, build_actual_inventory_placement_state, model)
@@ -294,9 +304,21 @@ def render_outbound_experiment(model: dict[str, Any]) -> None:
             outbound_rows, outbound_diag = normalize_outbound_table(table, detect_outbound_columns(table))
             if outbound_diag: st.json(outbound_diag)
 
+    dates = available_operational_dates(outbound_rows, selected_warehouse)
+    operational_date = st.selectbox("Операционный день", dates, index=None,
+                                    placeholder="Выберите день из расходных РО", key="experiment_day") if dates else None
+    if receipt_state and operational_date and selected_warehouse:
+        day_state, day_diag = build_day_receipt_scenario_inputs(
+            receipt_state, operational_date=operational_date, selected_warehouses=[selected_warehouse])
+        if day_diag.get("configuration_errors"):
+            st.warning("Приход не соответствует выбранному дню; это не блокирует V1 benchmark.")
+
     scope_errors = validate_outbound_scope(outbound_rows, selected_warehouse, operational_date)
     for error in scope_errors:
-        st.error(error)
+        issue = get_ui_message(error)
+        st.error(f"{issue['title']}\n\n{issue['message']}\n\nЧто сделать: {issue['solution']}")
+        with st.expander("Технический код"):
+            st.code(issue["technical_code"])
 
     classifications = {r.get("sku_key"): r.get("calculated_zone") for r in loaded_receipts.get("receipts", [])
                        if r.get("calculated_zone") in CODE_TO_ZONE}
@@ -317,26 +339,34 @@ def render_outbound_experiment(model: dict[str, Any]) -> None:
                                   "priority_rank": None if pd.isna(priority) else int(priority),
                                   "source": "loaded_receipt_classification" if original == zone else "experiment_ui_manual"})
 
-    roads = model.get("roads", []) or []
-    road_options = list(range(len(roads)))
-    road_index = st.selectbox("Дорога/проезд для ворот", road_options,
-                              format_func=lambda i: f"{roads[i].get('road_type')} · {roads[i].get('road_id', i)} · "
-                              f"x=[{roads[i].get('x_min')}, {roads[i].get('x_max')}], y=[{roads[i].get('y_min')}, {roads[i].get('y_max')}]" ) if roads else None
-    gate_config: dict[str, Any] = {}
-    gate_confirmed = False
-    if road_index is not None:
-        road = roads[road_index]
-        x = st.number_input("X ворот", value=float(road.get("x_min", 0) + road.get("x_max", 0)) / 2)
-        y = st.number_input("Y ворот", value=float(road.get("y_min", 0) + road.get("y_max", 0)) / 2)
-        gate_confirmed = st.checkbox("Использовать эти координаты ворот")
-        gate_config = {"gate_key": "experiment_gate", "gate_name": "Ворота эксперимента",
-                       "road_type": road.get("road_type"), "x": float(x), "y": float(y)}
+    persistent_gate_state = st.session_state.get("workspace_gate_state") or {}
+    if persistent_gate_state.get("model_id") != model.get("model_id"):
+        persistent_gate_state = {"model_id": model.get("model_id"), "gates": model.get("gates", []) or []}
+    gate_options = [gate for gate in persistent_gate_state.get("gates", []) or [] if gate.get("gate_key")]
+    selected_gate_key = None
+    if len(gate_options) > 1:
+        selected_gate_key = st.selectbox("Ворота начала/возврата", [gate["gate_key"] for gate in gate_options],
+                                         index=None, placeholder="Выберите настроенные ворота")
+    elif gate_options:
+        selected_gate_key = gate_options[0]["gate_key"]
+        st.caption(f"Ворота: {gate_options[0].get('gate_name') or selected_gate_key}")
+    gate_model = {**model, "gates": gate_options}
+    gate_state = configured_gate_state(gate_model, selected_gate_key)
+    if gate_state is None:
+        st.warning("Сначала настройте ворота в Склад → Ворота.")
+
+    st.session_state["outbound_selected_warehouse"] = selected_warehouse
+    st.session_state["outbound_selected_date"] = operational_date
+    st.session_state["placement_comparison_gate_state"] = gate_state
+    st.session_state["outbound_mandatory_data_checks_passed"] = not scope_errors and bool(start_state)
+    st.session_state["placement_comparison_benchmark_prerequisites_ready"] = bool(gate_state and not scope_errors)
 
     render_scenario_comparison(
         model, operational_date=operational_date, selected_warehouse=selected_warehouse,
         start_state=start_state, opening_rows=opening_rows,
         classification_rows=loaded_classifications, outbound_rows=outbound_rows,
-        gate_state={"model_id": model.get("model_id"), "gates": [gate_config]} if gate_confirmed else None,
+        gate_state=gate_state,
         end_snapshot=end_state,
         inventory_control_supplied=inventory_state is not None,
+        rule_config=st.session_state.get("workspace_rule_config"),
     )

@@ -42,7 +42,7 @@ def test_workspace_rendering_is_delegated_without_calculation(monkeypatch):
     monkeypatch.setattr(workspace, "render_operational_workspace", lambda model, **renderers: captured.update(model=model, renderers=renderers))
     app.render_excel_geometry_warehouse()
     assert captured["model"] == {"model_id": "saved"}
-    assert len(captured["renderers"]) == 5
+    assert len(captured["renderers"]) == 6
 
 
 def test_geometry_screen_loads_applied_model_without_row_settings_sync():
