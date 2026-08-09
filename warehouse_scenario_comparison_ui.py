@@ -74,17 +74,21 @@ def build_comparison_signature(
     return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def build_weight_zone_rule_config(enabled: bool) -> dict[str, dict[str, bool]]:
+def build_weight_zone_rule_config(enabled: bool) -> dict[str, dict[str, Any]]:
     """Backward-compatible adapter for callers that expose only weight zones."""
-    return build_scenario_rule_config(weight_zones_enabled=enabled, velocity_enabled=False, adjacency_enabled=False)
+    return build_scenario_rule_config(weight_zones_enabled=enabled, velocity_enabled=False,
+                                      adjacency_enabled=False, base_sku_capacity_enabled=False)
 
 
 def build_scenario_rule_config(*, weight_zones_enabled: bool, velocity_enabled: bool,
-                               adjacency_enabled: bool = False) -> dict[str, dict[str, bool]]:
+                               adjacency_enabled: bool = False,
+                               base_sku_capacity_enabled: bool = False) -> dict[str, dict[str, Any]]:
     """Translate the supported UI toggles into the backend rule contract."""
     return {"weight_zones": {"enabled": bool(weight_zones_enabled)},
             "velocity": {"enabled": bool(velocity_enabled)},
-            "adjacency": {"enabled": bool(adjacency_enabled)}}
+            "adjacency": {"enabled": bool(adjacency_enabled)},
+            "base_sku_capacity": {"enabled": bool(base_sku_capacity_enabled),
+                                  "parameters": {"minimum_positions_per_sku": 1}}}
 
 
 def build_sku_zone_rows(classification_rows: Sequence[Mapping[str, Any]] | None) -> list[dict[str, str]]:
@@ -125,6 +129,10 @@ def summarize_scenario_ui_metrics(
         if opening_skus else 100.0,
         "compliance_before_percent": summary.get("weight_zone_compliance_before_percent", 100.0),
         "compliance_after_percent": summary.get("weight_zone_compliance_after_percent", 100.0),
+        "capacity_skus_total": summary.get("capacity_skus_total", 0),
+        "capacity_skus_satisfied": summary.get("capacity_skus_satisfied", 0),
+        "capacity_positions_reserved": summary.get("capacity_positions_reserved", 0),
+        "capacity_shortage_positions": summary.get("capacity_shortage_positions", 0),
     }
 
 
@@ -271,8 +279,10 @@ def render_scenario_comparison(
     weight_zones = st.checkbox("Весовые зоны", key=f"{SESSION_PREFIX}_weight_zones")
     velocity_enabled = st.checkbox("Оборачиваемость / частота отбора", key=f"{SESSION_PREFIX}_velocity")
     adjacency_enabled = st.checkbox("Товарное соседство", key=f"{SESSION_PREFIX}_adjacency")
+    base_capacity_enabled = st.checkbox("Базовое место для SKU", key=f"{SESSION_PREFIX}_base_capacity")
     rule_config = build_scenario_rule_config(weight_zones_enabled=weight_zones, velocity_enabled=velocity_enabled,
-                                             adjacency_enabled=adjacency_enabled)
+                                             adjacency_enabled=adjacency_enabled,
+                                             base_sku_capacity_enabled=base_capacity_enabled)
     adjacency_profile, adjacency_diagnostics = build_sku_adjacency_profile(adjacency_rows)
     if adjacency_enabled and not adjacency_rows:
         st.caption("Связанные товарные группы не загружены — используется только компактное размещение одинаковых SKU.")
@@ -351,7 +361,7 @@ def render_scenario_comparison(
             components.html(proposed_html, height=MAP_HEIGHT, scrolling=True)
 
     if scenario and scenario.get("status") in {"ready", "partial"}:
-        if not weight_zones and not velocity_enabled and not adjacency_enabled:
+        if not weight_zones and not velocity_enabled and not adjacency_enabled and not base_capacity_enabled:
             st.info("Правила оптимизации выключены — PROPOSED совпадает с CURRENT.")
         _show_metrics(summarize_scenario_ui_metrics(scenario, baseline, sku_zone_rows))
         if adjacency_enabled:
@@ -362,6 +372,12 @@ def render_scenario_comparison(
                        f"после {summary.get('same_sku_fragments_after', 0)} · "
                        f"Фрагментов групп: до {summary.get('adjacency_group_fragments_before', 0)}, "
                        f"после {summary.get('adjacency_group_fragments_after', 0)}")
+        if base_capacity_enabled:
+            summary = scenario.get("summary", {})
+            st.caption(f"SKU обеспечено: {summary.get('capacity_skus_satisfied', 0)} / "
+                       f"{summary.get('capacity_skus_total', 0)} · Выделено дополнительных мест: "
+                       f"{summary.get('capacity_positions_reserved', 0)} · Не хватило: "
+                       f"{summary.get('capacity_shortage_positions', 0)}")
         if scenario.get("status") == "partial":
             summary = scenario.get("summary", {})
             st.warning(f"Неразрешено: {summary.get('unresolved_units', 0)} · "

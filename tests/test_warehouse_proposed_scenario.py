@@ -56,3 +56,20 @@ def test_adjacency_rule_is_supported_and_invalid_rule_set_is_blocked():
         model, baseline, {"unknown_rule": True}, sku_zone_rows=rows,
     )
     assert invalid["status"] == "blocked" and not invalid_diagnostics["rule_set_validation"]["valid"]
+
+
+def test_capacity_metadata_does_not_materialize_stock_or_events():
+    model, baseline, rows = _fixture()
+    before = copy.deepcopy(baseline)
+    scenario, diagnostics = build_proposed_scenario(model, baseline, {
+        "base_sku_capacity": {"enabled": True, "parameters": {"minimum_positions_per_sku": 2}}
+    }, sku_zone_rows=rows)
+    proposed = scenario["proposed_state"]
+    assert diagnostics["valid"] and scenario["status"] == "partial"
+    assert scenario["summary"]["capacity_positions_reserved"] == 1
+    assert scenario["summary"]["capacity_shortage_positions"] == 1
+    assert proposed["stock_lots"] == baseline["stock_lots"]
+    assert proposed["pallet_units"] == baseline["pallet_units"]
+    assert proposed.get("warehouse_events", []) == baseline.get("warehouse_events", [])
+    assert scenario["summary"]["baseline_boxes"] == scenario["summary"]["proposed_boxes"]
+    assert baseline == before
