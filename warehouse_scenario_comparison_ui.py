@@ -25,6 +25,7 @@ from warehouse_outbound_experiment_inputs import filter_actual_placement_state_b
 from warehouse_pick_demands import build_outbound_pick_demands
 from warehouse_placement_zones import is_assignable_placement_zone, normalize_placement_zone
 from warehouse_proposed_scenario import build_proposed_scenario
+from warehouse_sku_velocity import build_sku_velocity_profile
 from warehouse_simulation_distance_comparison import compare_simulation_outbound_replay
 from warehouse_simulation_outbound_replay import replay_outbound_on_simulation_states
 from warehouse_simulation_render import build_simulation_dynamic_payload
@@ -49,7 +50,7 @@ def _canonical(value: Any) -> Any:
 def build_comparison_signature(
     *, model_id: Any, baseline_state_id: Any, operational_date: Any,
     normalized_warehouse: Any, sku_zone_rows: Sequence[Mapping[str, Any]],
-    rule_config: Mapping[str, Any],
+    rule_config: Mapping[str, Any], velocity_profile_id: Any = None, gate_identity: Any = None,
 ) -> str:
     """Fingerprint business inputs without depending on translated UI labels."""
     identity = {
@@ -62,6 +63,8 @@ def build_comparison_signature(
             key=lambda row: json.dumps(row, ensure_ascii=False, sort_keys=True, default=str),
         ),
         "rule_config": _canonical(rule_config),
+        "velocity_profile_id": velocity_profile_id,
+        "gate_identity": _canonical(gate_identity),
     }
     payload = json.dumps(identity, ensure_ascii=False, sort_keys=True,
                          separators=(",", ":"), default=str)
@@ -69,8 +72,14 @@ def build_comparison_signature(
 
 
 def build_weight_zone_rule_config(enabled: bool) -> dict[str, dict[str, bool]]:
-    """Translate the only active UI rule into the backend rule contract."""
-    return {"weight_zones": {"enabled": bool(enabled)}}
+    """Backward-compatible adapter for callers that expose only weight zones."""
+    return build_scenario_rule_config(weight_zones_enabled=enabled, velocity_enabled=False)
+
+
+def build_scenario_rule_config(*, weight_zones_enabled: bool, velocity_enabled: bool) -> dict[str, dict[str, bool]]:
+    """Translate the supported UI toggles into the backend rule contract."""
+    return {"weight_zones": {"enabled": bool(weight_zones_enabled)},
+            "velocity": {"enabled": bool(velocity_enabled)}}
 
 
 def build_sku_zone_rows(classification_rows: Sequence[Mapping[str, Any]] | None) -> list[dict[str, str]]:
@@ -254,16 +263,37 @@ def render_scenario_comparison(
 
     st.markdown("### Правила PROPOSED")
     weight_zones = st.checkbox("Весовые зоны", key=f"{SESSION_PREFIX}_weight_zones")
-    st.caption("На текущем этапе доступно одно правило. Остальные будут добавляться последовательно.")
-    rule_config = build_weight_zone_rule_config(weight_zones)
+    velocity_enabled = st.checkbox("Оборачиваемость / частота отбора", key=f"{SESSION_PREFIX}_velocity")
+    rule_config = build_scenario_rule_config(weight_zones_enabled=weight_zones, velocity_enabled=velocity_enabled)
+    velocity_profile = None
+    velocity_diagnostics: dict[str, Any] = {"valid": True, "errors": [], "warnings": []}
+    if velocity_enabled:
+        velocity_profile, velocity_diagnostics = build_sku_velocity_profile(
+            list(outbound_rows or []), as_of_date=str(operational_date),
+            target_normalized_warehouse=target,
+        )
+        velocity_summary = velocity_profile.get("summary", {})
+        complete = velocity_summary.get("history_span_complete")
+        st.caption(f"История РО: {'✓ 28 дней' if complete else 'неполная'} · "
+                   f"SKU с профилем: {velocity_summary.get('unique_skus', 0)} · "
+                   f"Rank 1: {velocity_summary.get('rank_1_skus', 0)} · "
+                   f"Rank 2: {velocity_summary.get('rank_2_skus', 0)} · "
+                   f"Rank 3: {velocity_summary.get('rank_3_skus', 0)} · "
+                   f"Rank 4–6: {sum(velocity_summary.get(f'rank_{rank}_skus', 0) for rank in range(4, 7))}")
+        if not velocity_summary.get("accepted_history_rows"):
+            st.warning("Недостаточно истории РО для расчёта оборачиваемости")
     signature = build_comparison_signature(
         model_id=model.get("model_id"), baseline_state_id=baseline.get("simulation_state_id"),
         operational_date=operational_date, normalized_warehouse=target,
         sku_zone_rows=sku_zone_rows, rule_config=rule_config,
+        velocity_profile_id=velocity_profile.get("velocity_profile_id") if velocity_profile else None,
+        gate_identity=gate_state if velocity_enabled else None,
     )
     if st.button("Пересчитать PROPOSED", type="primary", key=f"{SESSION_PREFIX}_calculate"):
         scenario, diagnostics = build_proposed_scenario(
             model, baseline, rule_config, sku_zone_rows=sku_zone_rows,
+            sku_velocity_rows=velocity_profile.get("rows", []) if velocity_profile else None,
+            gate_state=gate_state,
         )
         st.session_state[f"{SESSION_PREFIX}_baseline"] = baseline
         st.session_state[f"{SESSION_PREFIX}_scenario"] = scenario
@@ -308,7 +338,7 @@ def render_scenario_comparison(
             components.html(proposed_html, height=MAP_HEIGHT, scrolling=True)
 
     if scenario and scenario.get("status") in {"ready", "partial"}:
-        if not weight_zones:
+        if not weight_zones and not velocity_enabled:
             st.info("Правила оптимизации выключены — PROPOSED совпадает с CURRENT.")
         _show_metrics(summarize_scenario_ui_metrics(scenario, baseline, sku_zone_rows))
         if scenario.get("status") == "partial":

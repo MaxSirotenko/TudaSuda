@@ -22,9 +22,10 @@ from warehouse_placement_zones import (
     DEFAULT_PLACEMENT_ZONE_ORDER,
     normalize_placement_zone,
 )
+from warehouse_physical_graph import build_physical_warehouse_graph, find_shortest_path
 
-PROPOSED_PLACEMENT_PLAN_VERSION = 1
-_SUPPORTED_RULES = frozenset({"weight_zones"})
+PROPOSED_PLACEMENT_PLAN_VERSION = 2
+_SUPPORTED_RULES = frozenset({"weight_zones", "velocity"})
 
 
 def _canonical_json(value: Any) -> str:
@@ -92,6 +93,27 @@ def _canonical_sku_zones(rows: Any) -> tuple[dict[str, str], list[dict[str, Any]
     return {sku: next(iter(zones)) for sku, zones in sorted(assignments.items()) if len(zones) == 1}, errors
 
 
+def _canonical_velocity(rows: Any) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
+    result: dict[str, dict[str, Any]] = {}
+    errors: list[dict[str, Any]] = []
+    if rows is None:
+        return result, errors
+    if not isinstance(rows, list):
+        return result, [{"code": "invalid_sku_velocity_rows"}]
+    for row in rows:
+        sku = _text(row.get("sku_key")) if isinstance(row, Mapping) else ""
+        rank = row.get("velocity_rank") if isinstance(row, Mapping) else None
+        if not sku or rank is not None and (isinstance(rank, bool) or not isinstance(rank, int) or not 1 <= rank <= 6):
+            errors.append({"code": "invalid_velocity_assignment", "sku_key": sku or None})
+            continue
+        canonical = {"sku_key": sku, "velocity_rank": rank,
+                     "velocity_class": _text(row.get("velocity_class")) or ("no_history" if rank is None else "")}
+        if sku in result and result[sku] != canonical:
+            errors.append({"code": "conflicting_velocity_assignment", "sku_key": sku})
+        result[sku] = canonical
+    return dict(sorted(result.items())), errors
+
+
 def _plan_identity(plan: Mapping[str, Any]) -> dict[str, Any]:
     """Return stable business fields (never messages, labels, or timestamps)."""
     return {
@@ -100,6 +122,8 @@ def _plan_identity(plan: Mapping[str, Any]) -> dict[str, Any]:
         "model_id": plan.get("model_id"),
         "placement_rule_set_id": plan.get("placement_rule_set_id"),
         "sku_zone_assignments": plan.get("sku_zone_assignments", []),
+        "sku_velocity_assignments": plan.get("sku_velocity_assignments", []),
+        "gate_identity": plan.get("gate_identity"),
         "status": plan.get("status"),
         "blocked_reasons": [
             {key: value for key, value in reason.items() if key != "message"}
@@ -122,7 +146,8 @@ def compute_proposed_placement_plan_id(plan: Mapping[str, Any]) -> str:
     return _sha256(_plan_identity(plan))
 
 
-def _placement_row(unit: Mapping[str, Any], target: Mapping[str, Any], cells: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
+def _placement_row(unit: Mapping[str, Any], target: Mapping[str, Any], cells: Mapping[str, Mapping[str, Any]],
+                   velocity: Mapping[str, Any] | None = None, distances: Mapping[str, float] | None = None) -> dict[str, Any]:
     origin_cell = unit.get("origin_cell_key")
     target_cell = target.get("cell_key")
     row = {
@@ -141,6 +166,11 @@ def _placement_row(unit: Mapping[str, Any], target: Mapping[str, Any], cells: Ma
     }
     if unit.get("qty_boxes") is not None:
         row["qty_boxes"] = unit["qty_boxes"]
+    if velocity is not None:
+        row.update({"velocity_rank": velocity.get("velocity_rank"),
+                    "velocity_class": velocity.get("velocity_class"),
+                    "origin_gate_distance_m": (distances or {}).get(origin_cell),
+                    "target_gate_distance_m": (distances or {}).get(target_cell)})
     return row
 
 
@@ -224,12 +254,14 @@ def _base_plan(model: Mapping[str, Any], state: Mapping[str, Any], rules: Mappin
 
 def build_proposed_placement_plan(
     model: dict[str, Any], baseline_state: dict[str, Any], placement_rule_set: dict[str, Any],
-    sku_zone_rows: list[dict[str, Any]],
+    sku_zone_rows: list[dict[str, Any]], *, sku_velocity_rows: list[dict[str, Any]] | None = None,
+    gate_state: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Build a deterministic target layout exclusively from the given baseline."""
     rule_validation = validate_placement_rule_set(placement_rule_set)
     assignments, mapping_errors = _canonical_sku_zones(sku_zone_rows)
-    errors = list(rule_validation.get("errors", [])) + mapping_errors
+    velocities, velocity_errors = _canonical_velocity(sku_velocity_rows)
+    errors = list(rule_validation.get("errors", [])) + mapping_errors + velocity_errors
     rules_id = None
     if rule_validation.get("valid"):
         rules_id = compute_placement_rule_set_id(placement_rule_set)
@@ -239,6 +271,8 @@ def build_proposed_placement_plan(
     rules_copy = dict(placement_rule_set) if isinstance(placement_rule_set, Mapping) else {}
     rules_copy["placement_rule_set_id"] = rules_id or rules_copy.get("placement_rule_set_id")
     plan = _base_plan(model, baseline_state, rules_copy, assignments)
+    plan["sku_velocity_assignments"] = list(velocities.values())
+    plan["gate_identity"] = None
 
     enabled = get_enabled_rule_ids(placement_rule_set) if rule_validation.get("valid") else []
     for rule_id in enabled:
@@ -250,6 +284,8 @@ def build_proposed_placement_plan(
         errors.append({"code": "invalid_baseline_state_identity"})
     if baseline_state.get("model_id") != model.get("model_id"):
         errors.append({"code": "baseline_model_mismatch"})
+    if "velocity" in enabled and not velocities:
+        errors.append({"code": "velocity_profile_empty"})
     if errors:
         plan["blocked_reasons"] = sorted(errors, key=_canonical_json)
         plan["proposed_placement_plan_id"] = compute_proposed_placement_plan_id(plan)
@@ -258,12 +294,28 @@ def build_proposed_placement_plan(
     units, unresolved, cells, positions = _extract_units(model, baseline_state)
     occupancy_by_cell = {row.get("cell_key"): row for row in baseline_state.get("cell_occupancy", []) or []}
     weight_enabled = "weight_zones" in enabled
+    velocity_enabled = "velocity" in enabled
+    distances: dict[str, float] = {}
+    if velocity_enabled:
+        graph, graph_diagnostics = build_physical_warehouse_graph(model, gate_state)
+        gates = graph.get("gate_links", [])
+        if len(gates) != 1 or graph_diagnostics.get("configuration_errors"):
+            error = {"code": "velocity_gate_required"}
+            plan["blocked_reasons"] = [error]
+            plan["proposed_placement_plan_id"] = compute_proposed_placement_plan_id(plan)
+            return plan, _diagnostics([error])
+        plan["gate_identity"] = {key: gates[0].get(key) for key in ("gate_key", "gate_node_id")}
+        start_node = gates[0]["gate_node_id"]
+        for link in graph.get("cell_access_links", []):
+            path = find_shortest_path(graph, start_node, link.get("access_node_id"))
+            if path.get("reachable"):
+                distances[link["cell_key"]] = path["distance_m"]
     fixed: list[dict[str, Any]] = []
     applicable: list[tuple[dict[str, Any], str]] = []
     kept: list[tuple[dict[str, Any], str]] = []
     identity_units: list[dict[str, Any]] = []
 
-    if not weight_enabled:
+    if not weight_enabled and not velocity_enabled:
         identity_units = units
     else:
         for unit in units:
@@ -280,7 +332,9 @@ def build_proposed_placement_plan(
                 reason = "occupancy_conflict"
             elif not cell or not position or position.get("cell_key") != unit.get("origin_cell_key"):
                 reason = "invalid_physical_reference"
-            elif unit.get("sku_key") not in assignments:
+            elif velocity_enabled and unit.get("origin_cell_key") not in distances:
+                reason = "velocity_unreachable_position"
+            elif weight_enabled and unit.get("sku_key") not in assignments:
                 reason = "missing_sku_zone_assignment"
             if reason:
                 record = dict(unit) | {"reason": reason}
@@ -291,8 +345,8 @@ def build_proposed_placement_plan(
                                        "origin_cell_key": unit.get("origin_cell_key"), "reason": reason})
                 identity_units.append(unit)
                 continue
-            target_zone = assignments[unit["sku_key"]]
-            if normalize_placement_zone(cell.get("weight_zone")) == target_zone:
+            target_zone = assignments[unit["sku_key"]] if weight_enabled else normalize_placement_zone(cell.get("weight_zone"))
+            if not velocity_enabled and normalize_placement_zone(cell.get("weight_zone")) == target_zone:
                 kept.append((unit, target_zone))
             else:
                 applicable.append((unit, target_zone))
@@ -313,11 +367,14 @@ def build_proposed_placement_plan(
         zone = normalize_placement_zone(cell.get("weight_zone"))
         if storage == "deep_lane" or cell.get("capacity_pallets", 1) != 1 or zone not in ASSIGNABLE_PLACEMENT_ZONE_IDS:
             continue
+        if velocity_enabled and position.get("cell_key") not in distances:
+            continue
         normal_position_totals[zone] += 1
         if position.get("status") in {"free", "occupied"} and position.get("position_id") not in reserved:
             available[zone].append(position)
     for zone in available:
-        available[zone].sort(key=lambda p: _position_key(p, cells))
+        available[zone].sort(key=lambda p: ((distances.get(p.get("cell_key"), float("inf")), _position_key(p, cells))
+                                            if velocity_enabled else _position_key(p, cells)))
 
     needed = Counter(zone for _, zone in applicable)
     shortages = {zone: max(0, needed[zone] - len(available[zone])) for zone in ASSIGNABLE_PLACEMENT_ZONE_IDS}
@@ -346,13 +403,22 @@ def build_proposed_placement_plan(
         for unit, _ in kept:
             placements.append(_placement_row(unit, positions[unit["origin_position_id"]], cells))
         zone_rank = {zone: index for index, zone in enumerate(DEFAULT_PLACEMENT_ZONE_ORDER)}
-        ordered = sorted(applicable, key=lambda item: (zone_rank[item[1]], _text(item[0].get("sku_key")),
-                                                       _text(item[0].get("placement_unit_id"))))
+        ordered = sorted(applicable, key=lambda item: (zone_rank[item[1]],
+                         velocities.get(_text(item[0].get("sku_key")), {}).get("velocity_rank") or 7,
+                         _text(item[0].get("sku_key")), _text(item[0].get("placement_unit_id"))))
         offsets: Counter[str] = Counter()
-        for unit, zone in ordered:
-            target = available[zone][offsets[zone]]
-            offsets[zone] += 1
-            placements.append(_placement_row(unit, target, cells))
+        ranked = [(unit, zone) for unit, zone in ordered if velocities.get(_text(unit.get("sku_key")), {}).get("velocity_rank")]
+        unranked = [(unit, zone) for unit, zone in ordered if not velocities.get(_text(unit.get("sku_key")), {}).get("velocity_rank")]
+        remaining = {zone: list(values) for zone, values in available.items()}
+        for unit, zone in ranked:
+            target = remaining[zone].pop(0)
+            placements.append(_placement_row(unit, target, cells, velocities.get(_text(unit.get("sku_key"))), distances))
+        for unit, zone in unranked:
+            origin = next((p for p in remaining[zone] if p.get("position_id") == unit.get("origin_position_id")), None)
+            target = origin or remaining[zone][0]
+            remaining[zone].remove(target)
+            placements.append(_placement_row(unit, target, cells, velocities.get(_text(unit.get("sku_key")),
+                                                                                  {"velocity_rank": None, "velocity_class": "no_history"}), distances))
         plan["status"] = "partial" if unresolved or fixed else "ready"
 
     placements.sort(key=lambda row: _text(row["placement_unit_id"]))
@@ -380,6 +446,26 @@ def build_proposed_placement_plan(
         "weight_zone_compliance_after_percent": 100.0 * after / denominator if denominator else 100.0,
         "weight_zone_compliance_complete": weight_enabled and not unresolved and not any(shortages.values()) and after == denominator,
     }
+    velocity_rows = [row for row in placements if "velocity_rank" in row]
+    ranked_rows = [row for row in velocity_rows if row.get("velocity_rank") is not None]
+    def average(rows: list[dict[str, Any]], key: str) -> float | None:
+        values = [row[key] for row in rows if isinstance(row.get(key), (int, float))]
+        return round(sum(values) / len(values), 6) if values else None
+    plan["summary"].update({
+        "velocity_profile_skus": len(velocities), "velocity_ranked_units": len(ranked_rows),
+        "velocity_unranked_units": len(velocity_rows) - len(ranked_rows),
+        "velocity_units_moved": sum(bool(row.get("moved")) for row in velocity_rows),
+        "average_gate_distance_before_m": average(velocity_rows, "origin_gate_distance_m"),
+        "average_gate_distance_after_m": average(velocity_rows, "target_gate_distance_m"),
+    })
+    for rank in range(1, 7):
+        rank_rows = [row for row in velocity_rows if row.get("velocity_rank") == rank]
+        plan["summary"][f"rank_{rank}_average_gate_distance_before_m"] = average(rank_rows, "origin_gate_distance_m")
+        plan["summary"][f"rank_{rank}_average_gate_distance_after_m"] = average(rank_rows, "target_gate_distance_m")
+    if velocity_enabled:
+        plan["limitations"] = [item for item in plan["limitations"] if item != "weight_zones_only"]
+        plan["limitations"].extend(["velocity_priority_uses_gate_distance_not_global_route_optimization",
+                                    "deep_lane_velocity_optimization_not_implemented"])
     plan["proposed_placement_plan_id"] = compute_proposed_placement_plan_id(plan)
     validation = validate_proposed_placement_plan(plan, model, baseline_state, placement_rule_set, sku_zone_rows)
     return plan, validation
