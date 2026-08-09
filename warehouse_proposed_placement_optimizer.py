@@ -252,7 +252,8 @@ def _extract_units(
         cell = cells.get(cell_key)
         storage = _text((cell or {}).get("storage_type") or (cell or {}).get("row_storage_type") or "normal")
         cell_lots = [lot for lot in lots_by_cell.get(cell_key, []) if lot.get("stock_lot_id") not in linked_lots]
-        if cell and storage != "deep_lane" and (cell.get("capacity_pallets", 1) == 1) and len(cell_lots) == 1:
+        if (cell and storage != "deep_lane" and (cell.get("capacity_pallets", 1) == 1)
+                and len(cell_lots) == 1 and not cell_lots[0].get("unresolved_reason")):
             lot = cell_lots[0]
             identity = {"unit_type": "opaque_opening_position", "position_id": position.get("position_id"),
                         "stock_lot_ids": [lot.get("stock_lot_id")]}
@@ -271,7 +272,8 @@ def _extract_units(
         unresolved.append({"stock_lot_id": lot_id, "sku_key": lot.get("sku_key"),
                            "origin_position_id": lot.get("position_id"),
                            "origin_cell_key": lot.get("cell_key"),
-                           "reason": "unknown_location" if lot.get("location_status") != "located" else "unsupported_physical_footprint"})
+                           "reason": ("unknown_location" if lot.get("location_status") != "located" else
+                                      lot.get("unresolved_reason") or "unsupported_physical_footprint")})
     return sorted(units, key=lambda u: _text(u["placement_unit_id"])), unresolved, cells, positions
 
 

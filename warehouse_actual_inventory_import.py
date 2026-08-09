@@ -7,6 +7,7 @@ box calculation is authoritative and whose physical cell exists are accepted.
 from __future__ import annotations
 
 import hashlib
+import copy
 import json
 import math
 import re
@@ -34,6 +35,7 @@ FIELD_ALIASES = {
     "characteristic_code": ["КодХарактеристики", "Код характеристики", "characteristic_code"],
     "characteristic": ["Характеристика", "characteristic", "characteristic_name"],
     "production_date": ["ДатаПроизводства", "Дата производства", "production_date"],
+    "source_pallet_ref": ["Паллета", "source_pallet_ref", "pallet_ref"],
     "source_unit_name": ["ЕдиницаИзмерения", "Единица измерения", "source_unit_name"],
     "source_quantity": ["Количество", "source_quantity"],
     "pallet_count": ["КоличествоПаллет", "Количество паллет", "pallet_count"],
@@ -190,6 +192,8 @@ def _source_record(row: pd.Series, mapping: dict[str, str | None], source_index:
 def build_actual_inventory_placement_state(
     model: dict[str, Any], table: pd.DataFrame,
     mapping: dict[str, str | None] | None = None,
+    *, inventory_results_rows: list[dict[str, Any]] | None = None,
+    palletization_rule_state: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Build a placement state without changing either input or doing I/O."""
     columns = dict(mapping) if mapping is not None else detect_actual_inventory_columns(table)
@@ -254,7 +258,7 @@ def build_actual_inventory_placement_state(
             continue
 
         duplicate_key = (
-            record["cell_key"], sku_key, record["production_date"],
+            record["cell_key"], _text(record["source_pallet_ref"]), sku_key, record["production_date"],
             _text(record["source_quantity"]), boxes, _text(record["quantity_per_box"]),
         )
         if not reason and duplicate_key in seen:
@@ -280,7 +284,9 @@ def build_actual_inventory_placement_state(
         model_cell = cells[record["cell_key"]]
         pallet_value = _positive_number(record["pallet_count"])
         placement_seed = json.dumps(
-            [model.get("model_id"), record["source_index"], record["cell_key"], sku_key, record["production_date"]],
+            [model.get("model_id"), record["warehouse"], record["cell_key"],
+             _text(record["source_pallet_ref"]), sku_key, record["production_date"], boxes,
+             _text(record["source_quantity"])],
             ensure_ascii=False, separators=(",", ":"),
         )
         placement = {
@@ -306,6 +312,7 @@ def build_actual_inventory_placement_state(
             "distribution_center": record["distribution_center"], "cell_code": record["cell_code"],
             "cell_display": record["cell_display"], "cell_address": record["cell_address"],
             "pick_order": record["pick_order"], "calculated_box_qty": record["calculated_box_qty"],
+            "source_pallet_ref": _text(record["source_pallet_ref"]),
             "reason": "",
             "source_index": record["source_index"], "occupancy_not_authoritative": True,
         }
@@ -323,4 +330,135 @@ def build_actual_inventory_placement_state(
         round(100.0 * diagnostics["accepted_rows"] / diagnostics["rows_total"], 2)
         if diagnostics["rows_total"] else 0.0
     )
+    _classify_physical_pallet_evidence(model, state, diagnostics)
+    rules = {r.get("sku_key"): r for r in (palletization_rule_state or {}).get("rules", []) or []}
+    for placement in state["placements"]:
+        rule = rules.get(placement["sku_key"])
+        if rule and placement.get("physical_pallet_authority") == "exact_normal_pallet":
+            placement["capacity_boxes"] = rule.get("boxes_per_pallet")
+    _cross_check_inventory_totals(state, diagnostics, inventory_results_rows)
+    return state, diagnostics
+
+
+def _classify_physical_pallet_evidence(
+    model: dict[str, Any], state: dict[str, Any], diagnostics: dict[str, Any],
+) -> None:
+    """Annotate exact pallet footprints; never choose among conflicting facts."""
+    placements = state["placements"]
+    cells = {cell_key(c.get("row_number"), c.get("cell_number"), c.get("tier")): c
+             for c in model.get("cells", []) or []}
+    by_pallet: dict[str, list[dict[str, Any]]] = {}
+    for row in placements:
+        ref = _text(row.get("source_pallet_ref"))
+        row["physical_pallet_authority"] = "missing_identity" if not ref else "pending"
+        row["occupancy_not_authoritative"] = True
+        if ref:
+            by_pallet.setdefault(ref, []).append(row)
+
+    counts = {
+        "source_rows": len(placements), "accepted_boxes": sum(r["qty_boxes"] for r in placements),
+        "unique_source_pallets": len(by_pallet), "exact_normal_pallets": 0,
+        "deep_lane_pallets_with_unknown_depth": 0,
+        "pallets_missing_identity": sum(not _text(r.get("source_pallet_ref")) for r in placements),
+        "multi_sku_source_pallets": 0, "pallet_in_multiple_cell_conflicts": 0,
+        "normal_cell_overoccupancy_conflicts": 0, "unknown_model_cells": diagnostics.get("unknown_cell", 0),
+        "inventory_total_mismatches": 0, "unresolved_boxes": 0,
+    }
+    usable_by_cell: dict[str, list[str]] = {}
+    for ref, rows in sorted(by_pallet.items()):
+        warehouses = {_text(r.get("warehouse")) for r in rows}
+        cell_keys = {r["cell_key"] for r in rows}
+        skus = {r["sku_key"] for r in rows}
+        if len(warehouses) != 1 or len(cell_keys) != 1:
+            reason = "pallet_in_multiple_cells" if len(cell_keys) != 1 else "pallet_in_multiple_warehouses"
+            counts["pallet_in_multiple_cell_conflicts"] += len(cell_keys) != 1
+        elif len(skus) != 1:
+            reason = "multi_sku_source_pallet"
+            counts["multi_sku_source_pallets"] += 1
+        else:
+            key = next(iter(cell_keys)); cell = cells[key]
+            storage = _text(cell.get("storage_type") or cell.get("row_storage_type") or "normal")
+            if storage == "deep_lane" or cell.get("capacity_pallets", 1) > 1:
+                reason = "deep_lane_depth_unknown"
+                counts["deep_lane_pallets_with_unknown_depth"] += 1
+            elif cell.get("capacity_pallets", 1) != 1:
+                reason = "unsupported_normal_cell_capacity"
+            else:
+                reason = "exact_normal_pallet"
+                usable_by_cell.setdefault(key, []).append(ref)
+        for row in rows:
+            row["physical_pallet_authority"] = reason
+
+    conflicts = {key for key, refs in usable_by_cell.items() if len(set(refs)) > 1}
+    counts["normal_cell_overoccupancy_conflicts"] = len(conflicts)
+    for row in placements:
+        if row["cell_key"] in conflicts and row["physical_pallet_authority"] == "exact_normal_pallet":
+            row["physical_pallet_authority"] = "normal_cell_overoccupancy"
+        elif row["physical_pallet_authority"] == "exact_normal_pallet":
+            row["occupancy_not_authoritative"] = False
+    counts["exact_normal_pallets"] = len({r["source_pallet_ref"] for r in placements
+                                          if r["physical_pallet_authority"] == "exact_normal_pallet"})
+    counts["unresolved_boxes"] = sum(r["qty_boxes"] for r in placements
+                                      if r["physical_pallet_authority"] != "exact_normal_pallet")
+    authoritative_boxes = counts["accepted_boxes"] - counts["unresolved_boxes"]
+    counts["physical_pallet_coverage_percent"] = (
+        round(100 * authoritative_boxes / counts["accepted_boxes"], 4) if counts["accepted_boxes"] else 100.0)
+    counts["physical_pallet_coverage_denominator"] = "accepted_factual_boxes"
+    counts.update({
+        "stock_quantity_authoritative": diagnostics.get("excluded_rows", 0) == 0,
+        "stock_location_authoritative": diagnostics.get("unmatched_rows", 0) == 0,
+        "normal_pallet_footprint_authoritative": not any((counts["pallets_missing_identity"], counts["multi_sku_source_pallets"],
+            counts["pallet_in_multiple_cell_conflicts"], counts["normal_cell_overoccupancy_conflicts"])),
+        "deep_lane_depth_authoritative": counts["deep_lane_pallets_with_unknown_depth"] == 0,
+    })
+    counts["opening_stock_business_ready"] = (counts["stock_quantity_authoritative"] and
+        counts["stock_location_authoritative"] and counts["normal_pallet_footprint_authoritative"] and
+        counts["inventory_total_mismatches"] == 0)
+    diagnostics.update(counts)
+    state["physical_opening_readiness"] = counts
+
+
+def _cross_check_inventory_totals(
+    state: dict[str, Any], diagnostics: dict[str, Any], inventory_rows: list[dict[str, Any]] | None,
+) -> None:
+    """Compare independent totals without ever changing the physical snapshot."""
+    if inventory_rows is None:
+        diagnostics["inventory_totals_control_status"] = "not_supplied"
+        return
+    physical: dict[str, int] = {}
+    control: dict[str, int] = {}
+    for row in state["placements"]:
+        physical[row["sku_key"]] = physical.get(row["sku_key"], 0) + int(row["qty_boxes"])
+    for row in inventory_rows:
+        sku = canonical_sku_key(row)
+        boxes, error = _integer(row.get("qty_units") if "qty_units" in row else row.get("qty_boxes"))
+        if sku and not error:
+            control[sku] = control.get(sku, 0) + boxes
+    mismatches = [{"sku_key": sku, "physical_boxes": physical.get(sku, 0),
+                   "inventory_control_boxes": control.get(sku, 0),
+                   "delta_boxes": physical.get(sku, 0) - control.get(sku, 0)}
+                  for sku in sorted(set(physical) | set(control)) if physical.get(sku, 0) != control.get(sku, 0)]
+    diagnostics["inventory_total_mismatch_details"] = mismatches
+    diagnostics["inventory_total_mismatches"] = len(mismatches)
+    diagnostics["inventory_totals_control_status"] = "mismatch" if mismatches else "agrees"
+    readiness = state["physical_opening_readiness"]
+    readiness["inventory_total_mismatches"] = len(mismatches)
+    if mismatches:
+        readiness["opening_stock_business_ready"] = False
+
+
+def cross_check_physical_opening_stock(
+    actual_placement_state: dict[str, Any], inventory_results_rows: list[dict[str, Any]] | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return an unchanged-quantity snapshot plus independent total controls."""
+    state = copy.deepcopy(actual_placement_state)
+    diagnostics: dict[str, Any] = {}
+    state.setdefault("physical_opening_readiness", {
+        "stock_quantity_authoritative": True, "stock_location_authoritative": True,
+        "normal_pallet_footprint_authoritative": False, "deep_lane_depth_authoritative": False,
+        "opening_stock_business_ready": False, "inventory_total_mismatches": 0,
+    })
+    _cross_check_inventory_totals(state, diagnostics, inventory_results_rows)
+    diagnostics["allocation_contract"] = "exact_pallet_cell_snapshot"
+    diagnostics["legacy_redistribution_used"] = False
     return state, diagnostics

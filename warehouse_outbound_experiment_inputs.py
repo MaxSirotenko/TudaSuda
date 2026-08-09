@@ -10,6 +10,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from warehouse_opening_stock_reconciliation import reconcile_opening_stock
+from warehouse_actual_inventory_import import cross_check_physical_opening_stock
 from warehouse_pick_demands import build_outbound_pick_demands
 from warehouse_business_identity import normalize_warehouse
 from warehouse_placement_zones import (
@@ -184,7 +185,11 @@ def build_outbound_experiment_inputs(
         elif warehouse != target: inventory_diag["excluded_other_warehouse"] += 1
         else: scoped_inventory.append(copy.deepcopy(dict(row))); inventory_diag["accepted"] += 1
     diagnostics["opening_inventory"] = inventory_diag
-    opening_stock, opening_diag = reconcile_opening_stock(dict(model), scoped_inventory, start)
+    if any(row.get("source_pallet_ref") for row in start.get("placements", [])):
+        opening_stock, opening_diag = cross_check_physical_opening_stock(start, scoped_inventory)
+    else:
+        opening_stock, opening_diag = reconcile_opening_stock(dict(model), scoped_inventory, start)
+        opening_diag["legacy_redistribution_used"] = True
     diagnostics["opening_stock"] = opening_diag
     outbound = build_outbound_pick_demands(copy.deepcopy(outbound_order_rows))
     diagnostics["outbound_demands"] = copy.deepcopy(outbound.get("diagnostics", {}))
