@@ -8,6 +8,7 @@ from warehouse_scenario_comparison_ui import (
     build_comparison_signature,
     build_sku_zone_rows,
     build_weight_zone_rule_config,
+    build_distance_order_rows,
     summarize_scenario_ui_metrics,
 )
 from warehouse_proposed_scenario import build_proposed_scenario
@@ -98,3 +99,16 @@ def test_metrics_report_missing_zone_without_location_inference():
     assert metrics["missing_zone_skus"] == 1
     assert metrics["missing_zone_placements"] == 1
     assert metrics["fixed_units"] >= 1
+
+
+def test_distance_table_uses_distance_language_and_service_columns():
+    rows = build_distance_order_rows({"orders": [{
+        "operational_date": "2026-08-09", "outbound_order_number": "RO-1",
+        "current_distance_m": 15, "proposed_distance_m": 7, "distance_saved_m": 8,
+        "distance_saved_percent": 53.3, "classification": "improved", "requested_boxes": 4,
+        "current_picked_boxes": 4, "proposed_picked_boxes": 4,
+        "current_shortage_boxes": 0, "proposed_shortage_boxes": 0, "reasons": [],
+    }]})
+    assert rows[0]["Статус"] == "Улучшился"
+    assert rows[0]["Экономия, м"] == 8
+    assert rows[0]["Собрано CURRENT"] == rows[0]["Собрано PROPOSED"] == 4

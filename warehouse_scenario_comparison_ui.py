@@ -22,8 +22,11 @@ from warehouse_geometry_render_layers import (
 )
 from warehouse_opening_stock_reconciliation import reconcile_opening_stock
 from warehouse_outbound_experiment_inputs import filter_actual_placement_state_by_warehouse
+from warehouse_pick_demands import build_outbound_pick_demands
 from warehouse_placement_zones import is_assignable_placement_zone, normalize_placement_zone
 from warehouse_proposed_scenario import build_proposed_scenario
+from warehouse_simulation_distance_comparison import compare_simulation_outbound_replay
+from warehouse_simulation_outbound_replay import replay_outbound_on_simulation_states
 from warehouse_simulation_render import build_simulation_dynamic_payload
 from warehouse_simulation_state import build_initial_simulation_state
 
@@ -153,6 +156,12 @@ def _short_id(value: Any) -> str:
     return text[:19] + "…" if len(text) > 20 else text
 
 
+def _hash(value: Any) -> str:
+    payload = json.dumps(_canonical(value), ensure_ascii=False, sort_keys=True,
+                         separators=(",", ":"), default=str)
+    return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def _show_metrics(metrics: Mapping[str, Any]) -> None:
     labels = (
         ("Перемещено размещений", "units_moved"), ("Оставлено на месте", "units_kept"),
@@ -171,10 +180,52 @@ def _show_metrics(metrics: Mapping[str, Any]) -> None:
     )
 
 
+def build_distance_order_rows(comparison: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Adapt the backend distance contract to the Russian results table."""
+    labels = {"improved": "Улучшился", "worsened": "Ухудшился", "equal": "Без изменений",
+              "not_comparable": "Несопоставим"}
+    return [{
+        "Дата": row.get("operational_date"), "РО": row.get("outbound_order_number"),
+        "CURRENT, м": row.get("current_distance_m"), "PROPOSED, м": row.get("proposed_distance_m"),
+        "Экономия, м": row.get("distance_saved_m"), "Экономия, %": row.get("distance_saved_percent"),
+        "Статус": labels.get(row.get("classification"), row.get("classification")),
+        "Запрошено коробов": row.get("requested_boxes"), "Собрано CURRENT": row.get("current_picked_boxes"),
+        "Собрано PROPOSED": row.get("proposed_picked_boxes"), "Дефицит CURRENT": row.get("current_shortage_boxes"),
+        "Дефицит PROPOSED": row.get("proposed_shortage_boxes"),
+        "Причины несопоставимости": ", ".join(row.get("reasons") or []),
+    } for row in comparison.get("orders", [])]
+
+
+def _show_distance_comparison(comparison: Mapping[str, Any]) -> None:
+    summary, coverage = comparison.get("summary", {}), comparison.get("coverage", {})
+    st.markdown("### Экономия пробега")
+    primary = (("CURRENT, м", "current_total_distance_m"), ("PROPOSED, м", "proposed_total_distance_m"),
+               ("Экономия, м", "distance_saved_m"), ("Экономия, %", "distance_saved_percent"))
+    for column, (label, key) in zip(st.columns(4), primary):
+        column.metric(label, f"{float(summary.get(key) or 0):,.2f}".replace(",", " "))
+    for title, prefix in (("Средний пробег / РО", "average"), ("Медианный пробег / РО", "median")):
+        st.markdown(f"**{title}**")
+        values = (("CURRENT", f"{prefix}_current_distance_per_order_m"),
+                  ("PROPOSED", f"{prefix}_proposed_distance_per_order_m"),
+                  ("Δ", f"{prefix}_saved_per_order_m"))
+        for column, (label, key) in zip(st.columns(3), values):
+            value = summary.get(key)
+            column.metric(label, "—" if value is None else f"{float(value):,.2f} м".replace(",", " "))
+    st.write(f"Сопоставимых РО: {coverage.get('strict_comparable_orders', 0)} / {coverage.get('orders_total', 0)} · "
+             f"Улучшилось: {summary.get('improved_orders', 0)} · Ухудшилось: {summary.get('worsened_orders', 0)} · "
+             f"Без изменений: {summary.get('equal_orders', 0)}")
+    st.caption(f"Покрытие РО: {coverage.get('order_comparability_percent', 0):.2f}% · "
+               f"покрытие коробов: {coverage.get('requested_boxes_coverage_percent', 0):.2f}% · "
+               f"область эффекта: {comparison.get('scope')}")
+    st.dataframe(build_distance_order_rows(comparison), use_container_width=True)
+
+
 def render_scenario_comparison(
     model: dict[str, Any], *, operational_date: Any, selected_warehouse: Any,
     start_state: dict[str, Any] | None, opening_rows: list[dict[str, Any]],
     classification_rows: Sequence[Mapping[str, Any]] | None,
+    outbound_rows: Sequence[Mapping[str, Any]] | None = None,
+    gate_state: dict[str, Any] | None = None,
 ) -> None:
     """Render the independent placement preview before the outbound replay UI."""
     st.divider()
@@ -264,3 +315,32 @@ def render_scenario_comparison(
             summary = scenario.get("summary", {})
             st.warning(f"Неразрешено: {summary.get('unresolved_units', 0)} · "
                        f"фиксировано: {summary.get('fixed_units', 0)}")
+
+        scoped_rows = [dict(row) for row in outbound_rows or []
+                       if (not operational_date or str(row.get("created_at") or "")[:10] == str(operational_date)[:10])
+                       and (not target or normalize_warehouse(row.get("warehouse")) == target)]
+        demand = build_outbound_pick_demands(scoped_rows)
+        proposed = scenario.get("proposed_state")
+        distance_ready = bool(demand.get("orders") and gate_state and gate_state.get("gates") and proposed)
+        st.markdown("#### Пробег CURRENT / PROPOSED")
+        st.write(" · ".join(("✓ CURRENT baseline", "✓ PROPOSED scenario",
+                             f"{'✓' if demand.get('orders') else '✗'} РО выбранного дня",
+                             f"{'✓' if gate_state and gate_state.get('gates') else '✗'} Ворота")))
+        distance_signature = _hash({"model_id": model.get("model_id"), "current": baseline.get("simulation_state_id"),
+                                    "proposed": scenario.get("proposed_state_id"), "demand": demand,
+                                    "gate": gate_state, "zone_order": "default"})
+        if st.button("Рассчитать пробег CURRENT / PROPOSED", disabled=not distance_ready,
+                     key=f"{SESSION_PREFIX}_distance_calculate"):
+            replay, replay_diagnostics = replay_outbound_on_simulation_states(
+                model, baseline, proposed, demand, gate_state or {})
+            comparison, comparison_diagnostics = compare_simulation_outbound_replay(replay) if replay else ({}, {})
+            st.session_state[f"{SESSION_PREFIX}_distance_replay"] = replay
+            st.session_state[f"{SESSION_PREFIX}_distance_comparison"] = comparison
+            st.session_state[f"{SESSION_PREFIX}_distance_diagnostics"] = {
+                "replay": replay_diagnostics, "comparison": comparison_diagnostics}
+            st.session_state[f"{SESSION_PREFIX}_distance_signature"] = distance_signature
+        saved_distance_signature = st.session_state.get(f"{SESSION_PREFIX}_distance_signature")
+        if saved_distance_signature and saved_distance_signature != distance_signature:
+            st.warning("Результат пробега устарел. Нажмите кнопку расчёта повторно.")
+        elif st.session_state.get(f"{SESSION_PREFIX}_distance_comparison"):
+            _show_distance_comparison(st.session_state[f"{SESSION_PREFIX}_distance_comparison"])
