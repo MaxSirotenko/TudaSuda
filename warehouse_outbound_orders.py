@@ -23,6 +23,7 @@ FIELD_ALIASES = {
     "created_at": ["ДатаРО", "Дата РО", "created_at", "дата создания", "дата и время"],
     "distribution_center": ["РЦ", "distribution_center"],
     "line_number": ["НомерСтроки", "Номер строки", "line_number"],
+    "pick_order": ["ПорядокСборки", "Порядок сборки", "pick_order"],
     "nomenclature_code": ["КодНоменклатуры", "Код номенклатуры", "nomenclature_code"],
     "nomenclature": ["nomenclature", "номенклатура", "наименование", "товар", "sku_name"],
     "characteristic_code": ["КодХарактеристики", "Код характеристики", "characteristic_code"],
@@ -120,6 +121,19 @@ def _parse_units(value: Any) -> tuple[int | None, str]:
     return int(number), ""
 
 
+def _parse_positive_integer(value: Any, *, missing: str, invalid: str) -> tuple[int | None, str]:
+    raw = _text(value)
+    if not raw:
+        return None, missing
+    try:
+        number = float(raw.replace(",", "."))
+    except ValueError:
+        return None, invalid
+    if not number.is_integer() or number < 0:
+        return None, invalid
+    return int(number), ""
+
+
 def _json_value(value: Any) -> Any:
     if value is None or (not isinstance(value, str) and pd.isna(value)):
         return ""
@@ -148,6 +162,7 @@ def normalize_outbound_table(table: pd.DataFrame, mapping: dict[str, str | None]
     rows: list[dict[str, Any]] = []
     diagnostics: list[dict[str, Any]] = []
     real_export = bool(mapping.get("calculated_box_qty"))
+    pick_order_column_present = bool(mapping.get("pick_order"))
     required = ["outbound_order_number", "created_at", "nomenclature", "warehouse"]
     required.append("calculated_box_qty" if real_export else "qty_units")
     missing = [field for field in required if not mapping.get(field)]
@@ -161,6 +176,8 @@ def normalize_outbound_table(table: pd.DataFrame, mapping: dict[str, str | None]
         raw_qty = value("calculated_box_qty" if real_export else "qty_units")
         qty_units, quantity_reason = _parse_units(raw_qty)
         calculation_control = _text(value("calculation_control"))
+        pick_order, pick_order_reason = _parse_positive_integer(
+            value("pick_order"), missing="pick_order_missing", invalid="pick_order_invalid")
         control_label = _label(calculation_control)
         if real_export and control_label == "количество в коробке не найдено":
             qty_units, quantity_reason = 0, "quantity_per_box_missing"
@@ -185,12 +202,15 @@ def normalize_outbound_table(table: pd.DataFrame, mapping: dict[str, str | None]
             "source_index": source_index,
             "order_key": outbound_order_key(warehouse, order_number, created_at),
             "line_status": "not_processed",
+            "pick_order": pick_order,
+            "pick_order_validation_reason": (pick_order_reason if pick_order_column_present else "pick_order_column_missing"),
+            "route_sequence_authoritative": not bool(pick_order_reason) and pick_order_column_present,
+            "line_number": _json_value(value("line_number")),
         }
         if real_export:
             row.update({
                 "outbound_order_ref": _text(value("outbound_order_ref")),
                 "distribution_center": _text(value("distribution_center")),
-                "line_number": _json_value(value("line_number")),
                 "nomenclature_code": _text(value("nomenclature_code")),
                 "characteristic_code": _text(value("characteristic_code")),
                 "production_date": _json_value(value("production_date")),
@@ -205,6 +225,10 @@ def normalize_outbound_table(table: pd.DataFrame, mapping: dict[str, str | None]
             diagnostics.append({"level": "warning", "source_index": source_index, "outbound_order_number": order_number, "reason": quantity_reason})
         if real_export and calculation_control and control_label != "количество в коробке не найдено":
             diagnostics.append({"level": "warning", "source_index": source_index, "outbound_order_number": order_number, "reason": "calculation_control_warning"})
+        if row["pick_order_validation_reason"]:
+            diagnostics.append({"level": "warning", "source_index": source_index,
+                                "outbound_order_number": order_number,
+                                "reason": row["pick_order_validation_reason"]})
     return rows, diagnostics
 
 

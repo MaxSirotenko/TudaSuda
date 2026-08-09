@@ -22,7 +22,8 @@ def fixture():
         ],
     }
     gate = {"model_id": "m", "gates": [{"gate_key": "g", "road_type": "bottom", "x": 1, "y": .5}]}
-    demand = {"outbound_demand_state_id": "d", "orders": [{"order_key": "o1", "outbound_order_number": "RO-1",
+    demand = {"outbound_demand_state_id": "d", "readiness": {"route_sequence_authoritative": True},
+        "orders": [{"order_key": "o1", "outbound_order_number": "RO-1",
         "created_at": "2026-08-09T10:00:00", "demands": [{"demand_key": "d1", "sku_key": "sku", "requested_units": 4}]}]}
     return model, gate, demand
 

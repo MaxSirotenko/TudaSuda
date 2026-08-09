@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 from typing import Any
 
@@ -30,6 +31,16 @@ def _first_text(row: dict[str, Any], *names: str) -> str:
 
 def _unit_key(value: Any) -> str:
     return _text(value).casefold().replace("ё", "е")
+
+
+def _integer_evidence(value: Any) -> int | None:
+    if isinstance(value, bool) or value is None or value == "":
+        return None
+    try:
+        number = float(str(value).strip().replace(",", "."))
+    except ValueError:
+        return None
+    return int(number) if number.is_integer() and number >= 0 else None
 
 
 def _quantity_reason(row: dict[str, Any]) -> str:
@@ -67,6 +78,8 @@ def build_outbound_pick_demands(order_rows: list[dict[str, Any]]) -> dict[str, A
         "orders_count": 0,
         "demands_count": 0,
         "merged_duplicate_lines": 0,
+        "route_sequence_authoritative": True,
+        "route_sequence_reason_counts": {},
         "skipped_missing_order": 0,
         "skipped_missing_sku": 0,
         "skipped_invalid_quantity": 0,
@@ -103,7 +116,7 @@ def build_outbound_pick_demands(order_rows: list[dict[str, Any]]) -> dict[str, A
             "created_at": created_at,
             "warehouse": warehouse,
             "source_indexes": set(),
-            "demands_by_merge_key": {},
+            "demands": [],
             "sku_metadata_by_key": {},
         })
         _keep_metadata(order, {
@@ -114,6 +127,16 @@ def build_outbound_pick_demands(order_rows: list[dict[str, Any]]) -> dict[str, A
         source_index = row.get("source_index")
         if isinstance(source_index, int) and not isinstance(source_index, bool):
             order["source_indexes"].add(source_index)
+        pick_order = _integer_evidence(row.get("pick_order"))
+        line_number = _integer_evidence(row.get("line_number"))
+        sequence_reason = _text(row.get("pick_order_validation_reason"))
+        if pick_order is None:
+            sequence_reason = sequence_reason or "pick_order_missing"
+        if sequence_reason or row.get("route_sequence_authoritative") is False:
+            reason = sequence_reason or "pick_order_not_authoritative"
+            diagnostics["route_sequence_authoritative"] = False
+            counts = diagnostics["route_sequence_reason_counts"]
+            counts[reason] = counts.get(reason, 0) + 1
 
         sku_code = _text(row.get("sku_code"))
         sku_name = _first_text(row, "sku_name", "nomenclature", "item_name")
@@ -165,15 +188,10 @@ def build_outbound_pick_demands(order_rows: list[dict[str, Any]]) -> dict[str, A
             diagnostics["unsupported_unit"] += 1
             continue
         display_unit = normalized_unit
-        merge_key = (sku_key, normalized_unit)
-        demands = order["demands_by_merge_key"]
-        if merge_key in demands:
-            demand = demands[merge_key]
-            demand["requested_units"] += quantity
-            diagnostics["merged_duplicate_lines"] += 1
-        else:
-            demand = demands[merge_key] = {
-                "demand_key": json.dumps([order_key, sku_key, normalized_unit], ensure_ascii=False, separators=(",", ":")),
+        stable_evidence = [order_key, pick_order, line_number, sku_key, normalized_unit, quantity,
+                           sku_code, sku_name, characteristic_code, characteristic_name]
+        demand = {
+                "demand_key": json.dumps(stable_evidence, ensure_ascii=False, separators=(",", ":")),
                 "order_key": order_key,
                 "outbound_order_number": order["outbound_order_number"],
                 "sku_key": sku_key,
@@ -183,25 +201,40 @@ def build_outbound_pick_demands(order_rows: list[dict[str, Any]]) -> dict[str, A
                 "characteristic_name": characteristic_name,
                 "requested_units": quantity,
                 "unit_name": display_unit,
-                "source_indexes": set(),
+                "source_indexes": set(), "pick_order": pick_order, "line_number": line_number,
                 "_normalized_unit": normalized_unit,
             }
+        order["demands"].append(demand)
         if isinstance(source_index, int) and not isinstance(source_index, bool):
             demand["source_indexes"].add(source_index)
 
     orders = []
     for order in orders_by_key.values():
-        demand_values = list(order["demands_by_merge_key"].values())
+        demand_values = list(order["demands"])
         if not demand_values:
             diagnostics["orders_without_valid_demands"] += 1
             continue
         sku_units: dict[str, set[str]] = {}
+        sequence_evidence: dict[tuple[int | None, int | None], set[str]] = {}
+        picks_by_line: dict[int, set[int]] = {}
         for demand in demand_values:
             sku_units.setdefault(demand["sku_key"], set()).add(demand["_normalized_unit"])
+            sequence_evidence.setdefault((demand["pick_order"], demand["line_number"]), set()).add(demand["demand_key"])
+            if demand["line_number"] is not None and demand["pick_order"] is not None:
+                picks_by_line.setdefault(demand["line_number"], set()).add(demand["pick_order"])
+        ambiguous = sum(len(values) > 1 for key, values in sequence_evidence.items() if key[0] is not None)
+        if ambiguous:
+            diagnostics["route_sequence_authoritative"] = False
+            diagnostics["route_sequence_reason_counts"]["pick_order_ambiguous"] = ambiguous
+        conflicting = sum(len(values) > 1 for values in picks_by_line.values())
+        if conflicting:
+            diagnostics["route_sequence_authoritative"] = False
+            diagnostics["route_sequence_reason_counts"]["pick_order_conflict"] = conflicting
         diagnostics["unit_variants_for_same_sku"] += sum(len(units) > 1 for units in sku_units.values())
         demand_values.sort(key=lambda item: (
-            min(item["source_indexes"], default=float("inf")), item["sku_key"],
-            item["_normalized_unit"], item["demand_key"],
+            item["pick_order"] if item["pick_order"] is not None else float("inf"),
+            item["line_number"] if item["line_number"] is not None else float("inf"),
+            item["demand_key"],
         ))
         for demand in demand_values:
             demand["outbound_order_number"] = order["outbound_order_number"]
@@ -218,8 +251,20 @@ def build_outbound_pick_demands(order_rows: list[dict[str, Any]]) -> dict[str, A
         })
     orders.sort(key=lambda item: (
         item["created_at"], item["outbound_order_number"],
-        min(item["source_indexes"], default=float("inf")), item["order_key"],
+        item["order_key"],
     ))
     diagnostics["orders_count"] = len(orders)
     diagnostics["demands_count"] = sum(len(order["demands"]) for order in orders)
-    return {"orders": orders, "diagnostics": diagnostics}
+    readiness = {"route_sequence_authoritative": diagnostics["route_sequence_authoritative"],
+                 "reasons": dict(sorted(diagnostics["route_sequence_reason_counts"].items()))}
+    # Technical Excel positions remain audit evidence but must not change the
+    # business state identity when otherwise identical rows are permuted.
+    identity_orders = []
+    for order in orders:
+        identity_orders.append({key: value for key, value in order.items() if key != "source_indexes"} | {
+            "demands": [{key: value for key, value in demand.items() if key != "source_indexes"}
+                        for demand in order["demands"]]})
+    encoded = json.dumps({"orders": identity_orders, "readiness": readiness}, ensure_ascii=False,
+                         sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return {"outbound_demand_state_id": "sha256:" + hashlib.sha256(encoded).hexdigest(),
+            "orders": orders, "diagnostics": diagnostics, "readiness": readiness}

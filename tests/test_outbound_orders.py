@@ -73,7 +73,8 @@ def test_normalization_recognizes_columns_and_ignores_weight_for_quantity():
     mapping = outbound.detect_outbound_columns(table)
     rows, diagnostics = outbound.normalize_outbound_table(table, mapping)
 
-    assert diagnostics == []
+    assert [item["reason"] for item in diagnostics] == ["pick_order_column_missing"]
+    assert rows[0]["route_sequence_authoritative"] is False
     assert rows[0]["qty_units"] == 3
     assert "weight" not in rows[0]
     assert mapping["qty_units"] == "Количество"
@@ -183,7 +184,8 @@ def test_compound_warehouse_name_is_accepted_during_execution():
 def _real_export_row(**updates):
     row = {
         "СсылкаРО": "ref-1", "НомерРО": "RO-1", "ДатаРО": "2026-07-20", "Склад": "Зона комплектации тестового РЦ",
-        "РЦ": "Тестовый РЦ", "НомерСтроки": 4, "КодНоменклатуры": "ITEM-1", "Номенклатура": "Товар A",
+        "РЦ": "Тестовый РЦ", "НомерСтроки": 4, "ПорядокСборки": 3,
+        "КодНоменклатуры": "ITEM-1", "Номенклатура": "Товар A",
         "КодХарактеристики": "CHAR-1", "Характеристика": "Вариант A", "ДатаПроизводства": "2026-07-01",
         "ЕдиницаИзмерения": "кг", "Количество": 115.8, "КоличествоВКоробке": 19.3,
         "РасчетноеОтгруженоКоробок": 6, "КонтрольРасчета": "",

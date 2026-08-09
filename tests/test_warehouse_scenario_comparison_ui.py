@@ -40,8 +40,8 @@ def _fixture():
         for name in ("A", "B")
     ]
     classifications = [
-        {"sku_key": sku("A"), "calculated_zone": "light"},
-        {"sku_key": sku("B"), "calculated_zone": "heavy"},
+        {"sku_key": sku("A"), "sku_name": "A", "characteristic_name": "x", "calculated_zone": "light"},
+        {"sku_key": sku("B"), "sku_name": "B", "characteristic_name": "x", "calculated_zone": "heavy"},
     ]
     return model, start, inventory, classifications
 
@@ -60,14 +60,14 @@ def test_signature_is_deterministic_and_covers_rules_and_baseline():
 
 def test_classification_adapter_uses_canonical_contract_and_never_physical_zone():
     rows = build_sku_zone_rows([
-        {"sku_key": "a", "calculated_zone": "Средне-лёгкое", "weight_zone": "heavy"},
-        {"sku_key": "b", "calculated_zone": "show_boxes"},
-        {"sku_key": "c", "calculated_zone": "unassigned"},
-        {"sku_key": "d", "calculated_zone": "not-a-zone"},
+        {"sku_name": "a", "calculated_zone": "Средне-лёгкое", "weight_zone": "heavy"},
+        {"sku_name": "b", "calculated_zone": "show_boxes"},
+        {"sku_name": "c", "calculated_zone": "unassigned"},
+        {"sku_name": "d", "calculated_zone": "not-a-zone"},
     ])
     assert rows == [
-        {"sku_key": "a", "target_zone": "medium_light", "source": "loaded_receipt_classification"},
-        {"sku_key": "b", "target_zone": "show_boxes", "source": "loaded_receipt_classification"},
+        {"sku_key": canonical_sku_key({"nomenclature": "a"}), "target_zone": "medium_light", "source": "loaded_receipt_classification"},
+        {"sku_key": canonical_sku_key({"nomenclature": "b"}), "target_zone": "show_boxes", "source": "loaded_receipt_classification"},
     ]
 
 

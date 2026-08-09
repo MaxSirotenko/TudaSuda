@@ -15,7 +15,7 @@ from typing import Any
 import streamlit as st
 import streamlit.components.v1 as components
 
-from warehouse_business_identity import normalize_warehouse
+from warehouse_business_identity import canonical_sku_key, normalize_warehouse
 from warehouse_geometry_render_layers import (
     build_geometry_static_layer,
     compose_geometry_layers,
@@ -101,16 +101,21 @@ def build_scenario_rule_config(*, weight_zones_enabled: bool, velocity_enabled: 
 def build_sku_zone_rows(classification_rows: Sequence[Mapping[str, Any]] | None) -> list[dict[str, str]]:
     """Adapt accepted SKU classification; never infer a zone from a cell."""
     result: list[dict[str, str]] = []
-    seen: set[tuple[str, str, str]] = set()
+    evidence: dict[str, set[str]] = {}
     for row in classification_rows or []:
-        sku_key = str(row.get("sku_key") or "").strip()
+        sku_key = canonical_sku_key({"nomenclature": row.get("nomenclature") or row.get("sku_name"),
+                                     "characteristic": row.get("characteristic") or row.get("characteristic_name")})
+        imported_key = str(row.get("sku_key") or "").strip()
+        if not sku_key and imported_key.startswith("sku:v2:"):
+            sku_key = imported_key
         zone = normalize_placement_zone(row.get("calculated_zone"))
         if not sku_key or not is_assignable_placement_zone(zone):
             continue
-        adapted = (sku_key, str(zone), "loaded_receipt_classification")
-        if adapted not in seen:
-            seen.add(adapted)
-            result.append({"sku_key": adapted[0], "target_zone": adapted[1], "source": adapted[2]})
+        evidence.setdefault(sku_key, set()).add(str(zone))
+    for sku_key, zones in evidence.items():
+        if len(zones) == 1:
+            result.append({"sku_key": sku_key, "target_zone": next(iter(zones)),
+                           "source": "loaded_receipt_classification"})
     return sorted(result, key=lambda row: (row["sku_key"], row["target_zone"], row["source"]))
 
 
@@ -131,6 +136,9 @@ def summarize_scenario_ui_metrics(
         "fixed_units": summary.get("fixed_units", 0),
         "unresolved_units": summary.get("unresolved_units", 0),
         "missing_zone_skus": len(missing_skus),
+        "opening_skus_total": len(opening_skus),
+        "canonical_zone_resolved_skus": len(opening_skus) - len(missing_skus),
+        "unresolved_skus": len(missing_skus),
         "missing_zone_placements": missing_placements,
         "zone_coverage_percent": round(100 * (len(opening_skus) - len(missing_skus)) / len(opening_skus), 1)
         if opening_skus else 100.0,
@@ -420,11 +428,15 @@ def render_scenario_comparison(
                        and (not target or normalize_warehouse(row.get("warehouse")) == target)]
         demand = build_outbound_pick_demands(scoped_rows)
         proposed = scenario.get("proposed_state")
-        distance_ready = bool(demand.get("orders") and gate_state and gate_state.get("gates") and proposed)
+        route_ready = demand.get("readiness", {}).get("route_sequence_authoritative", False)
+        distance_ready = bool(route_ready and demand.get("orders") and gate_state and gate_state.get("gates") and proposed)
         st.markdown("#### Пробег CURRENT / PROPOSED")
         st.write(" · ".join(("✓ CURRENT baseline", "✓ PROPOSED scenario",
                              f"{'✓' if demand.get('orders') else '✗'} РО выбранного дня",
+                             f"{'✓' if route_ready else '✗'} Фактический порядок сборки",
                              f"{'✓' if gate_state and gate_state.get('gates') else '✗'} Ворота")))
+        if not route_ready:
+            st.warning("Бизнес-сравнение пробега недоступно: фактический порядок сборки отсутствует или некорректен.")
         distance_signature = _hash({"model_id": model.get("model_id"), "current": baseline.get("simulation_state_id"),
                                     "proposed": scenario.get("proposed_state_id"), "demand": demand,
                                     "gate": gate_state, "zone_order": "default"})

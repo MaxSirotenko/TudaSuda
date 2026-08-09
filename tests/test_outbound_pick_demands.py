@@ -26,6 +26,9 @@ def _row(number="РО-1", quantity=2, *, index=1, characteristic="Белая", u
         "unit_name": unit,
         "warehouse": "Вешки",
         "source_index": index,
+        "pick_order": index,
+        "line_number": index,
+        "route_sequence_authoritative": True,
         "order_key": f"key-{number}",
     }
     row.update(extra)
@@ -58,12 +61,12 @@ def test_orders_group_by_key_and_sort_deterministically():
     assert [order["order_key"] for order in build_outbound_pick_demands(rows)["orders"]] == ["a", "b"]
 
 
-def test_duplicates_merge_quantities_units_and_sorted_sources():
+def test_duplicate_sku_lines_remain_separate_and_ordered():
     rows = [_row(quantity=3, index=8, unit=" Короб "), _row(quantity=2, index=2, unit="КОРОБ")]
     result = build_outbound_pick_demands(rows)
-    demand = result["orders"][0]["demands"][0]
-    assert (demand["requested_units"], demand["unit_name"], demand["source_indexes"]) == (5, "короб", [2, 8])
-    assert result["diagnostics"]["merged_duplicate_lines"] == 1
+    demands = result["orders"][0]["demands"]
+    assert [(d["requested_units"], d["source_indexes"]) for d in demands] == [(2, [2]), (3, [8])]
+    assert result["diagnostics"]["merged_duplicate_lines"] == 0
 
 
 def test_characteristics_and_unit_variants_are_separate_and_sorted_by_source():
@@ -131,13 +134,13 @@ def test_metadata_conflicts_keep_first_nonempty_values_and_other_warehouse():
     assert result["diagnostics"]["sku_metadata_conflicts"] == 0
 
 
-def test_demand_key_is_stable_quantity_independent_and_collision_safe():
+def test_demand_key_covers_factual_line_evidence_and_is_collision_safe():
     first = build_outbound_pick_demands([_row(quantity=2, order_key="a,b", sku_key="c")])["orders"][0]["demands"][0]["demand_key"]
     second = build_outbound_pick_demands([_row(quantity=99, order_key="a,b", sku_key="c")])["orders"][0]["demands"][0]["demand_key"]
     collision = build_outbound_pick_demands([_row(order_key="a", sku_key="b,c")])["orders"][0]["demands"][0]["demand_key"]
-    assert first == second
+    assert first != second
     assert first != collision
-    assert json.loads(first) == ["a,b", make_sku_key({"sku_name": "Капуста", "characteristic_name": "Белая"}), "короб"]
+    assert json.loads(first)[:5] == ["a,b", 1, 1, make_sku_key({"sku_name": "Капуста", "characteristic_name": "Белая"}), "короб"]
 
 
 def test_input_list_rows_and_nested_values_are_not_modified():
