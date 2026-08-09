@@ -18,7 +18,7 @@ from warehouse_scenario_comparison_ui import build_scenario_rule_config
 from warehouse_ui_messages import get_ui_message
 from warehouse_workflow_ui_state import state_from_session
 from warehouse_factual_data import (
-    SOURCE_LABELS, cross_source_coverage, date_summary, import_excel_dataset, load_registry,
+    SOURCE_LABELS, active_datasets, cross_source_coverage, date_summary, import_excel_dataset, load_registry,
 )
 
 WORKSPACE_TABS = ("Склад", "Данные", "Условия модели", "CURRENT / PROPOSED", "Пробег", "Аналитика")
@@ -201,19 +201,18 @@ def render_factual_data_layer(model: Mapping[str, Any] | None) -> None:
         key="factual_data_uploads",
     )
     if files and st.button("Импортировать в Data Layer", type="primary", key="factual_data_import"):
-        geometry_cells = {
-            str(cell.get("cell_code") or cell.get("display_code") or cell.get("cell_key") or "")
-            for cell in (model or {}).get("cells", []) if isinstance(cell, Mapping)
-        }
         for uploaded in files:
             try:
-                result = import_excel_dataset(uploaded.getvalue(), uploaded.name, geometry_cells=geometry_cells)
+                result = import_excel_dataset(uploaded.getvalue(), uploaded.name)
             except (OSError, ValueError) as exc:
                 st.error(f"{uploaded.name}: файл не импортирован ({exc})")
                 continue
             if result.get("source_type") == "unknown":
-                st.error(f"{uploaded.name}: Неизвестный тип файла")
+                family = result.get("detected_source_family")
+                st.error(f"{uploaded.name}: требуется сопоставление полей" if family else f"{uploaded.name}: Неизвестный тип файла")
                 st.caption("Обнаруженные колонки: " + " · ".join(result.get("detected_columns", [])))
+                if result.get("required_missing"):
+                    st.caption("Не сопоставлены обязательные поля: " + " · ".join(result["required_missing"]))
             elif result.get("reused"):
                 st.info(f"{uploaded.name}: уже импортирован, использован сохранённый артефакт")
             else:
@@ -223,20 +222,28 @@ def render_factual_data_layer(model: Mapping[str, Any] | None) -> None:
     if not datasets:
         st.info("Фактические месячные наборы ещё не импортированы.")
         return
+    active = active_datasets(registry)
     compact = [{
         "Файл": item.get("source_file_name"), "Тип": item.get("source_label"), "Статус": item.get("status"),
+        "Версия": str(item.get("version") or item.get("content_hash") or "")[:10], "Активен": "да",
         "Период": " — ".join(filter(None, (item.get("period_from"), item.get("period_to")))) or "—",
         "Строк": item.get("rows", 0), "SKU": item.get("unique_sku", 0),
         "Ошибки": len(item.get("errors", [])), "Предупреждения": len(item.get("warnings", [])),
-    } for item in datasets]
+        "Импортирован": item.get("imported_at"),
+    } for item in active]
     st.dataframe(pd.DataFrame(compact), use_container_width=True, hide_index=True)
-    for item in datasets:
+    superseded = [item for item in datasets if not item.get("active", True)]
+    with st.expander("Предыдущие версии / технические детали"):
+        if superseded:
+            st.dataframe(pd.DataFrame([{"Файл": i.get("source_file_name"), "Тип": i.get("source_label"),
+                "Версия": str(i.get("version") or i.get("content_hash") or "")[:10], "Заменён": i.get("superseded_by")} for i in superseded]), hide_index=True)
+    for item in active:
         with st.expander(f"{item.get('source_file_name')} · {item.get('source_label')}"):
             st.json({key: item.get(key) for key in (
                 "dataset_id", "content_hash", "parser_version", "sheet", "imported_at", "artifact",
                 "detected_columns", "diagnostics",
             )})
-    available_days = sorted({day for item in datasets for day in item.get("partitions", []) if day != "undated"})
+    available_days = sorted({day for item in active for day in item.get("partitions", []) if day != "undated"})
     if available_days:
         selected = st.selectbox("Операционный день", available_days, key="factual_operational_day")
         summary = date_summary(registry, selected)

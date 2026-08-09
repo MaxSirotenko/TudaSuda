@@ -27,16 +27,16 @@ def test_source_detection_all_families_unknown_and_ambiguous():
     families = {
         "historical_placement": _placement(),
         "inventory": {"Инвентаризация": "I", "Номер": 1, "Дата": "2026-07-15", "НомерСтроки": 1, "Склад": "A", "Номенклатура": "N", "Характеристика": "C", "КоличествоФакт": 1, "КоличествоУчет": 2},
-        "receipts": {"НомерПриходногоОрдера": "R", "ДатаПриходногоОрдера": "2026-07-15", "Склад": "A", "НомерСтроки": 1, "Номенклатура": "N", "Характеристика": "C", "КоличествоКоробок": 1},
-        "outbound": {"НомерРасходногоОрдера": "O", "ДатаРасходногоОрдера": "2026-07-15", "Склад": "A", "Номенклатура": "N", "Характеристика": "C", "РасчетноеКоличествоКоробов": 1},
+        "receipts": {"Ссылка": "ref", "Номер": "R", "Дата": "2026-07-15", "Склад": "A", "НомерСтроки": 1, "Номенклатура": "N", "Характеристика": "C", "КоличествоКоробок": 1},
+        "outbound": {"СсылкаРО": "ref", "НомерРО": "O", "ДатаРО": "2026-07-15", "Склад": "A", "НомерСтроки": 1, "Номенклатура": "N", "Характеристика": "C", "РасчетноеОтгруженоКоробок": 1},
         "vgh": {"Номенклатура": "N", "Характеристика": "C", "КоличествоКоробовВОдномСлоеНаПаллете": 2, "КоличествоСлоевНаПаллете": 3},
     }
     for expected, row in families.items():
         assert detect_source_type(row)["source_type"] == expected
-    assert detect_source_type(["foo", "bar"])["status"] == "unknown"
+    assert detect_source_type(["foo", "bar"])["status"] == "unknown_schema"
     combined = {**families["receipts"], **families["vgh"]}
     detected = detect_source_type(combined)
-    assert detected["status"] == "ambiguous"
+    assert detected["status"] == "ambiguous_schema"
     assert detected["source_type"] == "unknown"
 
 
@@ -58,7 +58,8 @@ def test_placement_preserves_raw_ambiguity_and_never_creates_capacity(tmp_path):
     assert diag["multiple_sku_per_cell"] == 1
     assert diag["sku_in_multiple_cells"] == 1
     assert diag["pallet_in_multiple_cells"] == 1
-    assert diag["unknown_geometry_cells"] == 1
+    assert diag["unknown_geometry_cells"] is None
+    assert diag["historical_cell_resolution"] == "historical_cell_not_resolved_to_geometry"
     assert diag["cell_picking_order_conflicts"] == 1
     assert all("sku" not in evidence for evidence in diag["cell_picking_order_evidence"])
 
@@ -76,22 +77,22 @@ def test_inventory_is_chronological_evidence_not_additive_stock(tmp_path):
 
 
 def test_receipt_outbound_and_vgh_source_semantics(tmp_path):
-    receipt_rows = [{"НомерПриходногоОрдера": "R", "ДатаПриходногоОрдера": "2026-07-15 17:00", "Склад": "A", "НомерСтроки": i,
+    receipt_rows = [{"Ссылка": "ref", "Номер": "R", "Дата": "2026-07-15 17:00", "Склад": "A", "НомерСтроки": i,
                      "Номенклатура": "N", "Характеристика": "C", "КоличествоКоробок": qty, "КоличествоПаллет": 1}
                     for i, qty in enumerate((2, 0, -1, None), 1)]
     receipt = import_excel_dataset(_xlsx(receipt_rows), "ПО июль.xlsx", root=tmp_path)
     records = load_dataset_rows(receipt, "2026-07-15")
     assert [r["box_quantity"] for r in records] == [2, 0, -1, None]
     assert all(r["reported_pallets"] == 1 and "capacity" not in r for r in records)
-    outbound_rows = [{"НомерРасходногоОрдера": "O", "ДатаРасходногоОрдера": "2026-07-15", "Склад": "A",
-                      "Номенклатура": "N", "Характеристика": "C", "РасчетноеКоличествоКоробов": qty, "ПорядокСборки": 9}
+    outbound_rows = [{"СсылкаРО": "ref", "НомерРО": "O", "ДатаРО": "2026-07-15", "Склад": "A", "НомерСтроки": 1,
+                      "Номенклатура": "N", "Характеристика": "C", "РасчетноеОтгруженоКоробок": qty, "ПорядокСборки": 9}
                      for qty in (0, 4)]
     outbound = import_excel_dataset(_xlsx(outbound_rows), "РО июль.xlsx", root=tmp_path)
     out = load_dataset_rows(outbound, "2026-07-15")
     assert len(out) == 2 and [r["quantity"] for r in positive_outbound(out)] == [4]
     assert out[0]["source_pick_order"] == 9 and "sku_picking_order" not in out[0]
     vgh = import_excel_dataset(_xlsx([{"Номенклатура": "N", "Характеристика": "C", "Вес": 10, "Длина": 1,
-        "Ширина": 2, "Высота": 3, "КоличествоКоробовВОдномСлоеНаПаллете": 6, "КоличествоСлоевНаПаллете": 4}]), "ВГХ паллеты.xlsx", root=tmp_path)
+        "Ширина": 2, "Высота": 3, "КоличествоКоробовВОдномСлоеНаПаллете": 6, "КоличествоСлоевНаПаллете": 4, "КоличествоВКоробке": 10}]), "ВГХ паллеты.xlsx", root=tmp_path)
     vgh_row = load_dataset_rows(vgh)[0]
     assert vgh_row["source_boxes_per_pallet"] == 24
     assert vgh_row["palletization_authority"] == "source_layer_norm"
@@ -112,7 +113,8 @@ def test_registry_idempotency_changed_hash_provenance_partition_and_coverage(tmp
     assert row["parser_version"] == PARSER_VERSION
     assert load_dataset_rows(first, "2026-07-16") == []
     summary = date_summary(registry, "2026-07-15")
-    assert summary["placement"]["rows"] == 2
+    assert summary["placement"]["rows"] == 1
+    assert sum(item["active"] for item in registry["datasets"]) == 1
     coverage = cross_source_coverage(registry)
     assert coverage and coverage[0]["placement"] is True and coverage[0]["vgh"] is False
 
@@ -121,3 +123,43 @@ def test_unknown_file_is_not_persisted(tmp_path):
     result = import_excel_dataset(_xlsx([{"Количество": 1}]), "РО июль.xlsx", root=tmp_path)
     assert result["source_label"] == "Неизвестный тип файла"
     assert not (tmp_path / "registry.json").exists()
+
+
+def _outbound(qty=1, day="2026-07-15"):
+    return {"СсылкаРО": "ref", "НомерРО": "O", "ДатаРО": day, "Склад": "A", "НомерСтроки": 1,
+            "Номенклатура": "N", "Характеристика": "C", "РасчетноеОтгруженоКоробок": qty}
+
+
+def test_lifecycle_parser_upgrade_multifile_and_renamed_duplicate(tmp_path):
+    a = import_excel_dataset(_xlsx([_outbound(1)]), "РО июль.xlsx", root=tmp_path)
+    b = import_excel_dataset(_xlsx([_outbound(2)]), "РО июль.xlsx", root=tmp_path)
+    registry = load_registry(tmp_path)
+    assert not next(x for x in registry["datasets"] if x["dataset_id"] == a["dataset_id"])["active"]
+    assert b["active"] and b["supersedes"] == a["dataset_id"]
+
+    continuation_data = _xlsx([_outbound(3, "2026-07-31")])
+    continuation = import_excel_dataset(continuation_data, "РО 31-1(1).xlsx", root=tmp_path)
+    assert len([x for x in load_registry(tmp_path)["datasets"] if x["active"]]) == 2
+    renamed = import_excel_dataset(continuation_data, "renamed.xlsx", root=tmp_path)
+    assert renamed["reused"] and renamed["dataset_id"] == continuation["dataset_id"]
+
+    upgraded = import_excel_dataset(_xlsx([_outbound(2)]), "РО июль.xlsx", root=tmp_path, parser_version="factual-july-v3")
+    registry = load_registry(tmp_path)
+    assert upgraded["active"]
+    assert len([x for x in registry["datasets"] if x["active"] and x["logical_source_id"] == upgraded["logical_source_id"]]) == 1
+
+
+def test_duplicate_hash_precedes_parse_and_indexes_avoid_full_load(tmp_path, monkeypatch):
+    import warehouse_factual_data as factual
+    data = _xlsx([_outbound()])
+    first = import_excel_dataset(data, "РО июль.xlsx", root=tmp_path)
+    monkeypatch.setattr(factual, "read_excel_source", lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("parsed")))
+    assert import_excel_dataset(data, "РО июль.xlsx", root=tmp_path)["dataset_id"] == first["dataset_id"]
+    monkeypatch.setattr(factual, "load_dataset_rows", lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("full load")))
+    assert cross_source_coverage(load_registry(tmp_path))[0]["outbound"]
+
+
+def test_unconfirmed_outbound_names_are_not_authoritative():
+    plausible = {"НомерРасходногоОрдера": "O", "ДатаРасходногоОрдера": "2026-07-15", "Склад": "A",
+                 "Номенклатура": "N", "Характеристика": "C", "РасчетноеКоличествоКоробов": 1}
+    assert detect_source_type(plausible)["source_type"] == "unknown"

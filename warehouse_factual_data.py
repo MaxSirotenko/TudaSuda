@@ -24,7 +24,7 @@ import pandas as pd
 
 from warehouse_business_identity import build_canonical_sku_identity, find_canonical_identity_collisions
 
-PARSER_VERSION = "factual-july-v1"
+PARSER_VERSION = "factual-july-v2"
 DATA_ROOT = Path("data/last_import/factual")
 REGISTRY_PATH = DATA_ROOT / "registry.json"
 UNKNOWN_SOURCE = "unknown"
@@ -47,16 +47,16 @@ CONTRACTS: dict[str, dict[str, tuple[str, ...]]] = {
         "source_position_balance": ("КоличествоОстатокПоложения",),
     },
     "inventory": {
-        "inventory_ref": ("СсылкаИнвентаризации", "Инвентаризация"),
+        "inventory_ref": ("Ссылка", "Инвентаризация", "СсылкаИнвентаризации"),
         "inventory_number": ("НомерИнвентаризации", "Номер"),
         "occurred_at": ("ДатаИнвентаризации", "Дата"), "line_number": ("НомерСтроки",),
         "warehouse": ("Склад",), "nomenclature": ("Номенклатура",),
-        "characteristic": ("Характеристика",), "actual_quantity": ("КоличествоФакт",),
-        "accounting_quantity": ("КоличествоУчет",),
+        "characteristic": ("Характеристика",), "actual_quantity": ("КоличествоФакт", "ФактическоеКоличество"),
+        "accounting_quantity": ("КоличествоУчет", "УчетноеКоличество"),
     },
     "receipts": {
-        "document_ref": ("СсылкаПриходногоОрдера",), "document_number": ("НомерПриходногоОрдера",),
-        "occurred_at": ("ДатаПриходногоОрдера",), "warehouse": ("Склад",),
+        "document_ref": ("Ссылка", "СсылкаПриходногоОрдера"), "document_number": ("Номер", "НомерПриходногоОрдера"),
+        "occurred_at": ("Дата", "ДатаПриходногоОрдера"), "warehouse": ("Склад",),
         "line_number": ("НомерСтроки",), "nomenclature": ("Номенклатура",),
         "characteristic": ("Характеристика",), "box_quantity": ("КоличествоКоробок",),
         "reported_pallets": ("КоличествоПаллет",),
@@ -64,12 +64,12 @@ CONTRACTS: dict[str, dict[str, tuple[str, ...]]] = {
         "expected_receipt": ("ОжидаемыйПриход",),
     },
     "outbound": {
-        "document_ref": ("СсылкаРасходногоОрдера", "РасходныйОрдер"),
-        "document_number": ("НомерРасходногоОрдера",),
-        "occurred_at": ("ДатаРасходногоОрдера", "ДатаСоздания"), "warehouse": ("Склад",),
+        "document_ref": ("СсылкаРО",),
+        "document_number": ("НомерРО",),
+        "occurred_at": ("ДатаРО",), "warehouse": ("Склад",),
         "line_number": ("НомерСтроки",), "nomenclature": ("Номенклатура",),
         "characteristic": ("Характеристика",),
-        "quantity": ("РасчетноеКоличествоКоробов", "КоличествоКоробок"),
+        "quantity": ("РасчетноеОтгруженоКоробок",),
         "source_pick_order": ("ПорядокСборки",),
     },
     "vgh": {
@@ -80,11 +80,21 @@ CONTRACTS: dict[str, dict[str, tuple[str, ...]]] = {
         "quantity_per_box": ("КоличествоВКоробке",),
     },
 }
+# Each accepted spelling is traceable to the task's confirmed exports or to a
+# checked-in 1C query.  Keeping the evidence beside the executable contract
+# prevents a synthetic fixture from silently becoming source authority.
+CONTRACT_EVIDENCE = {
+    "historical_placement": "CONFIRMED_PROJECT_SOURCE:размещение июль.xlsx",
+    "inventory": "CONFIRMED_PROJECT_SOURCE;LEGACY_COMPATIBILITY:queries_1c/inventory_results.query",
+    "receipts": "CONFIRMED_PROJECT_SOURCE:ПО июль.xlsx;LEGACY_COMPATIBILITY:queries_1c/day_receipts.query",
+    "outbound": "EXISTING_WORKING_QUERY:queries_1c/mass_outbound_orders.query",
+    "vgh": "CONFIRMED_PROJECT_SOURCE",
+}
 REQUIRED = {
-    "historical_placement": {"snapshot_at", "source_pallet_ref", "nomenclature", "characteristic", "cell", "cell_picking_order"},
-    "inventory": {"occurred_at", "warehouse", "nomenclature", "characteristic", "actual_quantity", "accounting_quantity"},
-    "receipts": {"document_number", "occurred_at", "warehouse", "line_number", "nomenclature", "characteristic", "box_quantity"},
-    "outbound": {"document_number", "occurred_at", "warehouse", "nomenclature", "characteristic", "quantity"},
+    "historical_placement": {"snapshot_at", "source_pallet_ref", "nomenclature", "characteristic", "source_stock_quantity", "cell", "cell_picking_order", "source_position_balance"},
+    "inventory": {"inventory_ref", "inventory_number", "occurred_at", "line_number", "warehouse", "nomenclature", "characteristic", "actual_quantity", "accounting_quantity"},
+    "receipts": {"document_ref", "document_number", "occurred_at", "warehouse", "line_number", "nomenclature", "characteristic", "box_quantity"},
+    "outbound": {"document_ref", "document_number", "occurred_at", "warehouse", "line_number", "nomenclature", "characteristic", "quantity"},
     "vgh": {"nomenclature", "characteristic", "boxes_per_layer", "layers_per_pallet"},
 }
 
@@ -148,9 +158,29 @@ def detect_source_type(columns: Iterable[Any]) -> dict[str, Any]:
                 mapping[field] = found
         if REQUIRED[source_type].issubset(mapping):
             matches[source_type] = mapping
-    status = "detected" if len(matches) == 1 else "ambiguous" if len(matches) > 1 else "unknown"
+    status = "detected" if len(matches) == 1 else "ambiguous_schema" if len(matches) > 1 else "unknown_schema"
     source_type = next(iter(matches)) if len(matches) == 1 else UNKNOWN_SOURCE
-    return {"source_type": source_type, "status": status, "detected_columns": list(map(str, columns)),
+    missing: list[str] = []
+    if source_type == UNKNOWN_SOURCE and not matches:
+        # Family signatures are exact, confirmed source fields, not fuzzy
+        # aliases.  They allow a useful mapping_required diagnostic without
+        # authorising canonical rows.
+        signatures = {"receipts": "box_quantity", "outbound": "quantity", "historical_placement": "source_pallet_ref",
+                      "inventory": "actual_quantity", "vgh": "boxes_per_layer"}
+        candidates = []
+        partial = {}
+        for family, signature in signatures.items():
+            mapping = {field: next((normalized[_norm(alias)] for alias in aliases if _norm(alias) in normalized), None)
+                       for field, aliases in CONTRACTS[family].items()}
+            mapping = {field: value for field, value in mapping.items() if value}
+            if signature in mapping and {"nomenclature", "characteristic"}.issubset(mapping):
+                candidates.append(family); partial[family] = mapping
+        if len(candidates) == 1:
+            source_type = candidates[0]; status = "mapping_required"
+            missing = sorted(REQUIRED[source_type] - partial[source_type].keys())
+            matches = partial
+    return {"source_type": source_type, "status": status, "mapping_status": "ready" if status == "detected" else status,
+            "required_missing": missing, "detected_columns": list(map(str, columns)),
             "matches": sorted(matches), "mapping": matches.get(source_type, {})}
 
 
@@ -191,13 +221,14 @@ def _canonical_record(raw: Mapping[str, Any], mapping: Mapping[str, str], proven
 
 
 def normalize_table(table: pd.DataFrame, *, dataset_id: str, filename: str, data_hash: str,
-                    source_type: str, sheet: str, imported_at: str, mapping: Mapping[str, str] | None = None
+                    source_type: str, sheet: str, imported_at: str, mapping: Mapping[str, str] | None = None,
+                    parser_version: str = PARSER_VERSION,
                     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     mapping = dict(mapping or detect_source_type(table.columns)["mapping"])
     raw_records, canonical = [], []
     for ordinal, (source_index, series) in enumerate(table.iterrows(), 2):
         provenance = {"dataset_id": dataset_id, "source_file_name": filename, "content_hash": data_hash,
-                      "source_type": source_type, "parser_version": PARSER_VERSION, "sheet": sheet,
+                      "source_type": source_type, "parser_version": parser_version, "sheet": sheet,
                       "source_row": ordinal, "source_index": _json_value(source_index), "imported_at": imported_at}
         raw = {str(key): _json_value(value) for key, value in series.items()}
         raw_records.append({**provenance, "raw": raw})
@@ -245,9 +276,14 @@ def validate_records(source_type: str, raw: list[dict[str, Any]], rows: list[dic
         diagnostics.update(unique_cells=len(cells), sku_in_multiple_cells=grouped("sku_key", "cell"),
             multiple_sku_per_cell=grouped("cell", "sku_key"), multiple_sku_per_pallet=grouped("source_pallet_ref", "sku_key"),
             pallet_in_multiple_cells=grouped("source_pallet_ref", "cell", across_snapshots=True),
-            unknown_geometry_cells=len(cells - geometry_cells) if geometry_cells else 0,
+            # No authoritative resolver from the historical 1C address string
+            # to geometry cell_key exists in the project.  Do not compare it
+            # with ad-hoc display/code fields.
+            unknown_geometry_cells=None,
+            historical_cell_resolution="historical_cell_not_resolved_to_geometry",
             cell_picking_order_conflicts=sum(len(values) > 1 for values in orders.values()),
             cell_picking_order_evidence=[{"cell": cell, "picking_orders": sorted(values), "conflict": len(values) > 1} for cell, values in sorted(orders.items())])
+        diagnostics["warnings"].append("historical_cell_not_resolved_to_geometry")
     for key, label in (("missing_sku", "missing_sku"), ("duplicate_raw_rows", "duplicate_raw_rows"),
                        ("identity_collisions", "identity_collisions"), ("negative_quantities", "negative_quantities"),
                        ("missing_quantities", "missing_quantities")):
@@ -295,30 +331,79 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
 
 def load_registry(root: Path = DATA_ROOT) -> dict[str, Any]:
     path = root / "registry.json"
-    if not path.exists(): return {"registry_version": 1, "datasets": []}
+    if not path.exists(): return {"registry_version": 2, "datasets": [], "diagnostics": []}
     try:
         state = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {"registry_version": 1, "datasets": [], "warning": "registry_unreadable"}
-    return state if isinstance(state.get("datasets"), list) else {"registry_version": 1, "datasets": [], "warning": "registry_invalid"}
+    if not isinstance(state.get("datasets"), list):
+        return {"registry_version": 2, "datasets": [], "warning": "registry_invalid", "diagnostics": []}
+    # PR #161 registries did not distinguish immutable versions from active
+    # source slots.  Migrate in memory deterministically and flag ambiguous
+    # slots rather than allowing every version into business queries.
+    groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for item in state["datasets"]:
+        logical = item.get("logical_source_id") or logical_source_identity(
+            item.get("source_type", UNKNOWN_SOURCE), item.get("source_file_name", ""), item.get("sheet", "Sheet1"))
+        item.setdefault("logical_source_id", logical)
+        item.setdefault("version", item.get("content_hash"))
+        item.setdefault("superseded_by", None)
+        item.setdefault("supersedes", None)
+        groups[logical].append(item)
+    diagnostics = list(state.get("diagnostics", []))
+    for logical, versions in groups.items():
+        if all("active" not in item for item in versions):
+            ordered = sorted(versions, key=lambda item: (item.get("imported_at", ""), item.get("dataset_id", "")))
+            for item in ordered: item["active"] = False
+            ordered[-1]["active"] = True
+            if len(ordered) > 1:
+                diagnostics.append({"code": "registry_activation_review_required", "logical_source_id": logical})
+    state.update(registry_version=2, diagnostics=diagnostics)
+    return state
+
+
+def logical_source_identity(source_type: str, filename: str, sheet: str) -> str:
+    normalized_name = _norm(Path(filename).name)
+    payload = "\x1f".join((source_type, normalized_name, _norm(sheet)))
+    return "source:" + hashlib.sha256(payload.encode()).hexdigest()
+
+
+def active_datasets(registry: Mapping[str, Any], source_type: str | None = None) -> list[dict[str, Any]]:
+    """The single business-query boundary for lifecycle filtering."""
+    return [item for item in registry.get("datasets", [])
+            if item.get("active", True) and (source_type is None or item.get("source_type") == source_type)]
 
 
 def import_excel_dataset(data: bytes, filename: str, *, sheet: str | None = None, root: Path = DATA_ROOT,
-                         geometry_cells: Iterable[str] | None = None, reimport: bool = False) -> dict[str, Any]:
+                         geometry_cells: Iterable[str] | None = None, reimport: bool = False,
+                         parser_version: str = PARSER_VERSION) -> dict[str, Any]:
+    # Hash and consult content provenance before opening the workbook.  With no
+    # explicit sheet, a prior default-sheet import is safe to reuse; an
+    # explicitly selected sheet must match exactly.
+    digest = content_hash(data)
+    root.mkdir(parents=True, exist_ok=True)
+    registry = load_registry(root)
+    content_match = next((item for item in registry["datasets"]
+        if item.get("content_hash") == digest and item.get("parser_version") == parser_version
+        and (sheet is None or item.get("sheet") == sheet)), None)
+    if content_match and not reimport:
+        return {**content_match, "reused": True, "duplicate_filename": filename if filename != content_match.get("source_file_name") else None}
     selected, table = read_excel_source(data, sheet)
     detection = detect_source_type(table.columns)
-    if detection["source_type"] == UNKNOWN_SOURCE:
+    if detection["source_type"] == UNKNOWN_SOURCE or detection["status"] != "detected":
         return {"status": detection["status"], "source_type": UNKNOWN_SOURCE, "source_label": SOURCE_LABELS[UNKNOWN_SOURCE],
-                "detected_columns": detection["detected_columns"], "matches": detection["matches"], "errors": ["unknown_or_ambiguous_schema"]}
-    digest = content_hash(data); source_type = detection["source_type"]
-    dataset_id = dataset_identity(digest, source_type, selected)
-    registry = load_registry(root)
+                "detected_source_family": detection["source_type"] if detection["source_type"] != UNKNOWN_SOURCE else None,
+                "required_missing": detection["required_missing"], "detected_columns": detection["detected_columns"],
+                "matches": detection["matches"], "errors": [detection["status"]]}
+    source_type = detection["source_type"]
+    dataset_id = dataset_identity(digest, source_type, selected, parser_version)
     existing = next((item for item in registry["datasets"] if item.get("dataset_id") == dataset_id), None)
     if existing and not reimport:
         return {**existing, "reused": True}
-    imported_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    imported_at = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+    logical_source_id = logical_source_identity(source_type, filename, selected)
     raw, canonical = normalize_table(table, dataset_id=dataset_id, filename=filename, data_hash=digest,
-        source_type=source_type, sheet=selected, imported_at=imported_at, mapping=detection["mapping"])
+        source_type=source_type, sheet=selected, imported_at=imported_at, mapping=detection["mapping"], parser_version=parser_version)
     diagnostics = validate_records(source_type, raw, canonical, set(map(str, geometry_cells or [])))
     known_check = _known_july_placement_check(filename, canonical) if source_type == "historical_placement" else None
     if known_check:
@@ -326,19 +411,55 @@ def import_excel_dataset(data: bytes, filename: str, *, sheet: str | None = None
         if known_check["missing_dates"]: diagnostics["warnings"].append("known_july_missing_dates")
         if not known_check["july_15_fingerprint_matches"]: diagnostics["warnings"].append("known_july_15_fingerprint_mismatch")
     artifact = root / dataset_id.removeprefix("dataset:")
-    _write_jsonl(artifact / "raw.jsonl.gz", raw)
+    staging = Path(tempfile.mkdtemp(dir=root, prefix=".staging-"))
+    _write_jsonl(staging / "raw.jsonl.gz", raw)
     partitions = defaultdict(list)
     for row in canonical: partitions[_day(row) or "undated"].append(row)
-    for day, rows in partitions.items(): _write_jsonl(artifact / "canonical" / f"date={day}.jsonl.gz", rows)
+    daily: dict[str, Any] = {}
+    sku_index = sorted({row.get("sku_key") for row in canonical if row.get("sku_key")})
+    document_keys: set[str] = set()
+    for day, rows in partitions.items():
+        _write_jsonl(staging / "canonical" / f"date={day}.jsonl.gz", rows)
+        docs = {(r.get("document_ref") or r.get("inventory_ref"), r.get("document_number") or r.get("inventory_number"), r.get("occurred_at")) for r in rows}
+        document_keys.update(json.dumps(key, ensure_ascii=False, default=str) for key in docs)
+        positive = [r.get("quantity") for r in rows if isinstance(r.get("quantity"), (int, float)) and r.get("quantity") > 0]
+        daily[day] = {"rows": len(rows), "sku": len({r.get("sku_key") for r in rows if r.get("sku_key")}),
+            "cells": len({r.get("cell") for r in rows if r.get("cell")}), "documents": len(docs),
+            "positive_quantity": sum(positive), "positive_sku_keys": sorted({r.get("sku_key") for r in rows if r.get("sku_key") and isinstance(r.get("quantity"), (int, float)) and r.get("quantity") > 0})}
+    index = {"sku_keys": sku_index, "dates": sorted(partitions), "daily": daily, "document_keys": sorted(document_keys)}
     metadata = {"dataset_id": dataset_id, "source_file_name": filename, "content_hash": digest, "source_type": source_type,
-        "source_label": SOURCE_LABELS[source_type], "parser_version": PARSER_VERSION, "sheet": selected, "rows": len(raw),
+        "source_label": SOURCE_LABELS[source_type], "parser_version": parser_version, "sheet": selected, "rows": len(raw),
         "period_from": diagnostics["period_from"], "period_to": diagnostics["period_to"], "unique_sku": diagnostics["unique_sku"],
-        "imported_at": imported_at, "status": "warning" if diagnostics["warnings"] else "ready", "errors": diagnostics["errors"],
+        "imported_at": imported_at, "status": "ready_with_warnings" if diagnostics["warnings"] else "ready", "errors": diagnostics["errors"],
         "warnings": diagnostics["warnings"], "detected_columns": detection["detected_columns"],
-        "artifact": str(artifact), "partitions": sorted(partitions), "diagnostics": diagnostics}
-    _atomic_json(artifact / "metadata.json", metadata)
+        "mapping": detection["mapping"], "mapping_status": "ready", "artifact": str(artifact), "partitions": sorted(partitions),
+        "index": index, "diagnostics": diagnostics, "logical_source_id": logical_source_id, "version": digest,
+        "active": True, "superseded_by": None, "supersedes": None}
+    previous = [item for item in registry["datasets"] if item.get("active", True) and item.get("logical_source_id") == logical_source_id and item.get("dataset_id") != dataset_id]
+    metadata["supersedes"] = previous[-1]["dataset_id"] if previous else None
+    _atomic_json(staging / "metadata.json", metadata)
+    if artifact.exists():
+        # A reparse of the same immutable identity already has a complete artifact.
+        import shutil; shutil.rmtree(staging)
+    else:
+        os.replace(staging, artifact)
+    for item in previous:
+        item["active"] = False
+        item["superseded_by"] = dataset_id
     registry["datasets"] = [item for item in registry["datasets"] if item.get("dataset_id") != dataset_id] + [metadata]
+    # Different logical files may coexist, but overlapping dates/business keys
+    # are surfaced rather than silently summed without a warning.
+    overlaps = []
+    for item in active_datasets(registry, source_type):
+        if item["dataset_id"] == dataset_id: continue
+        dates = set(item.get("index", {}).get("dates", item.get("partitions", []))) & set(index["dates"])
+        keys = set(item.get("index", {}).get("document_keys", [])) & set(index["document_keys"])
+        if dates or keys: overlaps.append({"dataset_id": item["dataset_id"], "dates": sorted(dates), "duplicate_document_keys": len(keys)})
+    if overlaps:
+        metadata["diagnostics"]["overlapping_active_sources"] = overlaps
+        metadata["warnings"].append("overlapping_active_sources")
     registry["datasets"].sort(key=lambda item: (item.get("imported_at", ""), item["dataset_id"]))
+    registry["registry_version"] = 2
     _atomic_json(root / "registry.json", registry)
     return {**metadata, "reused": False}
 
@@ -362,7 +483,10 @@ def date_summary(registry: Mapping[str, Any], day: str) -> dict[str, Any]:
               "outbound": {"documents": 0, "lines": 0, "positive_demand": 0}, "vgh": {"relevant_sku": 0, "covered_sku": 0},
               "next_day_placement_available": False}
     source_rows = defaultdict(list)
-    for dataset in registry.get("datasets", []): source_rows[dataset["source_type"]].extend(load_dataset_rows(dataset, day))
+    for dataset in active_datasets(registry):
+        # Only the selected partition is opened; persisted indexes handle VGH
+        # and next-day existence below.
+        source_rows[dataset["source_type"]].extend(load_dataset_rows(dataset, day))
     placement = source_rows["historical_placement"]
     result["placement"] = {"snapshot_exists": bool(placement), "rows": len(placement), "sku": len({r.get("sku_key") for r in placement if r.get("sku_key")}), "cells": len({r.get("cell") for r in placement if r.get("cell")})}
     for source, target in (("inventory", "inventory"), ("receipts", "receipts")):
@@ -371,19 +495,19 @@ def date_summary(registry: Mapping[str, Any], day: str) -> dict[str, Any]:
     outbound = source_rows["outbound"]; positive = positive_outbound(outbound)
     result["outbound"] = {"documents": len({(r.get("document_ref"), r.get("document_number"), r.get("occurred_at")) for r in outbound}), "lines": len(outbound), "positive_demand": sum(r["quantity"] for r in positive)}
     demanded = {r.get("sku_key") for r in positive if r.get("sku_key")}; vgh = set()
-    for dataset in registry.get("datasets", []):
-        if dataset.get("source_type") == "vgh": vgh.update(r.get("sku_key") for r in load_dataset_rows(dataset) if r.get("sku_key"))
+    for dataset in active_datasets(registry):
+        if dataset.get("source_type") == "vgh": vgh.update(dataset.get("index", {}).get("sku_keys", []))
         if dataset.get("source_type") == "historical_placement":
             tomorrow = (pd.Timestamp(day).date() + timedelta(days=1)).isoformat()
-            result["next_day_placement_available"] |= bool(load_dataset_rows(dataset, tomorrow))
+            result["next_day_placement_available"] |= tomorrow in dataset.get("index", {}).get("dates", dataset.get("partitions", []))
     result["vgh"] = {"relevant_sku": len(demanded), "covered_sku": len(demanded & vgh)}
     return result
 
 
 def cross_source_coverage(registry: Mapping[str, Any]) -> list[dict[str, Any]]:
     indexes: dict[str, set[str]] = defaultdict(set)
-    for dataset in registry.get("datasets", []):
-        indexes[dataset["source_type"]].update(row.get("sku_key") for row in load_dataset_rows(dataset) if row.get("sku_key"))
+    for dataset in active_datasets(registry):
+        indexes[dataset["source_type"]].update(dataset.get("index", {}).get("sku_keys", []))
     scope = indexes["outbound"] | indexes["historical_placement"]
     return [{"sku_key": sku, "outbound": sku in indexes["outbound"], "placement": sku in indexes["historical_placement"],
              "vgh": sku in indexes["vgh"], "inventory": sku in indexes["inventory"], "receipts": sku in indexes["receipts"]} for sku in sorted(scope)]
