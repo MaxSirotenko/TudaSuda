@@ -32,11 +32,14 @@ def build_proposed_scenario(
     rule_config: dict[str, Any],
     *,
     sku_zone_rows: list[dict[str, Any]] | None = None,
+    sku_velocity_rows: list[dict[str, Any]] | None = None,
+    gate_state: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Run RuleSet -> Plan -> ProposedState, always from ``baseline_state``."""
     rule_set, rule_validation = build_placement_rule_set(rule_config)
     plan, plan_validation = build_proposed_placement_plan(
         model, baseline_state, rule_set, sku_zone_rows or [],
+        sku_velocity_rows=sku_velocity_rows, gate_state=gate_state,
     )
     proposed = None
     apply_report: dict[str, Any] | None = None
@@ -56,6 +59,7 @@ def build_proposed_scenario(
         "enabled_rule_ids": get_enabled_rule_ids(rule_set) if rule_validation["valid"] else [],
         **{key: plan_summary.get(key, 0) for key in (
             "placement_units_total", "units_kept", "units_moved", "fixed_units", "unresolved_units",
+            "velocity_profile_skus", "velocity_ranked_units", "velocity_unranked_units", "velocity_units_moved",
         )},
         "weight_zone_compliance_before_percent": plan_summary.get("weight_zone_compliance_before_percent", 100.0),
         "weight_zone_compliance_after_percent": plan_summary.get("weight_zone_compliance_after_percent", 100.0),

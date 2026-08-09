@@ -148,3 +148,59 @@ def test_permutations_have_same_plan_and_identity_and_api_has_no_previous_plan()
     assert diagnostics["valid"] and first == second
     assert "previous" not in " ".join(inspect.signature(build_proposed_placement_plan).parameters)
     assert validate_proposed_placement_plan(first, model, state, rules(True), mapping)["valid"]
+
+
+def velocity_fixture():
+    model = {
+        "model_id": "m", "source_file_hash": "source",
+        "roads": [{"road_id": "bottom", "road_type": "bottom", "x_min": 0, "x_max": 4, "y_min": 0, "y_max": 2}],
+        "aisles": [{"aisle_id": "a", "x_min": 0, "x_max": 2, "y_min": 2, "y_max": 12}],
+        "cross_aisles": [], "rows": [{"row_number": "1"}],
+        "cells": [
+            {"cell_key": "near", "row_number": "1", "cell_number": 1, "tier": 1, "physical_index": 1,
+             "x_min": 2, "x_max": 3, "y_min": 3, "y_max": 5, "side": "left", "weight_zone": "heavy",
+             "storage_type": "normal", "capacity_pallets": 1},
+            {"cell_key": "far", "row_number": "1", "cell_number": 2, "tier": 1, "physical_index": 2,
+             "x_min": 2, "x_max": 3, "y_min": 7, "y_max": 9, "side": "left", "weight_zone": "heavy",
+             "storage_type": "normal", "capacity_pallets": 1},
+        ],
+    }
+    state = {"simulation_state_id": "s", "model_id": "m", "target_normalized_warehouse": "вешки",
+             "physical_positions": [
+                 {"position_id": "P_NEAR", "cell_key": "near", "status": "occupied", "slot_index": 1},
+                 {"position_id": "P_FAR", "cell_key": "far", "status": "occupied", "slot_index": 1}],
+             "cell_occupancy": [{"cell_key": key, "occupancy_conflict": False} for key in ("near", "far")],
+             "stock_lots": [
+                 {"stock_lot_id": "cold", "sku_key": "COLD", "qty_boxes": 10, "location_status": "located", "cell_key": "near"},
+                 {"stock_lot_id": "hot", "sku_key": "HOT", "qty_boxes": 10, "location_status": "located", "cell_key": "far"}],
+             "pallet_units": []}
+    gate = {"model_id": "m", "gates": [{"gate_key": "g", "road_type": "bottom", "x": 1, "y": .5}]}
+    velocity = [{"sku_key": "HOT", "velocity_rank": 1, "velocity_class": "confirmed_core"},
+                {"sku_key": "COLD", "velocity_rank": 6, "velocity_class": "tail"}]
+    return model, state, gate, velocity
+
+
+def test_velocity_only_uses_graph_distance_and_stays_inside_zone_deterministically():
+    model, state, gate, velocity = velocity_fixture()
+    plan, diagnostics = build_proposed_placement_plan(
+        model, state, rules(velocity=True), [], sku_velocity_rows=velocity, gate_state=gate)
+    targets = {row["sku_key"]: row["target_position_id"] for row in plan["placements"]}
+    assert diagnostics["valid"] and targets == {"HOT": "P_NEAR", "COLD": "P_FAR"}
+    assert plan["summary"]["velocity_units_moved"] == 2
+    assert plan["summary"]["rank_1_average_gate_distance_after_m"] < plan["summary"]["rank_1_average_gate_distance_before_m"]
+    repeated, _ = build_proposed_placement_plan(
+        model, state, rules(velocity=True), [], sku_velocity_rows=list(reversed(velocity)), gate_state=gate)
+    assert repeated == plan
+
+
+def test_velocity_requires_gate_and_profile_and_does_not_invent_missing_rank():
+    model, state, gate, velocity = velocity_fixture()
+    missing_gate, _ = build_proposed_placement_plan(
+        model, state, rules(velocity=True), [], sku_velocity_rows=velocity)
+    assert missing_gate["blocked_reasons"] == [{"code": "velocity_gate_required"}]
+    empty, _ = build_proposed_placement_plan(model, state, rules(velocity=True), [], gate_state=gate)
+    assert empty["blocked_reasons"] == [{"code": "velocity_profile_empty"}]
+    partial, _ = build_proposed_placement_plan(
+        model, state, rules(velocity=True), [], sku_velocity_rows=velocity[:1], gate_state=gate)
+    cold = next(row for row in partial["placements"] if row["sku_key"] == "COLD")
+    assert cold["velocity_rank"] is None
