@@ -80,7 +80,7 @@ def build(cells=None, placements=None, unknown=None, opening_changes=None):
 
 def test_empty_state_and_ordinary_and_deep_position_registries():
     state, diagnostics = build()
-    assert state["simulation_state_version"] == 4
+    assert state["simulation_state_version"] == 5
     assert state["target_normalized_warehouse"] == "вешки"
     assert state["summary"]["total_boxes"] == 0
     assert [p["position_id"] for p in state["physical_positions"]] == [

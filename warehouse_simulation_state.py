@@ -21,7 +21,7 @@ from warehouse_business_identity import (
 )
 from warehouse_deep_lane import derive_deep_lane_depths
 
-SIMULATION_STATE_VERSION = 4
+SIMULATION_STATE_VERSION = 5
 POSITION_STATUSES = frozenset({"free", "occupied", "unknown"})
 
 LIMITATIONS = [
@@ -154,7 +154,7 @@ def summarize_simulation_state(state: Mapping[str, Any]) -> dict[str, Any]:
         "depleted_pallet_units": sum(p.get("physical_status") == "depleted" for p in pallets),
         "unassigned_pallet_units": sum(p.get("physical_status") == "active" and p.get("location_status") == "unassigned" for p in pallets),
         "exact_positioned_pallet_units": sum(p.get("physical_status") == "active" and p.get("location_status") == "located" for p in pallets),
-        "full_pallet_units": sum(not p.get("is_partial") for p in pallets),
+        "full_pallet_units": sum(p.get("is_partial") is False for p in pallets),
         "partial_pallet_units": sum(bool(p.get("is_partial")) for p in pallets),
         "palletized_boxes": palletized_boxes,
         "palletized_stock_boxes": palletized_boxes,
@@ -315,8 +315,13 @@ def refresh_simulation_state(model: Mapping[str, Any], state: Mapping[str, Any])
     stock_ready = expected == total
     physical_ready = view["physical_occupancy_ready"]
     result["physical_capacity_status"] = "exact" if physical_ready else ("partial" if result["physical_positions"] else "unknown")
+    opening_readiness = {key: value for key, value in (result.get("readiness", {}) or {}).items()
+                         if key in {"stock_quantity_authoritative", "stock_location_authoritative",
+                                    "normal_pallet_footprint_authoritative", "deep_lane_depth_authoritative",
+                                    "opening_stock_business_ready", "estimated_opening_allocation"}}
     result["readiness"] = {"stock_ready": stock_ready, "physical_occupancy_ready": physical_ready,
-                           "capacity_sensitive_placement_ready": stock_ready and physical_ready}
+                           "capacity_sensitive_placement_ready": stock_ready and physical_ready,
+                           **opening_readiness}
     result["summary"] = summarize_simulation_state(result)
     result["simulation_state_id"] = compute_simulation_state_id(result)
     return result
@@ -330,8 +335,30 @@ def build_initial_simulation_state(
     diagnostics: dict[str, Any] = {name: 0 for name in _DIAGNOSTIC_NAMES}
     diagnostics.update({"configuration_errors": [], "warnings": []})
     lots: list[dict[str, Any]] = []
+    pallets: list[dict[str, Any]] = []
     opening_boxes = 0
-    for located, records in ((True, opening_stock_state.get("placements", []) or []),
+    raw_placements = list(opening_stock_state.get("placements", []) or [])
+    # Exact same-SKU rows belonging to one factual pallet are one movable
+    # physical object, even when 1C reports several production dates.
+    grouped: dict[tuple[str, str, str], list[Mapping[str, Any]]] = defaultdict(list)
+    ordinary: list[Mapping[str, Any]] = []
+    for record in raw_placements:
+        ref = _text(record.get("source_pallet_ref"))
+        if ref and record.get("physical_pallet_authority") == "exact_normal_pallet":
+            grouped[(ref, _text(record.get("cell_key")), _text(record.get("sku_key")))].append(record)
+        else:
+            ordinary.append(record)
+    exact_records: list[dict[str, Any]] = []
+    for (ref, key, _), rows in sorted(grouped.items()):
+        base = dict(sorted(rows, key=lambda row: _canonical_json(dict(row)))[0])
+        base["qty_units"] = base["qty_boxes"] = sum(int(row["qty_units"]) for row in rows)
+        base["production_dates"] = sorted({_text(row.get("production_date")) for row in rows if _text(row.get("production_date"))})
+        base["source_placement_ids"] = sorted({_text(row.get("placement_id")) for row in rows})
+        base["placement_id"] = _sha256({"source_pallet_ref": ref, "cell_key": key,
+                                          "sku_key": base.get("sku_key")})
+        exact_records.append(base)
+
+    for located, records in ((True, ordinary + exact_records),
                              (False, opening_stock_state.get("unknown_location_inventory", []) or [])):
         for record in records:
             lot, error = _lot_from_opening(record, located=located)
@@ -342,6 +369,30 @@ def build_initial_simulation_state(
                 continue
             opening_boxes += lot["qty_boxes"]
             lots.append(lot)
+            if located and record.get("physical_pallet_authority") == "exact_normal_pallet":
+                ref = _text(record.get("source_pallet_ref"))
+                position_id = f"position:{lot['cell_key']}:1"
+                identity = {"source_type": "opening_actual_inventory", "warehouse": target_normalized_warehouse,
+                            "source_pallet_ref": ref, "cell_key": lot["cell_key"], "sku_key": lot["sku_key"]}
+                pallet_id = _sha256(identity)
+                capacity = record.get("capacity_boxes")
+                if capacity is not None:
+                    capacity, capacity_error = validate_box_quantity(capacity, positive=True)
+                    if capacity_error or lot["qty_boxes"] > capacity:
+                        diagnostics["configuration_errors"].append({"reason": "observed_boxes_exceed_nominal_capacity",
+                            "source_pallet_ref": ref, "observed_boxes": lot["qty_boxes"], "capacity_boxes": capacity})
+                        lot["unresolved_reason"] = "observed_boxes_exceed_nominal_capacity"
+                        continue
+                is_partial = None if capacity is None else lot["qty_boxes"] < capacity
+                lot.update({"pallet_unit_id": pallet_id, "position_id": position_id,
+                            "pallet_count": 1, "pallet_count_status": "exact",
+                            "source_pallet_ref": ref, "source_placement_ids": record.get("source_placement_ids", [])})
+                pallets.append({"pallet_unit_id": pallet_id, "sku_key": lot["sku_key"],
+                    "source_type": "opening_actual_inventory", "source_pallet_ref": ref,
+                    "capacity_boxes": capacity, "capacity_status": "exact" if capacity is not None else "unknown",
+                    "initial_boxes": lot["qty_boxes"], "remaining_boxes": lot["qty_boxes"],
+                    "is_partial": is_partial, "position_id": position_id, "cell_key": lot["cell_key"],
+                    "location_status": "located", "physical_status": "active"})
             if not located:
                 diagnostics["unknown_location_stock"] += 1
     lots.sort(key=lambda lot: (lot["stock_lot_id"], _canonical_json(lot)))
@@ -349,7 +400,7 @@ def build_initial_simulation_state(
     diagnostics["duplicate_stock_lot_id"] = len(duplicate_lots)
     diagnostics["configuration_errors"].extend({"reason": "duplicate_stock_lot_id", "stock_lot_id": key} for key in duplicate_lots)
 
-    view = rebuild_simulation_state_views(model, {"stock_lots": lots})
+    view = rebuild_simulation_state_views(model, {"stock_lots": lots, "pallet_units": pallets})
     positions = view["physical_positions"]
     occupancies = view["cell_occupancy"]
     for name, count in view["diagnostics"].items():
@@ -365,12 +416,19 @@ def build_initial_simulation_state(
         diagnostics["stock_conservation_failed"] += 1
     stock_errors = {"invalid_sku_identity", "unsupported_unit", "invalid_box_quantity", "duplicate_stock_lot_id", "stock_conservation_failed"}
     stock_ready = conservation_ok and not any(diagnostics[name] for name in stock_errors)
+    methods = {_text(lot.get("allocation_method")) for lot in lots}
+    estimated_opening = bool(methods & {"estimated_even", "estimated_proportional"})
+    physical_contract = opening_stock_state.get("physical_opening_readiness", {}) or {}
+    quantity_authoritative = bool(physical_contract.get("stock_quantity_authoritative", stock_ready))
+    location_authoritative = bool(physical_contract.get("stock_location_authoritative", not estimated_opening))
+    business_ready = bool(stock_ready and quantity_authoritative and location_authoritative and not estimated_opening and
+                          physical_contract.get("opening_stock_business_ready", True))
     warehouse = normalize_warehouse(target_normalized_warehouse)
     state = {
         "simulation_state_version": SIMULATION_STATE_VERSION, "simulation_state_id": "",
         "model_id": model.get("model_id"), "source_file_hash": model.get("source_file_hash"),
         "target_normalized_warehouse": warehouse, "simulation_time": simulation_time,
-        "stock_lots": lots, "pallet_units": [], "physical_positions": positions, "cell_occupancy": occupancies,
+        "stock_lots": lots, "pallet_units": sorted(pallets, key=lambda p: p["pallet_unit_id"]), "physical_positions": positions, "cell_occupancy": occupancies,
         "unresolved_stock": view["unresolved_stock"],
         "applied_event_ids": [],
         "positions_released_total": 0,
@@ -380,7 +438,13 @@ def build_initial_simulation_state(
                                "stock_conservation_ok": conservation_ok},
         "physical_capacity_status": "exact" if physical_ready else ("partial" if positions else "unknown"),
         "readiness": {"stock_ready": stock_ready, "physical_occupancy_ready": physical_ready,
-                      "capacity_sensitive_placement_ready": physical_ready and stock_ready},
+                      "capacity_sensitive_placement_ready": physical_ready and stock_ready,
+                      "stock_quantity_authoritative": quantity_authoritative,
+                      "stock_location_authoritative": location_authoritative,
+                      "normal_pallet_footprint_authoritative": bool(physical_contract.get("normal_pallet_footprint_authoritative", False)),
+                      "deep_lane_depth_authoritative": bool(physical_contract.get("deep_lane_depth_authoritative", False)),
+                      "opening_stock_business_ready": business_ready,
+                      "estimated_opening_allocation": estimated_opening},
         "summary": {}, "limitations": list(LIMITATIONS),
     }
     state["summary"] = summarize_simulation_state(state)
@@ -441,11 +505,16 @@ def validate_simulation_state(state: Mapping[str, Any], model: Mapping[str, Any]
         pallet_id = pallet.get("pallet_unit_id")
         if not str(pallet.get("sku_key", "")).startswith("sku:v2:"):
             error("invalid_pallet_unit_sku", pallet_unit_id=pallet_id)
-        capacity, capacity_error = validate_box_quantity(pallet.get("capacity_boxes"), positive=True)
+        capacity_unknown = (pallet.get("source_type") == "opening_actual_inventory" and
+                            pallet.get("capacity_boxes") is None and pallet.get("capacity_status") == "unknown")
+        capacity, capacity_error = ((None, None) if capacity_unknown else
+                                    validate_box_quantity(pallet.get("capacity_boxes"), positive=True))
         initial, initial_error = validate_box_quantity(pallet.get("initial_boxes"), positive=True)
         remaining = pallet.get("remaining_boxes")
-        if capacity_error or initial_error or initial > capacity:
+        if capacity_error or initial_error or (capacity is not None and not initial_error and initial > capacity):
             error("invalid_pallet_unit_capacity", pallet_unit_id=pallet_id)
+        if capacity_unknown and pallet.get("is_partial") is not None:
+            error("unknown_capacity_claims_partial_status", pallet_unit_id=pallet_id)
         if (not isinstance(remaining, int) or isinstance(remaining, bool) or
                 (not initial_error and not 0 <= remaining <= initial)):
             error("invalid_pallet_unit_remaining_boxes", pallet_unit_id=pallet_id)

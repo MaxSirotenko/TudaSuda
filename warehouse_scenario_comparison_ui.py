@@ -22,6 +22,7 @@ from warehouse_geometry_render_layers import (
 )
 from warehouse_opening_stock_reconciliation import reconcile_opening_stock
 from warehouse_outbound_experiment_inputs import filter_actual_placement_state_by_warehouse
+from warehouse_actual_inventory_import import cross_check_physical_opening_stock
 from warehouse_pick_demands import build_outbound_pick_demands
 from warehouse_placement_zones import is_assignable_placement_zone, normalize_placement_zone
 from warehouse_proposed_scenario import build_proposed_scenario
@@ -164,7 +165,12 @@ def build_comparison_baseline(
         dict(row) for row in opening_rows
         if normalize_warehouse(row.get("normalized_warehouse") or row.get("warehouse")) == target
     ]
-    opening_stock, reconciliation = reconcile_opening_stock(model, scoped_inventory, scoped_start)
+    factual = any(row.get("source_pallet_ref") for row in scoped_start.get("placements", []))
+    if factual:
+        opening_stock, reconciliation = cross_check_physical_opening_stock(scoped_start, scoped_inventory)
+    else:
+        opening_stock, reconciliation = reconcile_opening_stock(model, scoped_inventory, scoped_start)
+        reconciliation["legacy_redistribution_used"] = True
     baseline, simulation = build_initial_simulation_state(
         model, opening_stock, target_normalized_warehouse=target,
         simulation_time=str(operational_date),
@@ -429,14 +435,18 @@ def render_scenario_comparison(
         demand = build_outbound_pick_demands(scoped_rows)
         proposed = scenario.get("proposed_state")
         route_ready = demand.get("readiness", {}).get("route_sequence_authoritative", False)
-        distance_ready = bool(route_ready and demand.get("orders") and gate_state and gate_state.get("gates") and proposed)
+        opening_ready = baseline.get("readiness", {}).get("opening_stock_business_ready", False)
+        distance_ready = bool(route_ready and opening_ready and demand.get("orders") and gate_state and gate_state.get("gates") and proposed)
         st.markdown("#### Пробег CURRENT / PROPOSED")
         st.write(" · ".join(("✓ CURRENT baseline", "✓ PROPOSED scenario",
                              f"{'✓' if demand.get('orders') else '✗'} РО выбранного дня",
                              f"{'✓' if route_ready else '✗'} Фактический порядок сборки",
+                             f"{'✓' if opening_ready else '✗'} Фактический начальный остаток",
                              f"{'✓' if gate_state and gate_state.get('gates') else '✗'} Ворота")))
         if not route_ready:
             st.warning("Бизнес-сравнение пробега недоступно: фактический порядок сборки отсутствует или некорректен.")
+        if not opening_ready:
+            st.warning("Бизнес-сравнение пробега недоступно: начальное физическое размещение оценочное или имеет конфликты.")
         distance_signature = _hash({"model_id": model.get("model_id"), "current": baseline.get("simulation_state_id"),
                                     "proposed": scenario.get("proposed_state_id"), "demand": demand,
                                     "gate": gate_state, "zone_order": "default"})
