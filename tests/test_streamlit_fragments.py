@@ -45,7 +45,7 @@ def test_navigation_remains_outside_fragments():
     settings_section = _source("render_warehouse_settings_tab")
     receipts_section = _source("render_receipts_inventory_tab")
 
-    assert 'key="warehouse_active_section"' in top_level
+    assert 'render_operational_workspace(' in top_level
     assert 'key="warehouse_map_subsection"' in map_section
     assert 'key="warehouse_settings_subsection"' in settings_section
     assert 'key="warehouse_receipts_subsection"' in receipts_section
