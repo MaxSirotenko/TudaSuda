@@ -92,7 +92,7 @@ def apply_proposed_placement_plan(
     placements = proposed_placement_plan.get("placements", []) or []
     origins = {row.get("origin_position_id") for row in placements}
     targets: set[Any] = set()
-    mappings: list[tuple[str, str, list[str], Any, Any]] = []
+    mappings: list[tuple[str, str, list[str], Any, Any, Any]] = []
 
     for row in placements:
         unit_type = row.get("unit_type")
@@ -136,19 +136,22 @@ def apply_proposed_placement_plan(
                 return _blocked("invalid_opaque_opening_placement_unit", baseline_id=baseline_id, plan_id=plan_id)
         else:
             return _blocked("unsupported_placement_unit_type", baseline_id=baseline_id, plan_id=plan_id)
-        mappings.append((unit_type, row.get("pallet_unit_id"), lot_ids, target_id, row.get("target_cell_key")))
+        mappings.append((unit_type, row.get("pallet_unit_id"), lot_ids, target_id,
+                         row.get("target_cell_key"), row.get("stock_role")))
 
     # Mutation starts only after every mapping and final-position constraint passed.
     proposed = copy.deepcopy(dict(baseline_state))
     proposed_lots = {lot["stock_lot_id"]: lot for lot in proposed.get("stock_lots", [])}
     proposed_pallets = {unit["pallet_unit_id"]: unit for unit in proposed.get("pallet_units", [])}
-    for unit_type, pallet_id, lot_ids, target_id, target_cell in mappings:
+    for unit_type, pallet_id, lot_ids, target_id, target_cell, stock_role in mappings:
         lot = proposed_lots[lot_ids[0]]
         lot["cell_key"] = target_cell
         lot["location_status"] = "located"
         if unit_type == "pallet":
             pallet = proposed_pallets[pallet_id]
             pallet.update(position_id=target_id, cell_key=target_cell, location_status="located")
+            if stock_role in {"picking", "storage"}:
+                pallet["placement_role"] = stock_role
             lot["position_id"] = target_id
         else:
             lot["position_id"] = None

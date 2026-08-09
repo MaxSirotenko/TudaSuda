@@ -70,6 +70,8 @@ def build_proposed_scenario(
             "capacity_skus_total", "capacity_skus_satisfied", "capacity_skus_short",
             "capacity_positions_required", "capacity_positions_occupied", "capacity_positions_reserved",
             "capacity_shortage_positions",
+            "picking_storage_participating_skus", "skus_with_picking_position", "picking_positions",
+            "storage_positions", "skus_without_supported_picking_position",
         )},
         "weight_zone_compliance_before_percent": plan_summary.get("weight_zone_compliance_before_percent", 100.0),
         "weight_zone_compliance_after_percent": plan_summary.get("weight_zone_compliance_after_percent", 100.0),
