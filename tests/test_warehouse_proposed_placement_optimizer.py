@@ -384,3 +384,30 @@ def test_explicit_group_blocks_are_neighbours_and_conflict_blocks_plan():
     bad = dict(profile, validation_errors=[{"code": "conflicting_adjacency_group_assignment", "sku_key": "A"}])
     blocked, blocked_diagnostics = build_proposed_placement_plan(model, state, rules(adjacency=True), [], adjacency_profile=bad)
     assert blocked["status"] == "blocked" and not blocked_diagnostics["valid"]
+
+
+def test_deep_lane_rule_compacts_exact_pallets_to_authoritative_depth_suffix():
+    cell = {"cell_key": "D", "row_number": 1, "row_order": 1, "cell_number": 1, "tier": 1,
+            "weight_zone": "heavy", "storage_type": "deep_lane", "capacity_pallets": 5,
+            "deep_lane_access_side": "left", "physical_slots": [
+                {"slot_index": i, "x_min": i - 1.0, "x_max": float(i)} for i in range(1, 6)]}
+    positions = [{"position_id": f"position:D:{i}", "cell_key": "D", "slot_index": i,
+                  "depth_index": i, "status": "occupied" if i in {1, 5} else "free"}
+                 for i in range(1, 6)]
+    lots = [{"stock_lot_id": f"lot-{i}", "sku_key": "A", "qty_boxes": 10,
+             "location_status": "located", "cell_key": "D", "position_id": f"position:D:{i}",
+             "pallet_unit_id": f"pallet-{i}"} for i in (1, 5)]
+    pallets = [{"pallet_unit_id": f"pallet-{i}", "sku_key": "A", "remaining_boxes": 10,
+                "physical_status": "active", "location_status": "located", "cell_key": "D",
+                "position_id": f"position:D:{i}"} for i in (1, 5)]
+    state = {"simulation_state_id": "state-1", "model_id": "model-1",
+             "target_normalized_warehouse": "вешки", "physical_positions": positions,
+             "cell_occupancy": [{"cell_key": "D", "storage_type": "deep_lane",
+                                  "exact_occupied_positions": 2, "occupancy_conflict": False}],
+             "stock_lots": lots, "pallet_units": pallets}
+    plan, diagnostics = build_proposed_placement_plan(
+        {"model_id": "model-1", "cells": [cell]}, state,
+        rules(False, deep_lane_optimization=True), [])
+    assert diagnostics["valid"] and plan["status"] == "ready"
+    assert sorted(row["target_depth_index"] for row in plan["placements"]) == [4, 5]
+    assert plan["summary"]["deep_lane_units_moved_within"] == 1

@@ -24,8 +24,8 @@ from warehouse_placement_zones import (
 )
 from warehouse_physical_graph import build_physical_warehouse_graph, find_shortest_path
 
-PROPOSED_PLACEMENT_PLAN_VERSION = 5
-_SUPPORTED_RULES = frozenset({"weight_zones", "velocity", "adjacency", "base_sku_capacity", "picking_storage", "replenishment"})
+PROPOSED_PLACEMENT_PLAN_VERSION = 6
+_SUPPORTED_RULES = frozenset({"weight_zones", "velocity", "adjacency", "base_sku_capacity", "picking_storage", "replenishment", "deep_lane_optimization"})
 
 
 def _canonical_json(value: Any) -> str:
@@ -172,6 +172,10 @@ def _placement_row(unit: Mapping[str, Any], target: Mapping[str, Any], cells: Ma
         row["qty_boxes"] = unit["qty_boxes"]
     if role is not None:
         row["stock_role"] = role
+    if unit.get("origin_depth_index") is not None:
+        row["origin_depth_index"] = unit["origin_depth_index"]
+    if target.get("depth_index") is not None:
+        row["target_depth_index"] = target["depth_index"]
     if velocity is not None:
         row.update({"velocity_rank": velocity.get("velocity_rank"),
                     "velocity_class": velocity.get("velocity_class"),
@@ -201,12 +205,19 @@ def _extract_units(
         if not position or position.get("cell_key") != pallet.get("cell_key") or len(linked) != 1:
             continue
         lot = linked[0]
+        quantity = pallet.get("remaining_boxes")
+        if (isinstance(quantity, bool) or not isinstance(quantity, (int, float)) or quantity <= 0
+                or lot.get("qty_boxes") != quantity or lot.get("position_id") != pallet.get("position_id")
+                or lot.get("cell_key") != pallet.get("cell_key")
+                or lot.get("sku_key") != pallet.get("sku_key")):
+            continue
         linked_lots.add(lot.get("stock_lot_id"))
         units.append({
             "placement_unit_id": pallet.get("pallet_unit_id"), "unit_type": "pallet",
             "sku_key": pallet.get("sku_key"), "stock_lot_ids": [lot.get("stock_lot_id")],
             "pallet_unit_id": pallet.get("pallet_unit_id"), "origin_position_id": pallet.get("position_id"),
-            "origin_cell_key": pallet.get("cell_key"), "qty_boxes": pallet.get("remaining_boxes"),
+            "origin_cell_key": pallet.get("cell_key"), "origin_depth_index": position.get("depth_index"),
+            "qty_boxes": pallet.get("remaining_boxes"),
         })
 
     occupied_by_unit = {unit["origin_position_id"] for unit in units}
@@ -253,9 +264,65 @@ def _base_plan(model: Mapping[str, Any], state: Mapping[str, Any], rules: Mappin
         "unresolved_units": [], "sku_capacity_allocations": [], "zone_summary": [], "summary": {},
         "limitations": [
             "weight_zones_only", "target_layout_not_move_sequence", "simulation_state_not_mutated",
-            "deep_lane_optimization_not_implemented", "missing_sku_zone_is_not_inferred",
+            "missing_sku_zone_is_not_inferred",
         ],
     }
+
+
+def _deep_lane_inventory(cells, positions, units, unresolved, occupancy_by_cell):
+    """Return authoritative lanes and deterministic reasons for unavailable lanes."""
+    units_by_cell = defaultdict(list)
+    for unit in units:
+        units_by_cell[unit.get("origin_cell_key")].append(unit)
+    unresolved_cells = {row.get("origin_cell_key") for row in unresolved}
+    lanes, locked = [], []
+    for cell_key, cell in sorted(cells.items(), key=lambda item: _cell_key(item[1])):
+        storage = _text(cell.get("storage_type") or cell.get("row_storage_type") or "normal")
+        if storage != "deep_lane" and cell.get("capacity_pallets", 1) == 1:
+            continue
+        lane_positions = sorted((p for p in positions.values() if p.get("cell_key") == cell_key),
+                                key=lambda p: (_number_key(p.get("depth_index")), _position_key(p, cells)))
+        reason = None
+        capacity = cell.get("capacity_pallets")
+        if not isinstance(capacity, int) or isinstance(capacity, bool) or capacity < 1 or len(lane_positions) != capacity:
+            reason = "deep_lane_geometry_invalid"
+        elif any(p.get("depth_index") not in range(1, capacity + 1) for p in lane_positions) or len({p.get("depth_index") for p in lane_positions}) != capacity:
+            reason = "deep_lane_access_or_depth_invalid"
+        elif any(p.get("status") == "unknown" for p in lane_positions) or occupancy_by_cell.get(cell_key, {}).get("exact_occupied_positions") is None:
+            reason = "deep_lane_unknown_occupancy"
+        elif cell_key in unresolved_cells:
+            reason = "deep_lane_unresolved_stock"
+        occupied = {p.get("position_id") for p in lane_positions if p.get("status") == "occupied"}
+        lane_units = units_by_cell.get(cell_key, [])
+        represented = {u.get("origin_position_id") for u in lane_units if u.get("unit_type") == "pallet"}
+        if reason is None and (occupied != represented or any(u.get("unit_type") != "pallet" for u in lane_units)):
+            reason = "deep_lane_unsupported_footprint"
+        skus = {_text(u.get("sku_key")) for u in lane_units}
+        if reason is None and len(skus) > 1:
+            reason = "deep_lane_mixed_sku"
+        if reason:
+            locked.append({"cell_key": cell_key, "reason": reason, "occupied": bool(occupied)})
+        else:
+            lanes.append({"cell_key": cell_key, "cell": cell, "positions": lane_positions,
+                          "units": sorted(lane_units, key=lambda u: _text(u["placement_unit_id"])),
+                          "sku_key": next(iter(skus), None)})
+    return lanes, locked
+
+
+def _compact_existing_deep_lanes(lanes, cells):
+    rows = []
+    for lane in lanes:
+        units = lane["units"]
+        targets = lane["positions"][-len(units):] if units else []
+        by_origin = {u.get("origin_position_id"): u for u in units}
+        # Preserve a fully packed suffix byte-for-byte; otherwise stable unit identity
+        # makes the counterfactual independent of input ordering.
+        if set(by_origin) == {p.get("position_id") for p in targets}:
+            ordered_units = [by_origin[p.get("position_id")] for p in targets]
+        else:
+            ordered_units = units
+        rows.extend(_placement_row(unit, target, cells) for unit, target in zip(ordered_units, targets))
+    return rows
 
 
 def build_proposed_placement_plan(
@@ -317,9 +384,43 @@ def build_proposed_placement_plan(
     adjacency_enabled = "adjacency" in enabled
     capacity_enabled = "base_sku_capacity" in enabled
     picking_enabled = "picking_storage" in enabled
+    deep_enabled = "deep_lane_optimization" in enabled
+    deep_lanes, locked_deep_lanes = _deep_lane_inventory(cells, positions, units, unresolved, occupancy_by_cell)
     minimum_positions = next(
         (rule["parameters"]["minimum_positions_per_sku"] for rule in placement_rule_set["rules"]
          if rule["rule_id"] == "base_sku_capacity"), 1)
+    if deep_enabled and not any((weight_enabled, velocity_enabled, adjacency_enabled, picking_enabled)):
+        eligible_cells = {lane["cell_key"] for lane in deep_lanes}
+        locked_cells = {row["cell_key"] for row in locked_deep_lanes}
+        deep_rows = _compact_existing_deep_lanes(deep_lanes, cells)
+        other_rows = [_placement_row(unit, positions[unit["origin_position_id"]], cells)
+                      for unit in units if unit.get("origin_cell_key") not in eligible_cells]
+        plan["placements"] = sorted(deep_rows + other_rows, key=lambda row: _text(row["placement_unit_id"]))
+        plan["fixed_units"] = sorted([
+            dict(unit, reason=next(row["reason"] for row in locked_deep_lanes
+                                   if row["cell_key"] == unit.get("origin_cell_key")))
+            for unit in units if unit.get("origin_cell_key") in locked_cells
+        ], key=lambda row: _text(row["placement_unit_id"]))
+        plan["unresolved_units"] = sorted(unresolved, key=_canonical_json)
+        plan["status"] = "partial" if any(row["occupied"] for row in locked_deep_lanes) or unresolved else "ready"
+        moved = [row for row in deep_rows if row["moved"]]
+        used = sum(bool(lane["units"]) for lane in deep_lanes)
+        plan["summary"] = {
+            "placement_units_total": len(plan["placements"]), "units_moved": len(moved),
+            "deep_lane_eligible_cells": len(deep_lanes), "deep_lane_locked_or_unconfigured_cells": len(locked_deep_lanes),
+            "deep_lane_pallets_before": sum(len(lane["units"]) for lane in deep_lanes),
+            "deep_lane_pallets_after": sum(len(lane["units"]) for lane in deep_lanes),
+            "deep_lane_cells_used_before": used, "deep_lane_cells_used_after": used,
+            "deep_lane_units_moved_into": 0, "deep_lane_units_moved_out": 0,
+            "deep_lane_units_moved_within": len(moved),
+            "deep_lane_affected_skus": sorted({_text(row.get("sku_key")) for row in moved}),
+            "deep_lane_unresolved_skus": sorted({_text(row.get("sku_key")) for row in unresolved if row.get("sku_key")}),
+        }
+        plan["limitations"].extend(["counterfactual_target_not_relocation_sequence", "no_deep_lane_replenishment"])
+        plan["proposed_placement_plan_id"] = compute_proposed_placement_plan_id(plan)
+        validation = validate_proposed_placement_plan(plan, model, baseline_state, placement_rule_set, sku_zone_rows)
+        validation["warnings"] = sorted(locked_deep_lanes, key=_canonical_json)
+        return plan, validation
     distances: dict[str, float] = {}
     if velocity_enabled or picking_enabled:
         graph, graph_diagnostics = build_physical_warehouse_graph(model, gate_state)
@@ -807,9 +908,15 @@ def validate_proposed_placement_plan(
         if row.get("moved") and row.get("target_position_id") in fixed_positions:
             error("fixed_reserved_position_reused", target_position_id=row.get("target_position_id"))
         origin_cell = cells.get(row.get("origin_cell_key"), {})
-        storage = _text(origin_cell.get("storage_type") or origin_cell.get("row_storage_type") or "normal")
-        if row.get("moved") and (storage == "deep_lane" or origin_cell.get("capacity_pallets", 1) != 1):
-            error("deep_lane_unit_moved", placement_unit_id=row.get("placement_unit_id"))
+        origin_storage = _text(origin_cell.get("storage_type") or origin_cell.get("row_storage_type") or "normal")
+        target_storage = _text(cell.get("storage_type") or cell.get("row_storage_type") or "normal")
+        if origin_storage == "deep_lane" or target_storage == "deep_lane":
+            if row.get("unit_type") != "pallet":
+                error("deep_lane_requires_authoritative_pallet", placement_unit_id=row.get("placement_unit_id"))
+            if row.get("origin_depth_index") != (origin or {}).get("depth_index"):
+                error("origin_depth_index_mismatch", placement_unit_id=row.get("placement_unit_id"))
+            if row.get("target_depth_index") != target.get("depth_index") or target.get("depth_index") is None:
+                error("target_depth_index_mismatch", placement_unit_id=row.get("placement_unit_id"))
         mapped = assignments.get(row.get("sku_key"))
         if (weight_enabled and mapped and row.get("placement_unit_id") not in fixed_unit_ids
                 and row.get("target_zone") != mapped):
@@ -825,4 +932,18 @@ def validate_proposed_placement_plan(
     for sku, count in sorted(picking_counts.items()):
         if count != 1:
             error("invalid_picking_position_count", sku_key=sku, count=count)
+    deep_targets: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in placements:
+        cell = cells.get(row.get("target_cell_key"), {})
+        if _text(cell.get("storage_type") or cell.get("row_storage_type")) == "deep_lane":
+            deep_targets[row["target_cell_key"]].append(row)
+    for cell_key, rows in sorted(deep_targets.items()):
+        if len({_text(row.get("sku_key")) for row in rows}) != 1:
+            error("mixed_sku_deep_lane_target", cell_key=cell_key)
+        capacity = cells[cell_key].get("capacity_pallets")
+        depths = sorted(row.get("target_depth_index") for row in rows)
+        if not isinstance(capacity, int) or depths != list(range(capacity - len(rows) + 1, capacity + 1)):
+            error("deep_lane_not_back_packed", cell_key=cell_key)
+        if any(row.get("stock_role") == "picking" for row in rows):
+            error("picking_role_in_deep_lane", cell_key=cell_key)
     return _diagnostics(errors)

@@ -85,12 +85,14 @@ def build_scenario_rule_config(*, weight_zones_enabled: bool, velocity_enabled: 
                                adjacency_enabled: bool = False,
                                base_sku_capacity_enabled: bool = False,
                                picking_storage_enabled: bool = False,
+                               deep_lane_optimization_enabled: bool = False,
                                replenishment_enabled: bool = False) -> dict[str, dict[str, Any]]:
     """Translate the supported UI toggles into the backend rule contract."""
     return {"weight_zones": {"enabled": bool(weight_zones_enabled)},
             "velocity": {"enabled": bool(velocity_enabled)},
             "adjacency": {"enabled": bool(adjacency_enabled)},
             "picking_storage": {"enabled": bool(picking_storage_enabled)},
+            "deep_lane_optimization": {"enabled": bool(deep_lane_optimization_enabled)},
             "replenishment": {"enabled": bool(replenishment_enabled and picking_storage_enabled)},
             "base_sku_capacity": {"enabled": bool(base_sku_capacity_enabled),
                                   "parameters": {"minimum_positions_per_sku": 1}}}
@@ -294,6 +296,7 @@ def render_scenario_comparison(
     velocity_enabled = st.checkbox("Оборачиваемость / частота отбора", key=f"{SESSION_PREFIX}_velocity")
     adjacency_enabled = st.checkbox("Товарное соседство", key=f"{SESSION_PREFIX}_adjacency")
     picking_storage_enabled = st.checkbox("Комплектация / хранение", key=f"{SESSION_PREFIX}_picking_storage")
+    deep_lane_enabled = st.checkbox("Оптимизация deep lane", key=f"{SESSION_PREFIX}_deep_lane")
     replenishment_enabled = st.checkbox("Пополнение комплектации", disabled=not picking_storage_enabled,
                                         key=f"{SESSION_PREFIX}_replenishment")
     base_capacity_enabled = st.checkbox("Базовое место для SKU", key=f"{SESSION_PREFIX}_base_capacity")
@@ -301,6 +304,7 @@ def render_scenario_comparison(
                                              adjacency_enabled=adjacency_enabled,
                                              base_sku_capacity_enabled=base_capacity_enabled,
                                              picking_storage_enabled=picking_storage_enabled,
+                                             deep_lane_optimization_enabled=deep_lane_enabled,
                                              replenishment_enabled=replenishment_enabled)
     adjacency_profile, adjacency_diagnostics = build_sku_adjacency_profile(adjacency_rows)
     if adjacency_enabled and not adjacency_rows:
@@ -380,7 +384,7 @@ def render_scenario_comparison(
             components.html(proposed_html, height=MAP_HEIGHT, scrolling=True)
 
     if scenario and scenario.get("status") in {"ready", "partial"}:
-        if not weight_zones and not velocity_enabled and not adjacency_enabled and not base_capacity_enabled and not picking_storage_enabled:
+        if not weight_zones and not velocity_enabled and not adjacency_enabled and not base_capacity_enabled and not picking_storage_enabled and not deep_lane_enabled:
             st.info("Правила оптимизации выключены — PROPOSED совпадает с CURRENT.")
         _show_metrics(summarize_scenario_ui_metrics(scenario, baseline, sku_zone_rows))
         if adjacency_enabled:
@@ -403,6 +407,13 @@ def render_scenario_comparison(
                        f"Хранение: {summary.get('storage_positions', 0)} · "
                        f"SKU без поддерживаемой комплектации: "
                        f"{summary.get('skus_without_supported_picking_position', 0)}")
+        if deep_lane_enabled:
+            summary = scenario.get("summary", {})
+            st.caption(f"Deep lane: доступно {summary.get('deep_lane_eligible_cells', 0)} · "
+                       f"закрыто/не настроено {summary.get('deep_lane_locked_or_unconfigured_cells', 0)} · "
+                       f"паллет до/после {summary.get('deep_lane_pallets_before', 0)}/"
+                       f"{summary.get('deep_lane_pallets_after', 0)} · перемещено внутри "
+                       f"{summary.get('deep_lane_units_moved_within', 0)}")
         if scenario.get("status") == "partial":
             summary = scenario.get("summary", {})
             st.warning(f"Неразрешено: {summary.get('unresolved_units', 0)} · "
