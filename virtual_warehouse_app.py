@@ -1840,6 +1840,68 @@ def render_service_tab(saved_model: dict | None, model: dict | None) -> None:
             st.rerun()
 
 
+def render_warehouse_workspace(model: dict | None) -> None:
+    """Physical configuration only; simulation results never appear here."""
+    if not model:
+        st.info("Сначала загрузите схему склада.")
+        return
+    render_map_geometry_fragment(model)
+    from warehouse_workspace_ui import build_warehouse_zone_summary
+    st.subheader("Зоны склада")
+    st.dataframe(pd.DataFrame(build_warehouse_zone_summary(model)),
+                 use_container_width=True, hide_index=True)
+    subsection = st.radio(
+        "Настройка геометрии", ("rows", "cross", "aisles", "zones", "service"),
+        format_func={"rows": "Ряды", "cross": "Поперечные проезды",
+                     "aisles": "Продольные проезды", "zones": "Границы зон",
+                     "service": "Ворота и диагностика"}.get,
+        horizontal=True, key="workspace_warehouse_editor",
+    )
+    if subsection == "rows":
+        render_row_settings_fragment(model)
+    elif subsection == "cross":
+        render_cross_aisles_fragment(model)
+    elif subsection == "aisles":
+        render_aisles_fragment(model)
+    elif subsection == "zones":
+        render_zone_boundaries_fragment(model)
+    else:
+        with st.expander("Техническая геометрия"):
+            render_geometry_data_tabs(model)
+
+
+def render_data_workspace(model: dict | None) -> None:
+    """Single home for operational inputs and inventory operations."""
+    st.subheader("Авторитетные данные V1")
+    st.caption("START · расходные РО · операционный день · склад · ворота")
+    st.info("Приходы и END необязательны и не участвуют в headline replay V1.")
+    if not model:
+        st.warning("Для загрузки данных сначала настройте склад.")
+        return
+    render_receipts_inventory_tab(model)
+    with st.expander("Запросы 1С и техническая подготовка"):
+        render_1c_queries_tab()
+
+
+def render_rules_workspace(model: dict | None) -> None:
+    from warehouse_workspace_ui import render_rules_control_panel
+    render_rules_control_panel(model, st.session_state)
+
+
+def render_comparison_workspace(model: dict | None) -> None:
+    if not model:
+        st.info("Загрузите схему склада в разделе Склад.")
+        return
+    # The existing authoritative input/scenario adapter remains the sole owner
+    # of upload-to-SimulationState orchestration and calculation buttons.
+    render_outbound_experiment(model)
+
+
+def render_business_analytics_workspace(model: dict | None) -> None:
+    from warehouse_workspace_ui import render_cached_analytics
+    render_cached_analytics(st.session_state)
+
+
 def render_excel_geometry_warehouse() -> None:
     st.title("Симулятор скорости сборки")
     st.caption("Рабочий процесс: настройте склад на карте, добавьте приход, зафиксируйте инвент и проверьте результат в аналитике.")
@@ -1848,40 +1910,18 @@ def render_excel_geometry_warehouse() -> None:
     if saved_model and "geometry_model" not in st.session_state:
         st.session_state["geometry_model"] = saved_model
     model = st.session_state.get("geometry_model")
-    section_labels = {
-        "map": "Карта склада",
-        "settings": "Настройки склада",
-        "receipts_inventory": "Приходы и инвент",
-        "analytics": "Аналитика",
-        "queries_1c": "Запросы 1С",
-        "service": "Служебное",
-    }
-    active_section = st.radio(
-        "Раздел склада",
-        options=list(section_labels),
-        format_func=section_labels.__getitem__,
-        horizontal=True,
-        key="warehouse_active_section",
+    # The production workflow has one stable, business-facing navigation.  The
+    # tabs themselves do not calculate or mutate anything; calculations remain
+    # behind the explicit buttons in the delegated renderers.
+    from warehouse_workspace_ui import render_operational_workspace
+    render_operational_workspace(
+        model,
+        warehouse_renderer=render_warehouse_workspace,
+        data_renderer=render_data_workspace,
+        rules_renderer=render_rules_workspace,
+        comparison_renderer=render_comparison_workspace,
+        analytics_renderer=render_business_analytics_workspace,
     )
-
-    if active_section == "map":
-        with measure_step("render_section_map"):
-            render_warehouse_map_tab(model)
-    elif active_section == "settings":
-        with measure_step("render_section_settings"):
-            render_warehouse_settings_tab(model)
-    elif active_section == "receipts_inventory":
-        with measure_step("render_section_receipts_inventory"):
-            render_receipts_inventory_tab(model)
-    elif active_section == "analytics":
-        with measure_step("render_section_analytics"):
-            render_analytics_fragment(model)
-    elif active_section == "queries_1c":
-        with measure_step("render_section_queries_1c"):
-            render_1c_queries_tab()
-    elif active_section == "service":
-        with measure_step("render_section_service"):
-            render_service_tab(saved_model, model)
 
 
 def render_geometry_constructor_tab(saved_model: dict | None, *, show_active_model: bool = False) -> None:
@@ -2293,7 +2333,9 @@ def render_unified_row_settings_editor(model: dict) -> dict:
         "Порядок ряда": "Порядок",
         "Направление сборки": "Направление",
         "Весовая зона": "Зона",
-        "Вместимость одной логической ячейки": "Вместимость",
+        "Вместимость одной логической ячейки": "Вместимость одной ячейки",
+        "Количество логических ячеек": "Количество ячеек",
+        "Общая вместимость ряда": "Общая вместимость ряда",
     }
     with st.form(f"unified_row_settings_form_{model_id}_{revision}"):
         edited_display = st.data_editor(
@@ -2308,12 +2350,14 @@ def render_unified_row_settings_editor(model: dict) -> dict:
                 "Направление": st.column_config.SelectboxColumn("Направление", options=list(DIRECTION_LABELS.values())),
                 "Зона": st.column_config.SelectboxColumn("Зона", options=list(WEIGHT_ZONE_LABELS.values())),
                 "Тип ряда": st.column_config.SelectboxColumn("Тип ряда", options=list(ROW_STORAGE_TYPE_LABELS.values())),
-                "Вместимость": st.column_config.NumberColumn("Вместимость", min_value=1, step=1),
+                "Вместимость одной ячейки": st.column_config.NumberColumn("Вместимость одной ячейки", min_value=1, max_value=7, step=1),
+                "Количество ячеек": st.column_config.NumberColumn("Количество ячеек", disabled=True),
+                "Общая вместимость ряда": st.column_config.NumberColumn("Общая вместимость ряда", disabled=True),
                 "Доступ набивного ряда": st.column_config.SelectboxColumn("Доступ набивного ряда", options=["Не настроено", "Слева", "Справа"]),
                 "Отступ сверху, ячеек": st.column_config.NumberColumn("Отступ сверху, ячеек", min_value=0, step=1),
                 "Отступ снизу, ячеек": st.column_config.NumberColumn("Отступ снизу, ячеек", min_value=0, step=1),
             },
-            column_order=["Ряд", "Порядок", "Направление", "Зона", "Тип ряда", "Доступ набивного ряда", "Вместимость", "Отступ сверху, ячеек", "Отступ снизу, ячеек"],
+            column_order=["Ряд", "Порядок", "Направление", "Зона", "Тип ряда", "Доступ набивного ряда", "Количество ячеек", "Вместимость одной ячейки", "Общая вместимость ряда", "Отступ сверху, ячеек", "Отступ снизу, ячеек"],
         )
         cancel_column, apply_column = st.columns(2)
         reset_submit = cancel_column.form_submit_button("Отменить изменения")
