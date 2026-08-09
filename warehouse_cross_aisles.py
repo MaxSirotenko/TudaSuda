@@ -76,14 +76,6 @@ def _logical_cells(model: dict[str, Any], row_number: str, collection: str = "ce
     return sorted(cells, key=key)
 
 
-def _physical_cells(model: dict[str, Any], row_number: str, collection: str = "cells") -> list[dict[str, Any]]:
-    """Use established coordinates and direction rather than numeric addresses."""
-    cells = [cell for cell in model.get(collection, []) if _text(cell.get("row_number")) == row_number]
-    row = next((item for item in model.get("rows", []) if _text(item.get("row_number")) == row_number), {})
-    reverse = row.get("cell_direction", "bottom_to_top") == "top_to_bottom"
-    return sorted(cells, key=lambda cell: (_number(cell.get("y_center"), _number(cell.get("y_min"))), _text(cell.get("cell_number"))), reverse=reverse)
-
-
 def validate_cross_aisles(model: dict[str, Any], draft: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
     rows = {_text(row.get("row_number")): row for row in model.get("rows", [])}
     normalized: list[dict[str, Any]] = []
@@ -102,12 +94,10 @@ def validate_cross_aisles(model: dict[str, Any], draft: list[dict[str, Any]]) ->
         if not cell_number:
             errors.append(f"{prefix}: номер ячейки не заполнен.")
         row_cells = _logical_cells(model, row_number) if row_number in rows else []
-        physical_cells = _physical_cells(model, row_number) if row_number in rows else []
         cell_numbers = [_text(cell.get("cell_number")) for cell in row_cells]
-        physical_numbers = [_text(cell.get("cell_number")) for cell in physical_cells]
         if cell_number and row_number in rows and cell_number not in cell_numbers:
             errors.append(f"{prefix}: ячейка {cell_number} ряда {row_number} не существует.")
-        if cell_number and cell_number in physical_numbers and physical_numbers.index(cell_number) == len(physical_numbers) - 1:
+        if cell_number and cell_numbers and cell_number == cell_numbers[-1]:
             errors.append(f"{prefix}: проезд нельзя создать после последней физической ячейки ряда {row_number}.")
         raw_width = source.get("width_cells")
         width = _number(raw_width, float("nan"))
@@ -128,28 +118,37 @@ def validate_cross_aisles(model: dict[str, Any], draft: list[dict[str, Any]]) ->
 
 def _layout_collection(model: dict[str, Any], row: dict[str, Any], aisles: list[dict[str, Any]], collection: str) -> None:
     row_number = _text(row.get("row_number"))
-    cells = _physical_cells(model, row_number, collection)
+    cells = _logical_cells(model, row_number, collection)
     if not cells:
         return
-    length = _number(cells[0].get("length_m")) or _number((model.get("settings") or {}).get("cell_length_m"), 1.0) or 1.0
-    offset = _number(row.get("top_offset_m"), _number(row.get("top_offset_cells")) * length)
+    default_length = _number((model.get("settings") or {}).get("cell_length_m"), 1.0) or 1.0
+    lengths = [_number(cell.get("length_m")) or default_length for cell in cells]
+    offset = _number(row.get("top_offset_m"), _number(row.get("top_offset_cells")) * default_length)
     gaps = {_text(aisle["after_cell_number"]): _number(aisle["width_m"]) for aisle in aisles}
-    cursor = offset
-    for cell in cells:
-        cell.update({"y_min": cursor, "y_max": cursor + length, "y_center": cursor + length / 2, "length_m": length})
-        cursor += length
+    top_to_bottom = row.get("cell_direction") == "top_to_bottom"
+    content_span = sum(lengths) + sum(gaps.values())
+    cursor = offset + content_span if top_to_bottom else offset
+    for cell, length in zip(cells, lengths):
+        if top_to_bottom:
+            cursor -= length
+            y_min, y_max = cursor, cursor + length
+        else:
+            y_min, y_max = cursor, cursor + length
+            cursor = y_max
+        cell.update({"y_min": y_min, "y_max": y_max, "y_center": (y_min + y_max) / 2, "length_m": length})
         gap = gaps.get(_text(cell.get("cell_number")), 0.0)
         if gap:
+            gap_min, gap_max = ((cursor - gap, cursor) if top_to_bottom else (cursor, cursor + gap))
             if collection == "cells":
                 aisle = next(item for item in aisles if _text(item["after_cell_number"]) == _text(cell.get("cell_number")))
-                aisle.update({"x_min": _number(row.get("x_min")), "x_max": _number(row.get("x_max")), "x_center": (_number(row.get("x_min")) + _number(row.get("x_max"))) / 2, "y_min": cursor, "y_max": cursor + gap, "y_center": cursor + gap / 2})
-            cursor += gap
+                aisle.update({"x_min": _number(row.get("x_min")), "x_max": _number(row.get("x_max")), "x_center": (_number(row.get("x_min")) + _number(row.get("x_max"))) / 2, "y_min": gap_min, "y_max": gap_max, "y_center": (gap_min + gap_max) / 2})
+            cursor = gap_min if top_to_bottom else gap_max
         if cell.get("physical_slots"):
             for slot in cell["physical_slots"]:
                 slot.update({"y_min": cell["y_min"], "y_max": cell["y_max"]})
     if collection == "cells":
         row["y_min"] = 0.0
-        row["y_max"] = cursor + _number(row.get("bottom_offset_m"), _number(row.get("bottom_offset_cells")) * length)
+        row["y_max"] = offset + content_span + _number(row.get("bottom_offset_m"), _number(row.get("bottom_offset_cells")) * default_length)
 
 
 def _refresh_cross_navigation(model: dict[str, Any]) -> None:
@@ -164,6 +163,21 @@ def _refresh_cross_navigation(model: dict[str, Any]) -> None:
         for source, target in (("left", "center"), ("center", "left"), ("center", "right"), ("right", "center")):
             edges.append({"from_node": f"{base}:{source}", "to_node": f"{base}:{target}", "distance_m": half, "edge_type": "cross_aisle"})
     model["navigation_nodes"], model["navigation_edges"] = nodes, edges
+    rows = {_text(row.get("row_number")): row for row in model.get("rows", [])}
+    for node in nodes:
+        row = rows.get(_text(node.get("row_number")))
+        if not row:
+            continue
+        if node.get("node_type") == "row_bottom_entry" or str(node.get("node_id", "")).endswith(":bottom"):
+            node["y"] = _number(row.get("y_min"))
+        elif node.get("node_type") == "row_top_entry" or str(node.get("node_id", "")).endswith(":top"):
+            node["y"] = _number(row.get("y_max"))
+    for edge in edges:
+        if edge.get("edge_type") == "row_walk":
+            parts = str(edge.get("from_node", "")).split(":")
+            row = rows.get(parts[1] if len(parts) > 1 else "")
+            if row:
+                edge["distance_m"] = max(_number(row.get("y_max")) - _number(row.get("y_min")), 0.0)
 
 
 def relayout_cross_aisle_rows(model: dict[str, Any], row_numbers: set[str]) -> None:
@@ -188,11 +202,15 @@ def apply_cross_aisles_transaction(model: dict[str, Any], draft: list[dict[str, 
     if errors:
         return model, errors
     candidate = copy.deepcopy(model)
+    affected_rows = {_text(aisle.get("row_number")) for aisle in candidate.get("cross_aisles", [])}
     candidate["cross_aisles"] = normalized
     by_row: dict[str, list[dict[str, Any]]] = {}
     for aisle in candidate["cross_aisles"]:
         by_row.setdefault(aisle["row_number"], []).append(aisle)
+    affected_rows.update(by_row)
     for row in candidate.get("rows", []):
+        if _text(row.get("row_number")) not in affected_rows:
+            continue
         aisles = by_row.get(_text(row.get("row_number")), [])
         _layout_collection(candidate, row, aisles, "cells")
         _layout_collection(candidate, row, aisles, "base_cells")
