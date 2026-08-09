@@ -73,7 +73,7 @@ def test_build_draft_prefers_rows_over_old_settings_and_cells():
 
 def test_sync_rows_to_cells_base_cells_and_row_settings():
     model = _model()
-    model["rows"][0].update({"cell_direction": "top_to_bottom", "weight_zone": "heavy", "row_storage_type": "deep_lane", "deep_lane_width": 4, "row_group": "A", "side": "Лево", "comment": "тест"})
+    model["rows"][0].update({"cell_direction": "top_to_bottom", "weight_zone": "heavy", "row_storage_type": "deep_lane", "deep_lane_width": 4, "deep_lane_access_side": "right", "row_group": "A", "side": "Лево", "comment": "тест"})
     sync_row_settings_to_model(model)
     for group in ("cells", "base_cells"):
         row_cells = [cell for cell in model[group] if cell["row_number"] == "152"]
@@ -82,9 +82,28 @@ def test_sync_rows_to_cells_base_cells_and_row_settings():
         assert all(cell["storage_type"] == "deep_lane" for cell in row_cells)
         assert all(cell["capacity_pallets"] == 4 for cell in row_cells)
         assert all(len(cell["physical_slots"]) == 4 for cell in row_cells)
+        assert all(cell["deep_lane_access_side"] == "right" for cell in row_cells)
     setting = next(row for row in model["row_settings"] if row["row_number"] == "152")
     assert setting["cell_direction"] == "top_to_bottom"
     assert setting["weight_zone"] == "heavy"
+    assert setting["deep_lane_access_side"] == "right"
+
+
+def test_access_side_round_trip_and_switch_preserves_slot_ids():
+    model = _model()
+    edited = _edited(model)
+    edited[0].update({"row_storage_type": "deep_lane", "cell_capacity_pallets": 5,
+                      "deep_lane_access_side": "left"})
+    left, messages = apply_row_settings_transaction(model, edited)
+    assert not any(message.startswith("Ошибка:") for message in messages)
+    slot_ids = [slot["slot_index"] for slot in left["cells"][0]["physical_slots"]]
+    reloaded = json.loads(json.dumps(left, ensure_ascii=False))
+    assert build_row_settings_draft(reloaded).iloc[0]["deep_lane_access_side"] == "left"
+    switched = build_row_settings_draft(reloaded).to_dict(orient="records")
+    switched[0]["deep_lane_access_side"] = "right"
+    right, messages = apply_row_settings_transaction(reloaded, switched)
+    assert not any(message.startswith("Ошибка:") for message in messages)
+    assert [slot["slot_index"] for slot in right["cells"][0]["physical_slots"]] == slot_ids
 
 
 @pytest.mark.parametrize("zone", [

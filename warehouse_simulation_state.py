@@ -19,8 +19,9 @@ from warehouse_business_identity import (
     normalize_warehouse,
     validate_box_quantity,
 )
+from warehouse_deep_lane import derive_deep_lane_depths
 
-SIMULATION_STATE_VERSION = 3
+SIMULATION_STATE_VERSION = 4
 POSITION_STATUSES = frozenset({"free", "occupied", "unknown"})
 
 LIMITATIONS = [
@@ -33,7 +34,7 @@ LIMITATIONS = [
     "unknown_location_stock_is_preserved",
     "normal_single_position_occupancy_can_be_exact_from_positive_location_evidence",
     "deep_lane_opening_occupancy_count_is_unknown_without_pallet_evidence",
-    "deep_lane_depth_assignment_is_not_inferred",
+    "deep_lane_depth_requires_explicit_access_side_and_valid_x_geometry",
     "location_role_is_unassigned",
     "production_date_quantity_split_is_not_inferred",
     "no_receipt_events_are_applied",
@@ -48,6 +49,7 @@ _DIAGNOSTIC_NAMES = (
     "invalid_sku_identity unsupported_unit invalid_box_quantity "
     "zero_quantity_opening_placement unknown_location_stock unknown_cell_reference "
     "physical_slot_contract_invalid duplicate_position_id duplicate_stock_lot_id "
+    "deep_lane_access_unconfigured deep_lane_access_invalid "
     "multiple_stock_lots_single_position multiple_sku_deep_lane "
     "occupancy_not_authoritative stock_conservation_failed"
 ).split()
@@ -210,9 +212,16 @@ def rebuild_simulation_state_views(model: Mapping[str, Any], state: Mapping[str,
                 valid = valid and isinstance(index, int) and not isinstance(index, bool) and index >= 1
                 slots.append((index, slot))
             valid = valid and len({index for index, _ in slots}) == len(slots)
+            depths, depth_error = derive_deep_lane_depths(raw_slots, cell.get("deep_lane_access_side"), capacity)
+            if depth_error in {"deep_lane_access_unconfigured", "deep_lane_access_invalid"}:
+                diagnostics[depth_error] += 1
+                warnings.append({"reason": depth_error, "cell_key": key})
+            elif depth_error:
+                valid = False
         else:
             valid = valid and capacity == 1
             slots = [(1, {})]
+            depths = None
         if not valid:
             diagnostics["physical_slot_contract_invalid"] += 1
             configuration_errors.append({"reason": "physical_slot_contract_invalid", "cell_key": key})
@@ -268,7 +277,7 @@ def rebuild_simulation_state_views(model: Mapping[str, Any], state: Mapping[str,
             if position_status == "occupied" and not occupied_ids and not deep:
                 occupied_ids = sorted(lot["stock_lot_id"] for lot in cell_lots)
             positions.append({"position_id": position_id, "cell_key": key, "slot_index": index,
-                "depth_index": index if deep else None, "row_number": cell.get("row_number"),
+                "depth_index": depths.get(index) if deep and depths else None, "row_number": cell.get("row_number"),
                 "cell_number": cell.get("cell_number"), "tier": cell.get("tier") or "1", "status": position_status,
                 "occupied_stock_lot_ids": occupied_ids if position_status == "occupied" else [],
                 "pallet_unit_id": occupant.get("pallet_unit_id") if occupant else None})

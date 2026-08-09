@@ -12,6 +12,7 @@ from time import perf_counter
 from typing import Any
 
 import pandas as pd
+from warehouse_deep_lane import deep_lane_access_contract_id, deep_lane_access_diagnostics
 
 from warehouse_placement_zones import validate_placement_zone
 
@@ -168,6 +169,7 @@ def default_row_config(df: pd.DataFrame) -> pd.DataFrame:
             "row_order": list(range(1, len(rows) + 1)),
             "row_storage_type": ["normal"] * len(rows),
             "deep_lane_width": [1] * len(rows),
+            "deep_lane_access_side": [""] * len(rows),
             "cell_direction": ["bottom_to_top"] * len(rows),
             "row_group": [""] * len(rows),
             "side": [""] * len(rows),
@@ -241,6 +243,7 @@ def _row_order_map(row_config: pd.DataFrame | None) -> dict[str, dict[str, Any]]
             "row_order": row.get("row_order"),
             "row_storage_type": storage_type,
             "deep_lane_width": deep_lane_width,
+            "deep_lane_access_side": _display_value(row.get("deep_lane_access_side")),
             "cell_direction": cell_direction,
             "deep_lane_width_invalid": deep_lane_width_invalid,
             "row_group": _display_value(row.get("row_group")),
@@ -331,6 +334,7 @@ def build_geometry_model(
         meta = row_meta.get(row_number, {})
         storage_type = meta.get("row_storage_type", "normal")
         deep_lane_width = int(meta.get("deep_lane_width", 1))
+        deep_lane_access_side = meta.get("deep_lane_access_side", "") if storage_type == "deep_lane" else ""
         cell_direction = meta.get("cell_direction", "bottom_to_top")
         weight_zone = meta.get("weight_zone", "unassigned")
         initial_weight_zone = meta.get("initial_weight_zone", weight_zone)
@@ -380,6 +384,7 @@ def build_geometry_model(
                 "source": _display_value(cell_row.get("source")) or "excel",
                 "storage_type": storage_type,
                 "deep_lane_width": deep_lane_width,
+                "deep_lane_access_side": deep_lane_access_side,
                 "capacity_pallets": capacity_pallets,
                 "volume_m3": round(volume_m3, 4),
                 "cell_direction": cell_direction,
@@ -402,6 +407,7 @@ def build_geometry_model(
             "row_order": row_order_value,
             "row_storage_type": storage_type,
             "deep_lane_width": deep_lane_width,
+            "deep_lane_access_side": deep_lane_access_side,
             "cell_direction": cell_direction,
             "row_group": meta.get("row_group", ""),
             "side": meta.get("side", ""),
@@ -476,11 +482,14 @@ def build_geometry_model(
         "source_file_hash": source_file_hash,
         "settings": asdict(settings),
         "rows": rows,
+        "deep_lane_access_diagnostics": deep_lane_access_diagnostics(rows),
+        "deep_lane_access_contract_id": deep_lane_access_contract_id(rows),
         "row_settings": [
             {
                 "row_number": row["row_number"],
                 "row_storage_type": row.get("row_storage_type", "normal"),
                 "deep_lane_width": row.get("deep_lane_width", 1),
+                "deep_lane_access_side": row.get("deep_lane_access_side", ""),
                 "cell_direction": row.get("cell_direction", "bottom_to_top"),
                 "weight_zone": row.get("weight_zone", "unassigned"),
                 "initial_weight_zone": row.get("initial_weight_zone", row.get("weight_zone", "unassigned")),

@@ -25,10 +25,34 @@ def normal(key="1|1|1"):
 def deep(key="2|1|1", capacity=5, slots=None):
     row, cell, tier = key.split("|")
     if slots is None:
-        slots = [{"slot_index": index, "capacity_pallets": 1} for index in range(1, capacity + 1)]
+        slots = [{"slot_index": index, "x_min": index - 1.0, "x_max": float(index), "capacity_pallets": 1} for index in range(1, capacity + 1)]
     return {"cell_key": key, "row_number": row, "cell_number": cell, "tier": tier,
             "storage_type": "deep_lane", "row_storage_type": "deep_lane",
             "deep_lane_width": capacity, "capacity_pallets": capacity, "physical_slots": slots}
+
+
+def test_deep_lane_depth_requires_access_contract_and_uses_x_not_slot_identity():
+    legacy = deep(capacity=3)
+    state, diagnostics = build([legacy])
+    assert [position["depth_index"] for position in state["physical_positions"]] == [None, None, None]
+    assert diagnostics["deep_lane_access_unconfigured"] == 1
+
+    configured = copy.deepcopy(legacy)
+    configured["deep_lane_access_side"] = "right"
+    configured["physical_slots"] = [configured["physical_slots"][2], configured["physical_slots"][0], configured["physical_slots"][1]]
+    state, _ = build([configured])
+    assert {p["slot_index"]: p["depth_index"] for p in state["physical_positions"]} == {1: 3, 2: 2, 3: 1}
+
+
+def test_duplicate_x_rejects_depth_instead_of_guessing():
+    cell = deep(capacity=2, slots=[
+        {"slot_index": 8, "x_min": 0.0, "x_max": 1.0},
+        {"slot_index": 4, "x_min": 0.0, "x_max": 1.0},
+    ])
+    cell["deep_lane_access_side"] = "left"
+    state, diagnostics = build([cell])
+    assert state["physical_positions"] == []
+    assert diagnostics["physical_slot_contract_invalid"] == 1
 
 
 def model(cells=None):
@@ -56,7 +80,7 @@ def build(cells=None, placements=None, unknown=None, opening_changes=None):
 
 def test_empty_state_and_ordinary_and_deep_position_registries():
     state, diagnostics = build()
-    assert state["simulation_state_version"] == 3
+    assert state["simulation_state_version"] == 4
     assert state["target_normalized_warehouse"] == "вешки"
     assert state["summary"]["total_boxes"] == 0
     assert [p["position_id"] for p in state["physical_positions"]] == [
