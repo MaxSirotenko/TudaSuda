@@ -354,8 +354,55 @@ def authoritative_analytics_metrics(comparison: Mapping[str, Any]) -> dict[str, 
     return {key: summary.get(key) for key in keys}
 
 
+def render_monthly_placement_comparison(comparison: Mapping[str, Any] | None) -> None:
+    """Render a persisted monthly artifact; this function never runs replay."""
+    st.subheader("FACT vs PROPOSED — июль")
+    if not comparison:
+        st.info("Сохранённое месячное сравнение ещё не сформировано.")
+        return
+    readiness = comparison.get("readiness", "partial")
+    (st.success if readiness == "ready" else st.warning)(f"Готовность: {readiness}")
+    metrics = (("FACT", comparison.get("fact_meters")), ("PROPOSED", comparison.get("proposed_meters")),
+               ("Экономия", comparison.get("saved_meters")), ("Экономия, %", comparison.get("saved_percent")))
+    for column, (label, value) in zip(st.columns(4), metrics):
+        column.metric(label, f"{float(value or 0)/1000:.3f} км" if label != "Экономия, %" else f"{float(value or 0):.2f}%")
+    st.caption(f"Сопоставимо {comparison.get('comparable_orders', 0)} / {comparison.get('full_order_count', 0)} РО · "
+               f"исключено {comparison.get('excluded_orders', 0)} · coverage FACT/PROPOSED "
+               f"{100*float(comparison.get('fact_coverage', 0)):.1f}% / {100*float(comparison.get('proposed_coverage', 0)):.1f}%")
+    daily = comparison.get("daily_results") or []
+    if daily:
+        st.dataframe(pd.DataFrame(daily).rename(columns={"date": "Дата", "ro_count": "РО", "fact_meters": "FACT м",
+            "proposed_meters": "PROPOSED м", "saved_meters": "Δ м", "saved_percent": "Δ %",
+            "strict_coverage": "Coverage", "warnings": "Warnings"}), use_container_width=True, hide_index=True)
+    orders = comparison.get("order_comparisons") or []
+    if orders:
+        labels = [str(x.get("order_identity", {}).get("document_number") or x.get("order_identity", {}).get("document_ref") or i)
+                  for i, x in enumerate(orders)]
+        selected = st.selectbox("РО для детализации FACT / PROPOSED", labels, key="monthly_comparison_ro")
+        order = orders[labels.index(selected)]
+        st.json({"FACT": {"distance": order.get("fact_meters"), "route": order.get("fact_route"),
+                          "pick_stops": order.get("fact_pick_stops")},
+                 "PROPOSED": {"distance": order.get("proposed_meters"), "route": order.get("proposed_route"),
+                              "pick_stops": order.get("proposed_pick_stops")},
+                 "changed_skus": order.get("changed_skus"), "warnings": order.get("warnings")})
+        graph = comparison.get("route_graph") or {}
+        if graph:
+            from warehouse_route_ui import build_route_overlay
+            st.json({"FACT overlay": build_route_overlay({"route_legs": order.get("fact_route"),
+                "pick_events": order.get("fact_pick_stops"), "picker_distance_m": order.get("fact_meters")}, graph, "current"),
+                "PROPOSED overlay": build_route_overlay({"route_legs": order.get("proposed_route"),
+                "pick_events": order.get("proposed_pick_stops"), "picker_distance_m": order.get("proposed_meters")}, graph, "proposed")})
+    if comparison.get("contribution_analysis"):
+        st.markdown("**Измеренный вклад по SKU / зоне / ряду**")
+        st.dataframe(pd.DataFrame(comparison["contribution_analysis"]), use_container_width=True, hide_index=True)
+    if comparison.get("placement_changes"):
+        st.markdown("**Изменённые SKU**")
+        st.dataframe(pd.DataFrame(comparison["placement_changes"]), use_container_width=True, hide_index=True)
+
+
 def render_cached_analytics(session_state: Mapping[str, Any], model: Mapping[str, Any] | None = None) -> None:
     """Render only cached authoritative benchmark output; never recalculate it."""
+    render_monthly_placement_comparison(session_state.get("monthly_placement_comparison"))
     st.subheader("Аналитика CURRENT / PROPOSED")
     comparison = session_state.get("placement_comparison_distance_comparison")
     if not comparison:
