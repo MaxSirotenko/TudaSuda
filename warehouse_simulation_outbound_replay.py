@@ -235,6 +235,34 @@ def _replay_scenario(state: Mapping[str, Any], orders: list[Any], graph: dict[st
     return scenario, diagnostics
 
 
+def replay_factual_orders_on_graph(model: Mapping[str, Any], opening_state: Mapping[str, Any],
+                                   orders: list[dict[str, Any]], graph: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Replay a factual-only adapter on an already-authoritative physical graph.
+
+    This deliberately thin public boundary lets monthly replay reuse stock
+    depletion, shortest paths and the return-to-gate contract without invoking
+    (or constructing) a PROPOSED scenario.
+    """
+    links = graph.get("gate_links", [])
+    diagnostics: dict[str, Any] = {"configuration_errors": []}
+    if len(links) != 1:
+        diagnostics["configuration_errors"].append("exactly_one_mapped_gate_required")
+    if not isinstance(orders, list):
+        diagnostics["configuration_errors"].append("invalid_outbound_demand_orders")
+    if diagnostics["configuration_errors"]:
+        return {}, diagnostics
+    access = {str(item["cell_key"]): str(item["access_node_id"])
+              for item in graph.get("cell_access_links", [])}
+    cells = {str(cell.get("cell_key")): cell for cell in model.get("cells", [])
+             if isinstance(cell, Mapping) and cell.get("cell_key") not in (None, "")}
+    scenario, replay_diagnostics = _replay_scenario(
+        opening_state, orders, graph, str(links[0]["gate_node_id"]), access, cells,
+        {}, {}, set(),
+    )
+    diagnostics.update(replay_diagnostics)
+    return scenario, diagnostics
+
+
 def replay_outbound_on_simulation_states(model: dict[str, Any], current_state: dict[str, Any], proposed_state: dict[str, Any], outbound_demand_state: dict[str, Any], gate_state: dict[str, Any], *, zone_order: list[str] | None = None, placement_rule_set: dict[str, Any] | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
     """Replay CURRENT without rules and PROPOSED with an explicit optional RuleSet."""
     graph, graph_diagnostics = build_physical_warehouse_graph(model, gate_state); links = graph.get("gate_links", [])
