@@ -10,6 +10,16 @@ from warehouse_factual_data import (
     import_excel_dataset, load_dataset_rows, load_registry, positive_outbound,
     normalize_source_datetime,
 )
+import warehouse_factual_data as factual
+
+
+def test_date_summary_is_index_only(monkeypatch):
+    registry = {"datasets": [{"active": True, "source_type": "outbound", "partitions": ["2026-07-15"],
+        "index": {"dates": ["2026-07-15"], "sku_keys": ["sku:1"], "daily": {"2026-07-15": {
+            "rows": 3, "documents": 2, "positive_quantity": 7, "positive_sku_keys": ["sku:1"]}}}}]}
+    monkeypatch.setattr(factual, "load_dataset_rows", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("partition read")))
+    summary = date_summary(registry, "2026-07-15")
+    assert summary["outbound"] == {"documents": 2, "lines": 3, "positive_demand": 7.0}
 
 
 def _xlsx(rows):

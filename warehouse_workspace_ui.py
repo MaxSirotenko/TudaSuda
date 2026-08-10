@@ -23,6 +23,7 @@ from warehouse_factual_data import (
     cross_source_coverage, date_summary, import_excel_dataset, load_effective_placement, load_registry,
     save_historical_cell_mapping,
 )
+from warehouse_perf_diagnostics import ENABLED as PERF_ENABLED, measure, snapshot
 
 WORKSPACE_TABS = ("Склад", "Данные", "Условия модели", "CURRENT / PROPOSED", "Пробег", "Аналитика")
 SUPPORTED_RULES = (
@@ -147,13 +148,21 @@ def render_operational_workspace(model: dict | None, *, warehouse_renderer: Call
     .workflow-step{color:#64748b;padding:.15rem .35rem}.workflow-step.completed{color:#397354}.workflow-step.current{color:#1d4ed8;font-weight:650}.workflow-step.stale{color:#a16207}
     .workflow-context{background:white;border:1px solid #e5e7eb;border-left:3px solid #94a3b8;border-radius:8px;padding:.7rem .9rem;line-height:1.45;margin:.25rem 0 1rem}
     </style>""", unsafe_allow_html=True)
-    render_workflow_stepper(model, st.session_state)
-    tabs = st.tabs(list(WORKSPACE_TABS))
-    for tab, name, renderer in zip(tabs, WORKSPACE_TABS, (warehouse_renderer, data_renderer, rules_renderer,
-                                          comparison_renderer, distance_renderer, analytics_renderer)):
-        with tab:
-            render_context_block(name)
-            renderer(model)
+    with measure("workspace.root"):
+        render_workflow_stepper(model, st.session_state)
+        selected = st.radio("Раздел", WORKSPACE_TABS, horizontal=True, key="workspace_section",
+                            label_visibility="collapsed")
+        renderers = dict(zip(WORKSPACE_TABS, (warehouse_renderer, data_renderer, rules_renderer,
+                                             comparison_renderer, distance_renderer, analytics_renderer)))
+        render_context_block(selected)
+        with measure(f"workspace.section.{selected}"):
+            renderers[selected](model)
+    if PERF_ENABLED:
+        perf = snapshot()
+        with st.expander("Performance diagnostics", expanded=False):
+            st.caption(f"RSS: {perf['rss_mb']} MB · section: {selected} · last render: {perf['last_render_ms']} ms")
+            st.caption(f"Artifact reads: {perf['artifact_reads']} / {perf['artifact_bytes']} bytes · cache: {perf['cache_status']}")
+            st.json(perf["top_slow_blocks"])
 
 
 def render_rules_control_panel(model: Mapping[str, Any] | None, session_state: Mapping[str, Any]) -> None:
@@ -204,35 +213,36 @@ def render_factual_data_layer(model: Mapping[str, Any] | None) -> None:
         key="factual_data_uploads",
     )
     if files and st.button("Импортировать в Data Layer", type="primary", key="factual_data_import"):
-        for uploaded in files:
-            try:
-                result = import_excel_dataset(uploaded.getvalue(), uploaded.name)
-            except (OSError, ValueError) as exc:
-                st.error(f"{uploaded.name}: файл не импортирован ({exc})")
-                continue
-            if result.get("source_type") == "unknown":
-                family = result.get("detected_source_family")
-                if result.get("diagnostic_code") == "outbound_document_identity_missing":
-                    st.error(f"{uploaded.name}: Файл похож на расходные ордера, но не прошёл классификацию.")
-                    st.caption("Найдены поля: " + ", ".join(result.get("diagnostic_found", [])) + ".")
-                    st.caption("Не найдено: " + ", ".join(result.get("diagnostic_missing", [])) + ".")
+        with st.spinner("Импорт и индексация фактических Excel…"):
+            for uploaded in files:
+                try:
+                    result = import_excel_dataset(uploaded.getvalue(), uploaded.name)
+                except (OSError, ValueError) as exc:
+                    st.error(f"{uploaded.name}: файл не импортирован ({exc})")
+                    continue
+                if result.get("source_type") == "unknown":
+                    family = result.get("detected_source_family")
+                    if result.get("diagnostic_code") == "outbound_document_identity_missing":
+                        st.error(f"{uploaded.name}: Файл похож на расходные ордера, но не прошёл классификацию.")
+                        st.caption("Найдены поля: " + ", ".join(result.get("diagnostic_found", [])) + ".")
+                        st.caption("Не найдено: " + ", ".join(result.get("diagnostic_missing", [])) + ".")
+                    else:
+                        st.error(f"{uploaded.name}: требуется сопоставление полей" if family else f"{uploaded.name}: Неизвестный тип файла")
+                        st.caption("Обнаруженные колонки: " + " · ".join(result.get("detected_columns", [])))
+                    if result.get("required_missing"):
+                        st.caption("Не сопоставлены обязательные поля: " + " · ".join(result["required_missing"]))
+                elif result.get("reused"):
+                    if result.get("reuse_state") == "existing_superseded_version":
+                        st.warning(f"{uploaded.name}: Эта версия уже существует, но не активна.")
+                    else:
+                        st.info(f"{uploaded.name}: уже импортирован, использован сохранённый артефакт")
+                elif result.get("reparsed_for_parser_upgrade"):
+                    st.info(
+                        f"{uploaded.name}: файл уже был импортирован старой версией парсера. "
+                        "Данные пересобраны с исправленным форматом дат."
+                    )
                 else:
-                    st.error(f"{uploaded.name}: требуется сопоставление полей" if family else f"{uploaded.name}: Неизвестный тип файла")
-                    st.caption("Обнаруженные колонки: " + " · ".join(result.get("detected_columns", [])))
-                if result.get("required_missing"):
-                    st.caption("Не сопоставлены обязательные поля: " + " · ".join(result["required_missing"]))
-            elif result.get("reused"):
-                if result.get("reuse_state") == "existing_superseded_version":
-                    st.warning(f"{uploaded.name}: Эта версия уже существует, но не активна.")
-                else:
-                    st.info(f"{uploaded.name}: уже импортирован, использован сохранённый артефакт")
-            elif result.get("reparsed_for_parser_upgrade"):
-                st.info(
-                    f"{uploaded.name}: файл уже был импортирован старой версией парсера. "
-                    "Данные пересобраны с исправленным форматом дат."
-                )
-            else:
-                st.success(f"{uploaded.name}: {SOURCE_LABELS[result['source_type']]}")
+                    st.success(f"{uploaded.name}: {SOURCE_LABELS[result['source_type']]}")
     registry = load_registry()
     datasets = registry.get("datasets", [])
     if not datasets:
@@ -266,11 +276,13 @@ def render_factual_data_layer(model: Mapping[str, Any] | None) -> None:
     available_days = sorted({day for item in active for day in item.get("partitions", []) if day != "undated"})
     if available_days:
         selected = st.selectbox("Операционный день", available_days, key="factual_operational_day")
-        summary = date_summary(registry, selected)
+        with measure("factual.date_summary", cache_status="metadata"):
+            summary = date_summary(registry, selected)
         st.subheader(f"Срез на {selected}")
         st.json(summary)
         with st.expander("Покрытие SKU между источниками"):
-            coverage = cross_source_coverage(registry)
+            with measure("factual.cross_source_coverage", cache_status="metadata"):
+                coverage = cross_source_coverage(registry)
             st.dataframe(pd.DataFrame(coverage), use_container_width=True, hide_index=True)
         if model:
             placement = load_effective_placement(selected, model, registry=registry, strict=False)
@@ -291,17 +303,19 @@ def render_factual_data_layer(model: Mapping[str, Any] | None) -> None:
                     if st.button("Сохранить сопоставление", key="save_historical_cell_mapping"):
                         save_historical_cell_mapping(source_cell, target, model, source_evidence={"day": selected})
                         st.success("Сопоставление сохранено как подтверждённое пользователем.")
-            readiness = build_monthly_data_readiness(registry, model, "2026-07-01", "2026-07-31")
             st.subheader("Готовность к месячному replay")
-            c = readiness["coverage"]
-            st.caption(f"Срезы START: {c['placement_checkpoints']} / {c['placement_checkpoints_required']}")
-            st.caption(f"ВГХ: {c['vgh_covered_sku']} / {c['demanded_sku']} востребованных SKU")
-            st.caption(f"Конфликты источников: {c['source_conflicts']}")
-            if readiness["monthly_replay_ready"]:
-                st.success("Готово к месячному replay")
-            else:
-                st.error("Месячный replay заблокирован")
-                st.json(readiness["hard_blockers"])
+            st.caption("Полная проверка читает месячные партиции и запускается только явно.")
+            if st.button("Проверить готовность месяца", key="monthly_readiness_check"):
+                with st.spinner("Проверяем индексы и дневные партиции июля…"), measure("factual.build_monthly_data_readiness"):
+                    readiness = build_monthly_data_readiness(registry, model, "2026-07-01", "2026-07-31")
+                st.session_state["monthly_data_readiness"] = readiness
+            readiness = st.session_state.get("monthly_data_readiness")
+            if readiness:
+                c = readiness["coverage"]
+                st.caption(f"Срезы START: {c['placement_checkpoints']} / {c['placement_checkpoints_required']}")
+                st.caption(f"ВГХ: {c['vgh_covered_sku']} / {c['demanded_sku']} востребованных SKU")
+                (st.success if readiness["monthly_replay_ready"] else st.error)(
+                    "Готово к месячному replay" if readiness["monthly_replay_ready"] else "Месячный replay заблокирован")
 
 
 def render_monthly_fact_baseline(model: Mapping[str, Any] | None, session_state: Mapping[str, Any]) -> None:
@@ -310,7 +324,9 @@ def render_monthly_fact_baseline(model: Mapping[str, Any] | None, session_state:
     if not model:
         st.info("Сначала загрузите схему склада."); return
     registry = load_registry()
-    readiness = build_monthly_data_readiness(registry, model, "2026-07-01", "2026-07-31")
+    readiness = session_state.get("monthly_data_readiness")
+    if readiness is None:
+        st.info("Перед FACT явно проверьте готовность месяца в разделе «Данные»."); return
     if readiness.get("monthly_replay_ready") is not True:
         st.error("Месячный FACT заблокирован"); st.json(readiness.get("hard_blockers", [])); return
     st.success("Фактический Data Layer готов")

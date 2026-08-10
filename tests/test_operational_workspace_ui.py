@@ -3,10 +3,34 @@ from warehouse_workspace_ui import (
     build_warehouse_zone_summary, build_workspace_rule_config, normalize_rule_selection,
     deep_lane_edit_issue,
 )
+import warehouse_workspace_ui as workspace
 
 
 def test_six_business_workspace_tabs_are_fixed():
     assert WORKSPACE_TABS == ("Склад", "Данные", "Условия модели", "CURRENT / PROPOSED", "Пробег", "Аналитика")
+
+
+class _WorkspaceStreamlit:
+    def __init__(self, selected):
+        self.session_state = {"workspace_section": selected}
+
+    def markdown(self, *args, **kwargs): pass
+    def radio(self, _label, _options, **kwargs): return self.session_state["workspace_section"]
+
+
+def test_only_selected_workspace_section_executes(monkeypatch):
+    fake = _WorkspaceStreamlit("Данные")
+    monkeypatch.setattr(workspace, "st", fake)
+    calls = []
+    renderers = {key: (lambda _model, key=key: calls.append(key)) for key in (
+        "warehouse_renderer", "data_renderer", "rules_renderer", "comparison_renderer",
+        "distance_renderer", "analytics_renderer")}
+    workspace.render_operational_workspace(None, **renderers)
+    assert calls == ["data_renderer"]
+    fake.session_state["workspace_section"] = "Аналитика"
+    calls.clear()
+    workspace.render_operational_workspace(None, **renderers)
+    assert calls == ["analytics_renderer"]
 
 
 def test_only_supported_rules_are_active_and_dependency_is_deterministic():

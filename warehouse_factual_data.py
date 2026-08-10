@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+from warehouse_perf_diagnostics import measure, profiled, record_artifact_read
 
 from warehouse_business_identity import build_canonical_sku_identity, find_canonical_identity_collisions
 
@@ -380,15 +381,18 @@ def _write_jsonl(path: Path, rows: Iterable[Mapping[str, Any]]) -> None:
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     if not path.exists(): return []
-    with gzip.open(path, "rt", encoding="utf-8") as stream:
-        return [json.loads(line) for line in stream if line.strip()]
+    record_artifact_read(path.stat().st_size)
+    with measure("factual.artifact_read"):
+        with gzip.open(path, "rt", encoding="utf-8") as stream:
+            return [json.loads(line) for line in stream if line.strip()]
 
 
 def load_registry(root: Path = DATA_ROOT) -> dict[str, Any]:
     path = root / "registry.json"
     if not path.exists(): return {"registry_version": 2, "datasets": [], "diagnostics": []}
     try:
-        state = json.loads(path.read_text(encoding="utf-8"))
+        with measure("factual.load_registry"):
+            state = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {"registry_version": 1, "datasets": [], "warning": "registry_unreadable"}
     if not isinstance(state.get("datasets"), list):
@@ -748,24 +752,27 @@ def positive_outbound(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]
     return [dict(row) for row in rows if isinstance(row.get("quantity"), (int, float)) and row["quantity"] > 0]
 
 
+@profiled("factual.date_summary")
 def date_summary(registry: Mapping[str, Any], day: str) -> dict[str, Any]:
     result = {"operational_day": day, "placement": {"snapshot_exists": False, "rows": 0, "sku": 0, "cells": 0},
               "inventory": {"documents": 0, "rows": 0}, "receipts": {"documents": 0, "rows": 0, "accepted_boxes": None},
               "outbound": {"documents": 0, "lines": 0, "positive_demand": 0}, "vgh": {"relevant_sku": 0, "covered_sku": 0},
               "next_day_placement_available": False}
-    source_rows = defaultdict(list)
+    indexes: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
     for dataset in active_datasets(registry):
-        # Only the selected partition is opened; persisted indexes handle VGH
-        # and next-day existence below.
-        source_rows[dataset["source_type"]].extend(load_dataset_rows(dataset, day))
-    placement = source_rows["historical_placement"]
-    result["placement"] = {"snapshot_exists": bool(placement), "rows": len(placement), "sku": len({r.get("sku_key") for r in placement if r.get("sku_key")}), "cells": len({r.get("cell") for r in placement if r.get("cell")})}
+        daily = dataset.get("index", {}).get("daily", {}).get(day)
+        if daily: indexes[dataset["source_type"]].append(daily)
+    def total(source: str, field: str) -> float:
+        return sum(float(item.get(field) or 0) for item in indexes[source])
+    result["placement"] = {"snapshot_exists": bool(indexes["historical_placement"]),
+        "rows": int(total("historical_placement", "rows")), "sku": int(total("historical_placement", "sku")),
+        "cells": int(total("historical_placement", "cells"))}
     for source, target in (("inventory", "inventory"), ("receipts", "receipts")):
-        rows = source_rows[source]; docs = {(r.get("document_ref") or r.get("inventory_ref"), r.get("document_number") or r.get("inventory_number"), r.get("occurred_at")) for r in rows}
-        result[target].update(documents=len(docs), rows=len(rows))
-    outbound = source_rows["outbound"]; positive = positive_outbound(outbound)
-    result["outbound"] = {"documents": len({(r.get("document_ref"), r.get("document_number"), r.get("occurred_at")) for r in outbound}), "lines": len(outbound), "positive_demand": sum(r["quantity"] for r in positive)}
-    demanded = {r.get("sku_key") for r in positive if r.get("sku_key")}; vgh = set()
+        result[target].update(documents=int(total(source, "documents")), rows=int(total(source, "rows")))
+    demanded = {sku for item in indexes["outbound"] for sku in item.get("positive_sku_keys", [])}
+    result["outbound"] = {"documents": int(total("outbound", "documents")), "lines": int(total("outbound", "rows")),
+                          "positive_demand": total("outbound", "positive_quantity")}
+    vgh = set()
     for dataset in active_datasets(registry):
         if dataset.get("source_type") == "vgh": vgh.update(dataset.get("index", {}).get("sku_keys", []))
         if dataset.get("source_type") == "historical_placement":
@@ -775,6 +782,7 @@ def date_summary(registry: Mapping[str, Any], day: str) -> dict[str, Any]:
     return result
 
 
+@profiled("factual.cross_source_coverage")
 def cross_source_coverage(registry: Mapping[str, Any]) -> list[dict[str, Any]]:
     indexes: dict[str, set[str]] = defaultdict(set)
     for dataset in active_datasets(registry):
@@ -830,6 +838,7 @@ def _source_conflicts(registry: Mapping[str, Any], source_type: str, day: str | 
     return {"duplicates": duplicates, "conflicts": conflicts, "groups": groups}
 
 
+@profiled("factual.load_effective_rows")
 def load_effective_rows(source_type: str, day: str | None = None, *, registry: Mapping[str, Any] | None = None,
                         root: Path = DATA_ROOT, strict: bool = True) -> dict[str, Any]:
     """Authoritative replay boundary: active evidence in, deduplicated factual rows out."""
@@ -924,6 +933,7 @@ def resolve_historical_cell(source_cell: Any, model: Mapping[str, Any], *, root:
             "diagnostic": "historical_cell_unresolved"}
 
 
+@profiled("factual.load_effective_placement")
 def load_effective_placement(day: str, model: Mapping[str, Any], *, registry: Mapping[str, Any] | None = None,
                              root: Path = DATA_ROOT, strict: bool = True) -> dict[str, Any]:
     view = load_effective_rows("historical_placement", day, registry=registry, root=root, strict=strict)
@@ -955,6 +965,7 @@ def build_fact_route_readiness(placement_rows: Iterable[Mapping[str, Any]], dema
         "fact_route_ready": demand_cells <= demand_resolved}
 
 
+@profiled("factual.build_monthly_data_readiness")
 def build_monthly_data_readiness(registry: Mapping[str, Any], model: Mapping[str, Any], period_from: str,
                                  period_to: str, *, root: Path = DATA_ROOT,
                                  usable_cell_keys: Iterable[str] | None = None,
