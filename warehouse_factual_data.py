@@ -13,6 +13,7 @@ import json
 import math
 import os
 import tempfile
+import shutil
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping
 from datetime import date, datetime, timedelta, timezone
@@ -374,7 +375,7 @@ def active_datasets(registry: Mapping[str, Any], source_type: str | None = None)
             if item.get("active", True) and (source_type is None or item.get("source_type") == source_type)]
 
 
-def import_excel_dataset(data: bytes, filename: str, *, sheet: str | None = None, root: Path = DATA_ROOT,
+def _import_excel_dataset_buffered(data: bytes, filename: str, *, sheet: str | None = None, root: Path = DATA_ROOT,
                          geometry_cells: Iterable[str] | None = None, reimport: bool = False,
                          parser_version: str = PARSER_VERSION) -> dict[str, Any]:
     # Hash and consult content provenance before opening the workbook.  With no
@@ -464,6 +465,211 @@ def import_excel_dataset(data: bytes, filename: str, *, sheet: str | None = None
     return {**metadata, "reused": False}
 
 
+BUSINESS_KEYS = {
+    "outbound": ("document_ref", "line_number"),
+    "receipts": ("document_ref", "line_number"),
+    "inventory": ("inventory_ref", "line_number"),
+    "vgh": ("sku_key",),
+}
+MATERIAL_FIELDS = {
+    "outbound": ("occurred_at", "warehouse", "sku_key", "quantity", "source_pick_order"),
+    "receipts": ("occurred_at", "warehouse", "sku_key", "box_quantity", "reported_pallets",
+                 "terminal_completed", "expected_receipt"),
+    "inventory": ("occurred_at", "warehouse", "sku_key", "actual_quantity", "accounting_quantity"),
+    "vgh": ("boxes_per_layer", "layers_per_pallet", "quantity_per_box", "source_boxes_per_pallet"),
+}
+
+
+def _fingerprint(values: Any) -> str:
+    encoded = json.dumps(values, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _business_evidence(row: Mapping[str, Any], source_type: str) -> dict[str, Any] | None:
+    fields = BUSINESS_KEYS.get(source_type)
+    if not fields:
+        return None
+    key_values = [row.get(field) for field in fields]
+    if any(value in (None, "") for value in key_values):
+        return None
+    payload = {field: row.get(field) for field in MATERIAL_FIELDS[source_type]}
+    return {"business_key": json.dumps(key_values, ensure_ascii=False, separators=(",", ":"), default=str),
+            "payload_fingerprint": _fingerprint(payload), "payload": payload,
+            "day": _day(row), "dataset_id": row.get("dataset_id"),
+            "source_file_name": row.get("source_file_name"), "source_row": row.get("source_row")}
+
+
+def _stream_xlsx_dataset(data: bytes, filename: str, *, sheet: str | None, root: Path,
+                         geometry_cells: Iterable[str] | None, parser_version: str,
+                         fail_after_rows: int | None = None) -> dict[str, Any]:
+    """Import XLSX with one canonical and one RAW record resident at a time.
+
+    Memory is bounded by the uploaded XLSX bytes, openpyxl's read-only parser,
+    exact SHA-256 row fingerprints, SKU/business-key indexes, and per-day
+    aggregate sets.  It never creates a pandas table or complete row lists.
+    """
+    from openpyxl import load_workbook
+
+    digest = content_hash(data)
+    root.mkdir(parents=True, exist_ok=True)
+    registry = load_registry(root)
+    content_match = next((item for item in registry["datasets"]
+        if item.get("content_hash") == digest and item.get("parser_version") == parser_version
+        and (sheet is None or item.get("sheet") == sheet)), None)
+    if content_match:
+        state = "existing_active_version" if content_match.get("active", True) else "existing_superseded_version"
+        return {**content_match, "reused": True, "reuse_state": state, "status": state,
+                "duplicate_filename": filename if filename != content_match.get("source_file_name") else None}
+
+    workbook = load_workbook(BytesIO(data), read_only=True, data_only=True)
+    try:
+        selected = sheet or workbook.sheetnames[0]
+        if selected not in workbook.sheetnames:
+            raise ValueError("sheet_not_found")
+        worksheet = workbook[selected]
+        iterator = worksheet.iter_rows(values_only=True)
+        headers = [str(value).strip() if value is not None else "" for value in next(iterator, ())]
+        detection = detect_source_type(headers)
+        if detection["source_type"] == UNKNOWN_SOURCE or detection["status"] != "detected":
+            return {"status": detection["status"], "source_type": UNKNOWN_SOURCE,
+                    "source_label": SOURCE_LABELS[UNKNOWN_SOURCE],
+                    "detected_source_family": detection["source_type"] if detection["source_type"] != UNKNOWN_SOURCE else None,
+                    "required_missing": detection["required_missing"], "detected_columns": headers,
+                    "matches": detection["matches"], "errors": [detection["status"]]}
+        source_type = detection["source_type"]
+        dataset_id = dataset_identity(digest, source_type, selected, parser_version)
+        imported_at = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+        logical_source_id = logical_source_identity(source_type, filename, selected)
+        staging = Path(tempfile.mkdtemp(dir=root, prefix=".staging-"))
+        writers: dict[str, Any] = {}
+        raw_writer = index_writer = None
+        row_count = missing_sku = duplicate_raw = zero = negative = missing_qty = 0
+        raw_hashes: set[str] = set(); sku_keys: set[str] = set(); days: set[str] = set()
+        daily: dict[str, dict[str, Any]] = defaultdict(lambda: {"rows": 0, "sku_keys": set(), "cells": set(),
+            "documents": set(), "positive_quantity": 0, "positive_sku_keys": set()})
+        placement_sku_cells: dict[tuple[Any, Any], set[str]] = defaultdict(set)
+        placement_cell_sku: dict[tuple[Any, Any], set[str]] = defaultdict(set)
+        placement_pallet_sku: dict[tuple[Any, Any], set[str]] = defaultdict(set)
+        placement_pallet_cells: dict[str, set[str]] = defaultdict(set)
+        cell_orders: dict[str, set[Any]] = defaultdict(set)
+        business_key_count = 0
+        try:
+            raw_writer = gzip.open(staging / "raw.jsonl.gz", "wt", encoding="utf-8")
+            index_writer = gzip.open(staging / "business_index.jsonl.gz", "wt", encoding="utf-8")
+            for source_row, values in enumerate(iterator, 2):
+                if not any(value is not None for value in values):
+                    continue
+                if fail_after_rows is not None and row_count >= fail_after_rows:
+                    raise RuntimeError("injected_streaming_import_failure")
+                raw_values = {header: _json_value(value) for header, value in zip(headers, values) if header}
+                provenance = {"dataset_id": dataset_id, "source_file_name": filename, "content_hash": digest,
+                    "source_type": source_type, "parser_version": parser_version, "sheet": selected,
+                    "source_row": source_row, "source_index": source_row - 2, "imported_at": imported_at}
+                raw_record = {**provenance, "raw": raw_values}
+                raw_json = json.dumps(raw_values, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                raw_fp = hashlib.sha256(raw_json.encode()).hexdigest()
+                duplicate_raw += raw_fp in raw_hashes; raw_hashes.add(raw_fp)
+                raw_writer.write(json.dumps(raw_record, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
+                record = _canonical_record(raw_values, detection["mapping"], provenance)
+                day = _day(record) or "undated"; days.add(day)
+                if day not in writers:
+                    target = staging / "canonical" / f"date={day}.jsonl.gz"; target.parent.mkdir(parents=True, exist_ok=True)
+                    writers[day] = gzip.open(target, "wt", encoding="utf-8")
+                writers[day].write(json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
+                sku = record.get("sku_key"); missing_sku += not bool(sku)
+                if sku: sku_keys.add(sku); daily[day]["sku_keys"].add(sku)
+                daily[day]["rows"] += 1
+                if record.get("cell") not in (None, ""): daily[day]["cells"].add(str(record["cell"]))
+                doc = (record.get("document_ref") or record.get("inventory_ref"),
+                       record.get("document_number") or record.get("inventory_number"), record.get("occurred_at"))
+                if any(doc): daily[day]["documents"].add(json.dumps(doc, ensure_ascii=False, default=str))
+                qty_field = {"receipts": "box_quantity", "outbound": "quantity", "inventory": "actual_quantity"}.get(source_type)
+                if qty_field:
+                    qty = record.get(qty_field); zero += qty == 0; negative += isinstance(qty, (int, float)) and qty < 0; missing_qty += qty is None
+                    if qty_field == "quantity" and isinstance(qty, (int, float)) and qty > 0:
+                        daily[day]["positive_quantity"] += qty
+                        if sku: daily[day]["positive_sku_keys"].add(sku)
+                evidence = _business_evidence(record, source_type)
+                if evidence:
+                    index_writer.write(json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
+                    business_key_count += 1
+                if source_type == "historical_placement":
+                    snap, cell, pallet = record.get("snapshot_at"), str(record.get("cell") or ""), str(record.get("source_pallet_ref") or "")
+                    if sku and cell: placement_sku_cells[(snap, sku)].add(cell); placement_cell_sku[(snap, cell)].add(sku)
+                    if pallet and sku: placement_pallet_sku[(snap, pallet)].add(sku)
+                    if pallet and cell: placement_pallet_cells[pallet].add(cell)
+                    if cell and record.get("cell_picking_order") is not None: cell_orders[cell].add(record["cell_picking_order"])
+                row_count += 1
+        except Exception:
+            for stream in (raw_writer, index_writer, *writers.values()):
+                if stream: stream.close()
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+        finally:
+            for stream in (raw_writer, index_writer, *writers.values()):
+                if stream and not stream.closed: stream.close()
+    finally:
+        workbook.close()
+
+    real_days = sorted(day for day in days if day != "undated")
+    warnings = [name for value, name in ((missing_sku, "missing_sku"), (duplicate_raw, "duplicate_raw_rows"),
+        (negative, "negative_quantities"), (missing_qty, "missing_quantities")) if value]
+    diagnostics: dict[str, Any] = {"rows": row_count, "unique_sku": len(sku_keys), "missing_sku": missing_sku,
+        "duplicate_raw_rows": duplicate_raw, "period_from": real_days[0] if real_days else None,
+        "period_to": real_days[-1] if real_days else None, "snapshot_count": len(real_days) if source_type == "historical_placement" else None,
+        "zero_quantities": zero, "negative_quantities": negative, "missing_quantities": missing_qty,
+        "identity_collisions": [], "warnings": warnings, "errors": [], "streaming_import": True,
+        "memory_bound": "xlsx bytes + openpyxl read-only window + exact row hashes + compact unique-key indexes"}
+    if source_type == "historical_placement":
+        diagnostics.update(unique_cells=len({cell for _, cell in placement_cell_sku}),
+            sku_in_multiple_cells=sum(len(x) > 1 for x in placement_sku_cells.values()),
+            multiple_sku_per_cell=sum(len(x) > 1 for x in placement_cell_sku.values()),
+            multiple_sku_per_pallet=sum(len(x) > 1 for x in placement_pallet_sku.values()),
+            pallet_in_multiple_cells=sum(len(x) > 1 for x in placement_pallet_cells.values()), unknown_geometry_cells=None,
+            historical_cell_resolution="historical_cell_not_resolved_to_geometry",
+            cell_picking_order_conflicts=sum(len(x) > 1 for x in cell_orders.values()),
+            cell_picking_order_evidence=[{"cell": c, "picking_orders": sorted(v), "conflict": len(v) > 1} for c, v in sorted(cell_orders.items())])
+        diagnostics["warnings"].append("historical_cell_not_resolved_to_geometry")
+    index_daily = {day: {"rows": values["rows"], "sku": len(values["sku_keys"]), "cells": len(values["cells"]),
+        "documents": len(values["documents"]), "positive_quantity": values["positive_quantity"],
+        "positive_sku_keys": sorted(values["positive_sku_keys"])} for day, values in daily.items()}
+    index = {"sku_keys": sorted(sku_keys), "dates": sorted(days), "daily": index_daily,
+             "business_key_count": business_key_count, "business_index_artifact": "business_index.jsonl.gz"}
+    artifact = root / dataset_id.removeprefix("dataset:")
+    previous = [item for item in registry["datasets"] if item.get("active", True) and item.get("logical_source_id") == logical_source_id]
+    metadata = {"dataset_id": dataset_id, "source_file_name": filename, "content_hash": digest,
+        "source_type": source_type, "source_label": SOURCE_LABELS[source_type], "parser_version": parser_version,
+        "sheet": selected, "rows": row_count, "period_from": diagnostics["period_from"], "period_to": diagnostics["period_to"],
+        "unique_sku": len(sku_keys), "imported_at": imported_at, "status": "ready_with_warnings" if diagnostics["warnings"] else "ready",
+        "errors": [], "warnings": diagnostics["warnings"], "detected_columns": headers, "mapping": detection["mapping"],
+        "mapping_status": "ready", "artifact": str(artifact), "partitions": sorted(days), "index": index,
+        "diagnostics": diagnostics, "logical_source_id": logical_source_id, "version": digest, "active": True,
+        "superseded_by": None, "supersedes": previous[-1]["dataset_id"] if previous else None}
+    _atomic_json(staging / "metadata.json", metadata)
+    if artifact.exists(): shutil.rmtree(staging)
+    else: os.replace(staging, artifact)
+    for item in previous: item["active"] = False; item["superseded_by"] = dataset_id
+    registry["datasets"] = [item for item in registry["datasets"] if item.get("dataset_id") != dataset_id] + [metadata]
+    registry["datasets"].sort(key=lambda item: (item.get("imported_at", ""), item["dataset_id"]))
+    registry["registry_version"] = 3
+    _atomic_json(root / "registry.json", registry)
+    return {**metadata, "reused": False}
+
+
+def import_excel_dataset(data: bytes, filename: str, *, sheet: str | None = None, root: Path = DATA_ROOT,
+                         geometry_cells: Iterable[str] | None = None, reimport: bool = False,
+                         parser_version: str = PARSER_VERSION, _fail_after_rows: int | None = None) -> dict[str, Any]:
+    """Hash first, then use bounded-memory XLSX import; retain legacy XLS compatibility."""
+    if Path(filename).suffix.casefold() == ".xlsx" and not reimport:
+        return _stream_xlsx_dataset(data, filename, sheet=sheet, root=root, geometry_cells=geometry_cells,
+                                    parser_version=parser_version, fail_after_rows=_fail_after_rows)
+    result = _import_excel_dataset_buffered(data, filename, sheet=sheet, root=root, geometry_cells=geometry_cells,
+                                            reimport=reimport, parser_version=parser_version)
+    if Path(filename).suffix.casefold() == ".xls" and len(data) > 20_000_000:
+        result.setdefault("warnings", []).append("large_xls_uses_buffered_import")
+    return result
+
+
 def load_dataset_rows(dataset: Mapping[str, Any], day: str | None = None, *, raw: bool = False) -> list[dict[str, Any]]:
     artifact = Path(str(dataset["artifact"]))
     if raw: return _read_jsonl(artifact / "raw.jsonl.gz")
@@ -511,3 +717,233 @@ def cross_source_coverage(registry: Mapping[str, Any]) -> list[dict[str, Any]]:
     scope = indexes["outbound"] | indexes["historical_placement"]
     return [{"sku_key": sku, "outbound": sku in indexes["outbound"], "placement": sku in indexes["historical_placement"],
              "vgh": sku in indexes["vgh"], "inventory": sku in indexes["inventory"], "receipts": sku in indexes["receipts"]} for sku in sorted(scope)]
+
+
+def activate_dataset_version(dataset_id: str, *, root: Path = DATA_ROOT) -> dict[str, Any]:
+    """Explicitly activate an immutable version without reparsing its workbook."""
+    registry = load_registry(root)
+    selected = next((item for item in registry["datasets"] if item.get("dataset_id") == dataset_id), None)
+    if selected is None:
+        raise KeyError("dataset_not_found")
+    logical = selected.get("logical_source_id")
+    current = [item for item in registry["datasets"] if item.get("active", True)
+               and item.get("logical_source_id") == logical and item is not selected]
+    predecessor = current[-1] if current else None
+    for item in current:
+        item["active"] = False
+        item["superseded_by"] = dataset_id
+    selected["active"] = True
+    selected["superseded_by"] = None
+    selected["supersedes"] = predecessor.get("dataset_id") if predecessor else selected.get("supersedes")
+    registry["diagnostics"] = [d for d in registry.get("diagnostics", [])
+        if not (d.get("code") == "registry_activation_review_required" and d.get("logical_source_id") == logical)]
+    registry["readiness_invalidated_at"] = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+    _atomic_json(root / "registry.json", registry)
+    return dict(selected)
+
+
+def _source_conflicts(registry: Mapping[str, Any], source_type: str, day: str | None = None) -> dict[str, Any]:
+    groups: dict[str, dict[str, list[dict[str, Any]]]] = defaultdict(lambda: defaultdict(list))
+    for dataset in active_datasets(registry, source_type):
+        path = Path(str(dataset["artifact"])) / "business_index.jsonl.gz"
+        if path.exists():
+            evidence_rows = _read_jsonl(path)
+        else:
+            evidence_rows = [e for row in load_dataset_rows(dataset, day) if (e := _business_evidence(row, source_type))]
+        for evidence in evidence_rows:
+            if day is None or evidence.get("day") == day or source_type == "vgh":
+                groups[evidence["business_key"]][evidence["payload_fingerprint"]].append(evidence)
+    duplicates, conflicts = [], []
+    for key, payloads in sorted(groups.items()):
+        occurrences = [item for values in payloads.values() for item in values]
+        if len(payloads) > 1:
+            conflicts.append({"code": "conflicting_factual_business_key", "source_type": source_type,
+                "business_key": json.loads(key), "occurrences": occurrences})
+        elif len(occurrences) > 1:
+            duplicates.append({"code": "duplicate_factual_evidence_collapsed", "source_type": source_type,
+                "business_key": json.loads(key), "occurrences": occurrences})
+    return {"duplicates": duplicates, "conflicts": conflicts, "groups": groups}
+
+
+def load_effective_rows(source_type: str, day: str | None = None, *, registry: Mapping[str, Any] | None = None,
+                        root: Path = DATA_ROOT, strict: bool = True) -> dict[str, Any]:
+    """Authoritative replay boundary: active evidence in, deduplicated factual rows out."""
+    registry = registry or load_registry(root)
+    if source_type == "historical_placement":
+        candidates = [dataset for dataset in active_datasets(registry, source_type)
+                      if day is None or day in dataset.get("index", {}).get("dates", dataset.get("partitions", []))]
+        if day is not None and len(candidates) > 1:
+            conflict = {"code": "multiple_active_placement_sources_for_snapshot", "day": day,
+                        "dataset_ids": [item["dataset_id"] for item in candidates]}
+            if strict: raise ValueError("multiple_active_placement_sources_for_snapshot")
+            return {"rows": [], "duplicates": [], "conflicts": [conflict], "authoritative": False}
+        rows = [row for dataset in candidates for row in load_dataset_rows(dataset, day)]
+        return {"rows": rows, "duplicates": [], "conflicts": [], "authoritative": len(candidates) <= 1}
+    analysis = _source_conflicts(registry, source_type, day)
+    if analysis["conflicts"] and strict:
+        raise ValueError("conflicting_factual_business_key")
+    representatives: dict[str, dict[str, Any]] = {}
+    for dataset in sorted(active_datasets(registry, source_type), key=lambda x: x["dataset_id"]):
+        for row in load_dataset_rows(dataset, day):
+            evidence = _business_evidence(row, source_type)
+            if evidence is None:
+                representatives[f"unkeyed:{dataset['dataset_id']}:{row.get('source_row')}"] = dict(row)
+                continue
+            key = evidence["business_key"]
+            if key in representatives: continue
+            occurrences = [x for values in analysis["groups"].get(key, {}).values() for x in values]
+            enriched = dict(row)
+            enriched["duplicate_source_count"] = len(occurrences)
+            enriched["duplicate_source_ids"] = sorted({str(x.get("dataset_id")) for x in occurrences})
+            enriched["duplicate_source_filenames"] = sorted({str(x.get("source_file_name")) for x in occurrences})
+            enriched["duplicate_row_evidence"] = [{"dataset_id": x.get("dataset_id"), "source_file_name": x.get("source_file_name"),
+                                                     "source_row": x.get("source_row")} for x in occurrences]
+            representatives[key] = enriched
+    return {"rows": list(representatives.values()), "duplicates": analysis["duplicates"],
+            "conflicts": analysis["conflicts"], "authoritative": not analysis["conflicts"]}
+
+
+def geometry_model_signature(model: Mapping[str, Any]) -> str:
+    cells = sorted(str(cell.get("cell_key") or "") for cell in model.get("cells", []) if isinstance(cell, Mapping))
+    return _fingerprint({"model_id": model.get("model_id"), "cells": cells})
+
+
+def load_cell_mappings(root: Path = DATA_ROOT) -> dict[str, Any]:
+    path = root / "historical_cell_mappings.json"
+    if not path.exists(): return {"version": 1, "mappings": []}
+    try: return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError): return {"version": 1, "mappings": [], "warning": "mapping_registry_unreadable"}
+
+
+def save_historical_cell_mapping(source_cell: Any, geometry_cell_key: str, model: Mapping[str, Any], *,
+                                 root: Path = DATA_ROOT, source_evidence: Any = None) -> dict[str, Any]:
+    """Persist only an explicit user choice, scoped to exact geometry identity."""
+    source = str(source_cell).replace("\u00a0", " ").strip()
+    targets = [cell for cell in model.get("cells", []) if str(cell.get("cell_key") or "") == str(geometry_cell_key)]
+    if len(targets) != 1: raise ValueError("unknown_or_ambiguous_geometry_target")
+    state = load_cell_mappings(root); signature = geometry_model_signature(model)
+    record = {"model_id": model.get("model_id"), "model_signature": signature, "source_cell": source,
+        "geometry_cell_key": geometry_cell_key, "mapping_method": "user_confirmed",
+        "created_at": datetime.now(timezone.utc).isoformat(timespec="microseconds"),
+        "source_evidence": source_evidence, "validation_status": "valid"}
+    state["mappings"] = [item for item in state["mappings"]
+        if not (item.get("model_signature") == signature and item.get("source_cell") == source)] + [record]
+    _atomic_json(root / "historical_cell_mappings.json", state)
+    return record
+
+
+def resolve_historical_cell(source_cell: Any, model: Mapping[str, Any], *, root: Path = DATA_ROOT,
+                            mappings: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Resolve through proven source_cell identity or explicit confirmation; never guess."""
+    source = str(source_cell).replace("\u00a0", " ").strip()
+    signature = geometry_model_signature(model)
+    cells = [cell for cell in model.get("cells", []) if isinstance(cell, Mapping)]
+    valid_keys = {str(cell.get("cell_key")) for cell in cells if cell.get("cell_key") not in (None, "")}
+    state = mappings or load_cell_mappings(root)
+    persisted = next((item for item in state.get("mappings", []) if item.get("source_cell") == source
+                      and item.get("model_signature") == signature), None)
+    if persisted:
+        target = str(persisted.get("geometry_cell_key") or "")
+        if target in valid_keys: return {**persisted, "resolution_status": "resolved"}
+        return {**persisted, "geometry_cell_key": None, "resolution_status": "stale", "diagnostic": "historical_cell_unresolved"}
+    # source_cell is the only model field accepted as shared authoritative identity.
+    exact = [str(cell.get("cell_key")) for cell in cells
+             if str(cell.get("source_cell") or "").replace("\u00a0", " ").strip() == source]
+    if len(exact) == 1:
+        return {"source_cell": source, "geometry_cell_key": exact[0], "mapping_method": "exact_authoritative",
+                "model_signature": signature, "resolution_status": "resolved"}
+    if len(exact) > 1:
+        return {"source_cell": source, "geometry_cell_key": None, "candidates": sorted(exact),
+                "resolution_status": "ambiguous", "diagnostic": "historical_cell_ambiguous"}
+    return {"source_cell": source, "geometry_cell_key": None, "resolution_status": "unresolved",
+            "diagnostic": "historical_cell_unresolved"}
+
+
+def load_effective_placement(day: str, model: Mapping[str, Any], *, registry: Mapping[str, Any] | None = None,
+                             root: Path = DATA_ROOT, strict: bool = True) -> dict[str, Any]:
+    view = load_effective_rows("historical_placement", day, registry=registry, root=root, strict=strict)
+    resolved = []
+    for row in view["rows"]:
+        resolution = resolve_historical_cell(row.get("cell"), model, root=root)
+        resolved.append({**row, "source_cell": row.get("cell"), "resolved_geometry_cell_key": resolution.get("geometry_cell_key"),
+                         "cell_resolution_status": resolution["resolution_status"], "cell_resolution": resolution})
+    return {**view, "rows": resolved}
+
+
+def build_fact_route_readiness(placement_rows: Iterable[Mapping[str, Any]], demanded_sku_keys: Iterable[str],
+                               usable_cell_keys: Iterable[str]) -> dict[str, Any]:
+    rows = list(placement_rows); demanded = set(demanded_sku_keys); usable = set(usable_cell_keys)
+    cells = {str(r.get("source_cell") or r.get("cell")) for r in rows if r.get("source_cell") or r.get("cell")}
+    demand_rows = [r for r in rows if r.get("sku_key") in demanded]
+    demand_cells = {str(r.get("source_cell") or r.get("cell")) for r in demand_rows}
+    resolved = {str(r.get("source_cell") or r.get("cell")) for r in rows if r.get("resolved_geometry_cell_key")}
+    demand_resolved = {str(r.get("source_cell") or r.get("cell")) for r in demand_rows
+                       if r.get("resolved_geometry_cell_key") in usable}
+    ambiguous = {str(r.get("source_cell") or r.get("cell")) for r in rows if r.get("cell_resolution_status") == "ambiguous"}
+    return {"placement_rows": len(rows), "unique_factual_cells": len(cells), "resolved_cells": len(resolved),
+        "unresolved_cells": len(cells - resolved), "ambiguous_cells": len(ambiguous),
+        "overall_cell_coverage": {"resolved": len(resolved), "total": len(cells)},
+        "demand_relevant_cell_coverage": {"resolved": len(demand_resolved), "total": len(demand_cells)},
+        "resolved_row_sku_coverage": {"resolved": sum(bool(r.get("resolved_geometry_cell_key")) for r in rows), "total": len(rows)},
+        "cells_without_usable_access_node": sorted({str(r.get("resolved_geometry_cell_key")) for r in demand_rows
+            if r.get("resolved_geometry_cell_key") and r.get("resolved_geometry_cell_key") not in usable}),
+        "fact_route_ready": demand_cells <= demand_resolved}
+
+
+def build_monthly_data_readiness(registry: Mapping[str, Any], model: Mapping[str, Any], period_from: str,
+                                 period_to: str, *, root: Path = DATA_ROOT,
+                                 usable_cell_keys: Iterable[str] | None = None,
+                                 receipts_required: bool = True) -> dict[str, Any]:
+    """Pure, deterministic factual authority contract; it performs no simulation."""
+    start, end = date.fromisoformat(period_from), date.fromisoformat(period_to)
+    required_days = [(start + timedelta(days=i)).isoformat() for i in range((end - start).days + 2)]
+    blockers: list[dict[str, Any]] = []; warnings: list[dict[str, Any]] = []
+    registry_blockers = [d for d in registry.get("diagnostics", []) if d.get("code") == "registry_activation_review_required"]
+    if registry_blockers: blockers.append({"code": "registry_activation_review_required", "message": "Требуется подтвердить активную версию источника."})
+    placement_sources = {day: [d for d in active_datasets(registry, "historical_placement")
+        if day in d.get("index", {}).get("dates", d.get("partitions", []))] for day in required_days}
+    missing = [day for day, sources in placement_sources.items() if not sources]
+    overlaps = [day for day, sources in placement_sources.items() if len(sources) > 1]
+    if missing: blockers.append({"code": "missing_placement_snapshot", "dates": missing})
+    if overlaps: blockers.append({"code": "multiple_active_placement_sources_for_snapshot", "dates": overlaps})
+    analyses = {source: _source_conflicts(registry, source) for source in ("outbound", "receipts", "inventory", "vgh")}
+    for source, analysis in analyses.items():
+        if analysis["conflicts"]: blockers.append({"code": "conflicting_factual_business_key", "source_type": source,
+                                                   "count": len(analysis["conflicts"]), "preview": analysis["conflicts"][:10]})
+    outbound_rows = []
+    for day in required_days[:-1]:
+        view = load_effective_rows("outbound", day, registry=registry, root=root, strict=False)
+        outbound_rows.extend(positive_outbound(view["rows"]))
+    demanded = {row.get("sku_key") for row in outbound_rows if row.get("sku_key")}
+    vgh_keys = {sku for dataset in active_datasets(registry, "vgh") for sku in dataset.get("index", {}).get("sku_keys", [])}
+    missing_vgh = sorted(demanded - vgh_keys)
+    if missing_vgh: blockers.append({"code": "missing_vgh_for_demanded_sku", "count": len(missing_vgh), "preview": missing_vgh[:10]})
+    if not outbound_rows: blockers.append({"code": "outbound_not_available"})
+    receipt_dates = {day for dataset in active_datasets(registry, "receipts") for day in dataset.get("index", {}).get("dates", [])}
+    if receipts_required and not (set(required_days[:-1]) & receipt_dates): blockers.append({"code": "receipts_not_available"})
+    route_checks = []
+    usable = set(usable_cell_keys or [str(c.get("cell_key")) for c in model.get("cells", []) if c.get("cell_key")])
+    if not overlaps:
+        for day in required_days[:-1]:
+            placement = load_effective_placement(day, model, registry=registry, root=root, strict=False)
+            day_demand = {r.get("sku_key") for r in outbound_rows if _day(r) == day}
+            route_checks.append(build_fact_route_readiness(placement["rows"], day_demand, usable))
+    unresolved_demand = sum(x["demand_relevant_cell_coverage"]["total"] - x["demand_relevant_cell_coverage"]["resolved"] for x in route_checks)
+    if unresolved_demand: blockers.append({"code": "historical_cell_unresolved", "demand_relevant_cells": unresolved_demand})
+    active_signature = _fingerprint(sorted(d["dataset_id"] for d in active_datasets(registry)))
+    mapping_signature = _fingerprint(load_cell_mappings(root))
+    source_conflict_count = sum(len(x["conflicts"]) for x in analyses.values()) + len(overlaps)
+    placement_ready = not missing and not overlaps
+    outbound_ready = bool(outbound_rows) and not analyses["outbound"]["conflicts"]
+    receipts_ready = (not receipts_required or bool(set(required_days[:-1]) & receipt_dates)) and not analyses["receipts"]["conflicts"]
+    vgh_ready = not missing_vgh and not analyses["vgh"]["conflicts"]
+    cell_ready = not unresolved_demand and bool(route_checks)
+    registry_ready = not registry_blockers
+    return {"monthly_replay_ready": not blockers, "period_from": period_from, "period_to": period_to,
+        "control_endpoint": required_days[-1], "placement_ready": placement_ready, "outbound_ready": outbound_ready,
+        "receipts_ready": receipts_ready, "vgh_ready": vgh_ready, "cell_resolution_ready": cell_ready,
+        "registry_ready": registry_ready, "hard_blockers": blockers, "warnings": warnings,
+        "coverage": {"placement_checkpoints": len(required_days) - len(missing), "placement_checkpoints_required": len(required_days),
+                     "demanded_sku": len(demanded), "vgh_covered_sku": len(demanded & vgh_keys),
+                     "demand_relevant_unresolved_cells": unresolved_demand, "source_conflicts": source_conflict_count},
+        "active_dataset_signature": active_signature, "cell_mapping_signature": mapping_signature}
