@@ -160,7 +160,8 @@ def render_operational_workspace(model: dict | None, *, warehouse_renderer: Call
     if PERF_ENABLED:
         perf = snapshot()
         with st.expander("Performance diagnostics", expanded=False):
-            st.caption(f"RSS: {perf['rss_mb']} MB · section: {selected} · last render: {perf['last_render_ms']} ms")
+            rss = f"{perf['rss_mb']} MB" if perf["rss_mb"] is not None else "недоступно"
+            st.caption(f"RSS: {rss} · section: {selected} · last render: {perf['last_render_ms']} ms")
             st.caption(f"Artifact reads: {perf['artifact_reads']} / {perf['artifact_bytes']} bytes · cache: {perf['cache_status']}")
             st.json(perf["top_slow_blocks"])
 
