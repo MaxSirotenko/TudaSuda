@@ -18,6 +18,7 @@ from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping
 from datetime import date, datetime, timedelta, timezone
 from io import BytesIO
+from numbers import Real
 from pathlib import Path
 from typing import Any
 
@@ -26,7 +27,7 @@ from warehouse_perf_diagnostics import measure, profiled, record_artifact_read
 
 from warehouse_business_identity import build_canonical_sku_identity, find_canonical_identity_collisions
 
-PARSER_VERSION = "factual-july-v3"
+PARSER_VERSION = "factual-july-v4"
 DATA_ROOT = Path("data/last_import/factual")
 REGISTRY_PATH = DATA_ROOT / "registry.json"
 UNKNOWN_SOURCE = "unknown"
@@ -171,6 +172,43 @@ def normalize_source_datetime(value: Any) -> str | None:
     return None
 
 
+def normalize_operational_day(value: Any) -> str | None:
+    """Normalize an Excel placement snapshot value to one calendar day.
+
+    Historical exports can mix genuinely typed Excel dates, unformatted Excel
+    serial numbers and text in the same column.  The operational day is the
+    calendar date written by the source; it must not be shifted by a timezone
+    conversion and must never retain a time component.
+    """
+    if value is None or value is pd.NaT or isinstance(value, bool):
+        return None
+    if isinstance(value, (pd.Timestamp, datetime, date)):
+        if pd.isna(value):
+            return None
+        return value.date().isoformat() if isinstance(value, (pd.Timestamp, datetime)) else value.isoformat()
+    if isinstance(value, Real):
+        if not math.isfinite(float(value)) or not 1 <= float(value) < 2_958_466:
+            return None
+        # Excel's default 1900 date system includes its historical leap-year
+        # compatibility offset; 1899-12-30 is the established serial epoch.
+        return (datetime(1899, 12, 30) + timedelta(days=float(value))).date().isoformat()
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    for source_format in _SOURCE_DATETIME_FORMATS:
+        try:
+            return datetime.strptime(text, source_format).date().isoformat()
+        except ValueError:
+            continue
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed.date().isoformat()
+
+
 def content_hash(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -259,7 +297,9 @@ def _canonical_record(raw: Mapping[str, Any], mapping: Mapping[str, str], proven
         if field in {"nomenclature", "characteristic"}:
             continue
         value = get(field)
-        if field in {"snapshot_at", "occurred_at"}:
+        if field == "snapshot_at":
+            record[field] = normalize_operational_day(value)
+        elif field == "occurred_at":
             record[field] = normalize_source_datetime(value)
         elif field in {"source_stock_quantity", "source_position_balance", "cell_picking_order", "actual_quantity",
                        "accounting_quantity", "box_quantity", "reported_pallets", "quantity", "source_pick_order",
@@ -294,7 +334,7 @@ def normalize_table(table: pd.DataFrame, *, dataset_id: str, filename: str, data
 
 def _day(record: Mapping[str, Any]) -> str | None:
     value = record.get("snapshot_at") or record.get("occurred_at")
-    return str(value)[:10] if value else None
+    return normalize_operational_day(value)
 
 
 def _duplicates(raw_records: list[dict[str, Any]]) -> int:
@@ -980,6 +1020,10 @@ def build_monthly_data_readiness(registry: Mapping[str, Any], model: Mapping[str
         if day in d.get("index", {}).get("dates", d.get("partitions", []))] for day in required_days}
     missing = [day for day, sources in placement_sources.items() if not sources]
     overlaps = [day for day, sources in placement_sources.items() if len(sources) > 1]
+    imported_placement_dates = sorted({normalized for dataset in active_datasets(registry, "historical_placement")
+        for raw_day in dataset.get("index", {}).get("dates", dataset.get("partitions", []))
+        if (normalized := normalize_operational_day(raw_day))})
+    extra_placement_dates = sorted(set(imported_placement_dates) - set(required_days))
     if missing: blockers.append({"code": "missing_placement_snapshot", "dates": missing})
     if overlaps: blockers.append({"code": "multiple_active_placement_sources_for_snapshot", "dates": overlaps})
     analyses = {source: _source_conflicts(registry, source) for source in ("outbound", "receipts", "inventory", "vgh")}
@@ -1036,7 +1080,9 @@ def build_monthly_data_readiness(registry: Mapping[str, Any], model: Mapping[str
     checks = [
         {"name": "placement_snapshot", "status": "pass" if placement_ready else "fail",
          "title": "Срезы размещения", "expected_days": len(required_days),
-         "available_days": len(required_days) - len(missing), "missing_dates": missing,
+         "available_days": len(required_days) - len(missing),
+         "imported_days": len(imported_placement_dates), "missing_dates": missing,
+         "extra_dates": extra_placement_dates,
          "details": f"{len(required_days) - len(missing)} / {len(required_days)} дней"},
         {"name": "outbound", "status": "pass" if outbound_ready else "fail", "title": "Расходные ордера",
          "available": bool(outbound_rows), "rows": outbound_count, "documents": outbound_documents,

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from io import BytesIO
 
 import pandas as pd
@@ -9,7 +9,7 @@ import pytest
 from warehouse_factual_data import (
     activate_dataset_version, build_fact_route_readiness, build_monthly_data_readiness, import_excel_dataset,
     load_effective_rows, load_registry, resolve_historical_cell,
-    save_historical_cell_mapping,
+    save_historical_cell_mapping, normalize_operational_day,
 )
 
 
@@ -116,6 +116,45 @@ def test_complete_july_monthly_readiness_contract(tmp_path):
     assert result["coverage"]["placement_checkpoints"] == 32
 
 
+def test_mixed_excel_placement_dates_preserve_all_july_snapshots(tmp_path):
+    days = [date(2026, 7, 1) + timedelta(days=i) for i in range(32)]
+    representations = []
+    for index, day in enumerate(days):
+        if index < 6:
+            representations.append((day - date(1899, 12, 30)).days)
+        elif index < 12:
+            representations.append(f"{day.isoformat()} 00:00:00")
+        elif index == 31:
+            representations.append("2026-08-01T00:00:00+03:00")
+        else:
+            representations.append(datetime.combine(day, datetime.min.time()))
+    placements = [{"ДатаСреза": snapshot, "Паллета": f"P{i}", "Номенклатура": "N",
+        "Характеристика": "C", "КоличествоОстатокТовара": 1, "Ячейка": "A-01",
+        "ПорядокСборки": 1, "КоличествоОстатокПоложения": 1}
+        for i, snapshot in enumerate(representations)]
+    imported = import_excel_dataset(_xlsx(placements), "размещение июль.xlsx", root=tmp_path)
+    import_excel_dataset(_xlsx([_outbound()]), "РО июль.xlsx", root=tmp_path)
+    import_excel_dataset(_xlsx([{"Ссылка": "r", "Номер": "R", "Дата": "2026-07-15", "Склад": "A",
+        "НомерСтроки": 1, "Номенклатура": "N", "Характеристика": "C", "КоличествоКоробок": 1}]),
+        "ПО июль.xlsx", root=tmp_path)
+    import_excel_dataset(_xlsx([{"Номенклатура": "N", "Характеристика": "C",
+        "КоличествоКоробовВОдномСлоеНаПаллете": 1, "КоличествоСлоевНаПаллете": 1}]),
+        "ВГХ.xlsx", root=tmp_path)
+
+    expected = [day.isoformat() for day in days]
+    assert imported["partitions"] == expected
+    assert [normalize_operational_day(value) for value in representations] == expected
+    result = build_monthly_data_readiness(load_registry(tmp_path),
+        {"model_id": "M", "cells": [{"cell_key": "1|1|1", "source_cell": "A-01"}]},
+        "2026-07-01", "2026-07-31", root=tmp_path)
+    placement = next(check for check in result["diagnostics"]["checks"]
+                     if check["name"] == "placement_snapshot")
+    assert result["monthly_replay_ready"] is True
+    assert result["coverage"]["placement_checkpoints"] == 32
+    assert placement["available_days"] == placement["imported_days"] == 32
+    assert placement["missing_dates"] == placement["extra_dates"] == []
+
+
 def test_blocked_monthly_readiness_exposes_structured_reasons(tmp_path):
     result = build_monthly_data_readiness({}, {"model_id": "M", "cells": []},
                                           "2026-07-01", "2026-07-31", root=tmp_path)
@@ -142,3 +181,17 @@ def test_monthly_readiness_ui_formatter_is_human_readable():
     assert rendered.startswith("❌ **ВГХ**")
     assert "658 / 924 SKU" in rendered
     assert "Не хватает: 266 SKU" in rendered
+
+
+def test_failed_placement_readiness_formatter_exposes_date_diagnostics():
+    from warehouse_workspace_ui import format_monthly_readiness_check
+
+    rendered = format_monthly_readiness_check({
+        "name": "placement_snapshot", "status": "fail", "title": "Срезы размещения",
+        "details": "31 / 32 дней", "expected_days": 32, "imported_days": 32,
+        "missing_dates": ["2026-07-01"], "extra_dates": ["2026-06-30"],
+    })
+    assert "Ожидаемые даты: 32" in rendered
+    assert "Импортированные даты размещения: 32" in rendered
+    assert "Отсутствующие даты: 2026-07-01" in rendered
+    assert "Лишние даты: 2026-06-30" in rendered
