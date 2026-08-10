@@ -65,12 +65,12 @@ CONTRACTS: dict[str, dict[str, tuple[str, ...]]] = {
         "expected_receipt": ("ОжидаемыйПриход",),
     },
     "outbound": {
-        "document_ref": ("СсылкаРО",),
-        "document_number": ("НомерРО",),
-        "occurred_at": ("ДатаРО",), "warehouse": ("Склад",),
+        "document_ref": ("РасходныйОрдер", "СсылкаРО"),
+        "document_number": ("Номер", "НомерРО"),
+        "occurred_at": ("Дата", "ДатаРО"), "warehouse": ("Склад",),
         "line_number": ("НомерСтроки",), "nomenclature": ("Номенклатура",),
         "characteristic": ("Характеристика",),
-        "quantity": ("РасчетноеОтгруженоКоробок",),
+        "quantity": ("Количество", "РасчетноеОтгруженоКоробок"),
         "source_pick_order": ("ПорядокСборки",),
     },
     "vgh": {
@@ -95,7 +95,9 @@ REQUIRED = {
     "historical_placement": {"snapshot_at", "source_pallet_ref", "nomenclature", "characteristic", "source_stock_quantity", "cell", "cell_picking_order", "source_position_balance"},
     "inventory": {"inventory_ref", "inventory_number", "occurred_at", "line_number", "warehouse", "nomenclature", "characteristic", "actual_quantity", "accounting_quantity"},
     "receipts": {"document_ref", "document_number", "occurred_at", "warehouse", "line_number", "nomenclature", "characteristic", "box_quantity"},
-    "outbound": {"document_ref", "document_number", "occurred_at", "warehouse", "line_number", "nomenclature", "characteristic", "quantity"},
+    # Outbound document identity is an OR rule and is checked explicitly by
+    # detect_source_type: document_ref, or document_number + occurred_at.
+    "outbound": {"nomenclature", "characteristic", "quantity"},
     "vgh": {"nomenclature", "characteristic", "boxes_per_layer", "layers_per_pallet"},
 }
 
@@ -151,18 +153,37 @@ def detect_source_type(columns: Iterable[Any]) -> dict[str, Any]:
     """Detect by exact observed columns; filename is deliberately not authority."""
     normalized = {_norm(column): str(column) for column in columns}
     matches: dict[str, dict[str, str]] = {}
-    for source_type, fields in CONTRACTS.items():
+    # Priority is documented for review, but never resolves a collision: all
+    # matches are collected and an ambiguous schema is returned explicitly.
+    detection_order = ("historical_placement", "inventory", "vgh", "outbound", "receipts")
+    for source_type in detection_order:
+        fields = CONTRACTS[source_type]
         mapping = {}
         for field, aliases in fields.items():
             found = next((normalized[_norm(alias)] for alias in aliases if _norm(alias) in normalized), None)
             if found:
                 mapping[field] = found
-        if REQUIRED[source_type].issubset(mapping):
+        required = REQUIRED[source_type].issubset(mapping)
+        if source_type == "outbound":
+            required = required and ("document_ref" in mapping or {"document_number", "occurred_at"}.issubset(mapping))
+        if required:
             matches[source_type] = mapping
     status = "detected" if len(matches) == 1 else "ambiguous_schema" if len(matches) > 1 else "unknown_schema"
     source_type = next(iter(matches)) if len(matches) == 1 else UNKNOWN_SOURCE
     missing: list[str] = []
-    if source_type == UNKNOWN_SOURCE and not matches:
+    diagnostic_code: str | None = None
+    diagnostic_found: list[str] = []
+    diagnostic_missing: list[str] = []
+    outbound_common = {"nomenclature", "characteristic", "quantity"}
+    outbound_mapping = {field: next((normalized[_norm(alias)] for alias in aliases if _norm(alias) in normalized), None)
+                        for field, aliases in CONTRACTS["outbound"].items()}
+    outbound_mapping = {field: value for field, value in outbound_mapping.items() if value}
+    if source_type == UNKNOWN_SOURCE and not matches and outbound_common.issubset(outbound_mapping):
+        diagnostic_code = "outbound_document_identity_missing"
+        diagnostic_found = [outbound_mapping[field] for field in ("nomenclature", "characteristic", "quantity", "occurred_at")
+                            if field in outbound_mapping]
+        diagnostic_missing = ["РасходныйОрдер или Номер + Дата"]
+    if source_type == UNKNOWN_SOURCE and not matches and diagnostic_code is None:
         # Family signatures are exact, confirmed source fields, not fuzzy
         # aliases.  They allow a useful mapping_required diagnostic without
         # authorising canonical rows.
@@ -182,7 +203,9 @@ def detect_source_type(columns: Iterable[Any]) -> dict[str, Any]:
             matches = partial
     return {"source_type": source_type, "status": status, "mapping_status": "ready" if status == "detected" else status,
             "required_missing": missing, "detected_columns": list(map(str, columns)),
-            "matches": sorted(matches), "mapping": matches.get(source_type, {})}
+            "matches": sorted(matches), "mapping": matches.get(source_type, {}),
+            "diagnostic_code": diagnostic_code, "diagnostic_found": diagnostic_found,
+            "diagnostic_missing": diagnostic_missing}
 
 
 def read_excel_source(data: bytes, sheet: str | None = None) -> tuple[str, pd.DataFrame]:
@@ -395,7 +418,9 @@ def _import_excel_dataset_buffered(data: bytes, filename: str, *, sheet: str | N
         return {"status": detection["status"], "source_type": UNKNOWN_SOURCE, "source_label": SOURCE_LABELS[UNKNOWN_SOURCE],
                 "detected_source_family": detection["source_type"] if detection["source_type"] != UNKNOWN_SOURCE else None,
                 "required_missing": detection["required_missing"], "detected_columns": detection["detected_columns"],
-                "matches": detection["matches"], "errors": [detection["status"]]}
+                "matches": detection["matches"], "diagnostic_code": detection["diagnostic_code"],
+                "diagnostic_found": detection["diagnostic_found"], "diagnostic_missing": detection["diagnostic_missing"],
+                "errors": [detection["status"]]}
     source_type = detection["source_type"]
     dataset_id = dataset_identity(digest, source_type, selected, parser_version)
     existing = next((item for item in registry["datasets"] if item.get("dataset_id") == dataset_id), None)
@@ -535,7 +560,9 @@ def _stream_xlsx_dataset(data: bytes, filename: str, *, sheet: str | None, root:
                     "source_label": SOURCE_LABELS[UNKNOWN_SOURCE],
                     "detected_source_family": detection["source_type"] if detection["source_type"] != UNKNOWN_SOURCE else None,
                     "required_missing": detection["required_missing"], "detected_columns": headers,
-                    "matches": detection["matches"], "errors": [detection["status"]]}
+                    "matches": detection["matches"], "diagnostic_code": detection["diagnostic_code"],
+                    "diagnostic_found": detection["diagnostic_found"],
+                    "diagnostic_missing": detection["diagnostic_missing"], "errors": [detection["status"]]}
         source_type = detection["source_type"]
         dataset_id = dataset_identity(digest, source_type, selected, parser_version)
         imported_at = datetime.now(timezone.utc).isoformat(timespec="microseconds")
