@@ -163,3 +163,35 @@ def test_unconfirmed_outbound_names_are_not_authoritative():
     plausible = {"НомерРасходногоОрдера": "O", "ДатаРасходногоОрдера": "2026-07-15", "Склад": "A",
                  "Номенклатура": "N", "Характеристика": "C", "РасчетноеКоличествоКоробов": 1}
     assert detect_source_type(plausible)["source_type"] == "unknown"
+
+
+def test_real_outbound_ro_headers_aliases_and_filename_independence(tmp_path):
+    row = {"РасходныйОрдер": "ref", "НомерРО": "O-1", "ДатаРО": "2026-07-01", "ДеньРО": 1,
+           "Склад": "A", "НомерСтроки": 1, "Номенклатура": "N", "Характеристика": "C", "Количество": 3}
+    detected = detect_source_type(row)
+    assert detected["source_type"] == "outbound"
+    assert detected["mapping"]["document_number"] == "НомерРО"
+    assert detected["mapping"]["occurred_at"] == "ДатаРО"
+    result = import_excel_dataset(_xlsx([row]), "test_random_name.xlsx", root=tmp_path)
+    assert result["source_type"] == "outbound"
+    assert result["source_label"] == "Расходные ордера"
+    assert result["period_from"] == result["period_to"] == "2026-07-01"
+    assert load_dataset_rows(result, raw=True)[0]["raw"]["НомерРО"] == "O-1"
+
+
+def test_normalized_outbound_headers_are_detected():
+    headers = ["РасходныйОрдер", "Номер", "Дата", "Номенклатура", "Характеристика", "Количество"]
+    assert detect_source_type(headers)["source_type"] == "outbound"
+
+    conflict = headers + ["КоличествоКоробовВОдномСлоеНаПаллете", "КоличествоСлоевНаПаллете"]
+    detected = detect_source_type(conflict)
+    assert detected["status"] == "ambiguous_schema"
+    assert detected["source_type"] == "unknown"
+    assert detected["matches"] == ["outbound", "vgh"]
+
+
+def test_outbound_shape_without_document_identity_returns_targeted_diagnostic():
+    detected = detect_source_type(["Номенклатура", "Характеристика", "Количество"])
+    assert detected["source_type"] == "unknown"
+    assert detected["diagnostic_code"] == "outbound_document_identity_missing"
+    assert detected["diagnostic_missing"] == ["РасходныйОрдер или Номер + Дата"]

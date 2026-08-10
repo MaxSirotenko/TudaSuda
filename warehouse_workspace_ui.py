@@ -212,8 +212,13 @@ def render_factual_data_layer(model: Mapping[str, Any] | None) -> None:
                 continue
             if result.get("source_type") == "unknown":
                 family = result.get("detected_source_family")
-                st.error(f"{uploaded.name}: требуется сопоставление полей" if family else f"{uploaded.name}: Неизвестный тип файла")
-                st.caption("Обнаруженные колонки: " + " · ".join(result.get("detected_columns", [])))
+                if result.get("diagnostic_code") == "outbound_document_identity_missing":
+                    st.error(f"{uploaded.name}: Файл похож на расходные ордера, но не прошёл классификацию.")
+                    st.caption("Найдены поля: " + ", ".join(result.get("diagnostic_found", [])) + ".")
+                    st.caption("Не найдено: " + ", ".join(result.get("diagnostic_missing", [])) + ".")
+                else:
+                    st.error(f"{uploaded.name}: требуется сопоставление полей" if family else f"{uploaded.name}: Неизвестный тип файла")
+                    st.caption("Обнаруженные колонки: " + " · ".join(result.get("detected_columns", [])))
                 if result.get("required_missing"):
                     st.caption("Не сопоставлены обязательные поля: " + " · ".join(result["required_missing"]))
             elif result.get("reused"):
