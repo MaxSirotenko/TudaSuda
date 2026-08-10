@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any, Callable
 
 import pandas as pd
@@ -293,6 +294,54 @@ def render_factual_data_layer(model: Mapping[str, Any] | None) -> None:
                 st.json(readiness["hard_blockers"])
 
 
+def render_monthly_fact_baseline(model: Mapping[str, Any] | None, session_state: Mapping[str, Any]) -> None:
+    """Run and inspect persisted July FACT partitions without PROPOSED logic."""
+    st.subheader("FACT — июльский baseline")
+    if not model:
+        st.info("Сначала загрузите схему склада."); return
+    registry = load_registry()
+    readiness = build_monthly_data_readiness(registry, model, "2026-07-01", "2026-07-31")
+    if readiness.get("monthly_replay_ready") is not True:
+        st.error("Месячный FACT заблокирован"); st.json(readiness.get("hard_blockers", [])); return
+    st.success("Фактический Data Layer готов")
+    gate_state = session_state.get("workspace_gate_state")
+    if not gate_state:
+        st.error("Не настроены авторитетные ворота."); return
+    if st.button("Рассчитать FACT за июль", key="monthly_fact_run"):
+        from warehouse_monthly_fact_replay import replay_monthly_fact
+        bar, label = st.progress(0), st.empty()
+        def progress(event: dict[str, Any]) -> None:
+            label.caption(f"День {event['day_index']} из {event['days_total']} · РО обработано: {event.get('orders_processed', 0)}")
+            bar.progress(event["day_index"] / event["days_total"])
+        result = replay_monthly_fact(dict(model), dict(gate_state), registry=registry, progress_callback=progress)
+        session_state["monthly_fact_summary"] = {k: v for k, v in result.items() if k != "daily_results"}
+    summary = session_state.get("monthly_fact_summary")
+    if not summary: return
+    values = (("Дней", summary.get("days_total")), ("РО", summary.get("orders_total")),
+              ("Коробов", summary.get("picked_boxes")), ("Shortage", summary.get("shortage_boxes")),
+              ("FACT, км", round((summary.get("strict_fact_picker_distance_m") or 0)/1000, 3)),
+              ("Strict coverage", f"{100*(summary.get('route_order_coverage') or 0):.1f}%"))
+    for column, (label, value) in zip(st.columns(6), values): column.metric(label, value)
+    artifact = Path(str(summary.get("artifact_path") or "")); files = sorted(artifact.glob("day=*.json")) if artifact.is_dir() else []
+    if files:
+        import json
+        daily = [json.loads(path.read_text(encoding="utf-8")) for path in files]
+        st.dataframe(pd.DataFrame([{"Дата": d["operational_day"], "РО": d["orders_total"],
+            "Запрошено коробов": d["requested_boxes"], "Собрано": d["picked_boxes"], "Shortage": d["shortage_boxes"],
+            "FACT, м": d["picker_distance_m"], "strict status": d["status"],
+            "ambiguities": d["source_location_ambiguity_count"]} for d in daily]), use_container_width=True, hide_index=True)
+        selected_day = st.selectbox("День для детализации РО", [d["operational_day"] for d in daily])
+        chosen = next(d for d in daily if d["operational_day"] == selected_day)
+        identities = [o["order_identity"].get("document_number") or o["order_identity"].get("document_ref") for o in chosen["order_results"]]
+        if identities:
+            selected = st.selectbox("Расходный ордер", identities); order = chosen["order_results"][identities.index(selected)]
+            st.json({"order_identity": order["order_identity"], "picker_distance_m": order.get("picker_distance_m"),
+                     "shortage_boxes": order["shortage_boxes"], "strict_comparable": order["strict_comparable"],
+                     "route_legs": order["route_legs"], "factual_pick_stops": order["factual_pick_stops"],
+                     "source_location_ambiguity": order["source_location_ambiguous"], "blockers": order["blockers"]})
+    st.caption("Приходы и инвентаризации не изменяют START; неоднозначные ячейки не угадываются; Паллета — техническая ссылка; каждый день сбрасывается на D 00:00; PROPOSED и экономия не рассчитываются.")
+
+
 def authoritative_analytics_metrics(comparison: Mapping[str, Any]) -> dict[str, Any] | None:
     """Return the exact benchmark headline contract, or no non-authoritative headline."""
     if comparison.get("full_day_effect_valid") is not True:
@@ -305,7 +354,7 @@ def authoritative_analytics_metrics(comparison: Mapping[str, Any]) -> dict[str, 
     return {key: summary.get(key) for key in keys}
 
 
-def render_cached_analytics(session_state: Mapping[str, Any]) -> None:
+def render_cached_analytics(session_state: Mapping[str, Any], model: Mapping[str, Any] | None = None) -> None:
     """Render only cached authoritative benchmark output; never recalculate it."""
     st.subheader("Аналитика CURRENT / PROPOSED")
     comparison = session_state.get("placement_comparison_distance_comparison")
@@ -331,3 +380,4 @@ def render_cached_analytics(session_state: Mapping[str, Any]) -> None:
     for text in LIMITATION_LABELS.values(): st.write(f"• {text}")
     with st.expander("Технические IDs и диагностика"):
         st.json({"limitations": list(LIMITATION_LABELS), "comparison": comparison or {}})
+    render_monthly_fact_baseline(model, session_state)

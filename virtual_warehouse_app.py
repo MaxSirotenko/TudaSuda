@@ -1961,7 +1961,7 @@ def render_distance_workspace(model: dict | None) -> None:
 
 def render_business_analytics_workspace(model: dict | None) -> None:
     from warehouse_workspace_ui import render_cached_analytics
-    render_cached_analytics(st.session_state)
+    render_cached_analytics(st.session_state, model)
 
 
 def render_excel_geometry_warehouse() -> None:
