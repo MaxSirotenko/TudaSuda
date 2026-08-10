@@ -25,7 +25,7 @@ import pandas as pd
 
 from warehouse_business_identity import build_canonical_sku_identity, find_canonical_identity_collisions
 
-PARSER_VERSION = "factual-july-v2"
+PARSER_VERSION = "factual-july-v3"
 DATA_ROOT = Path("data/last_import/factual")
 REGISTRY_PATH = DATA_ROOT / "registry.json"
 UNKNOWN_SOURCE = "unknown"
@@ -131,13 +131,43 @@ def _number(value: Any) -> float | int | None:
     return int(number) if number.is_integer() else number
 
 
-def _timestamp(value: Any) -> str | None:
-    if _json_value(value) in (None, ""):
+_SOURCE_DATETIME_FORMATS = (
+    "%d.%m.%Y %H:%M:%S",
+    "%d.%m.%Y %H:%M",
+    "%d.%m.%Y",
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%d %H:%M",
+    "%Y-%m-%dT%H:%M:%S",
+    "%Y-%m-%d",
+)
+
+
+def normalize_source_datetime(value: Any) -> str | None:
+    """Return a deterministic factual-source datetime in canonical ISO form.
+
+    Native Excel dates retain their calendar value.  Text is accepted only in
+    the confirmed Russian day-first and ISO source formats; no locale-dependent
+    or fuzzy parser participates in factual partitioning.
+    """
+    if value is None or value is pd.NaT:
         return None
-    try:
-        return pd.Timestamp(value).isoformat()
-    except (TypeError, ValueError):
+    if isinstance(value, pd.Timestamp):
+        return None if pd.isna(value) else value.isoformat()
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    if not isinstance(value, str):
         return None
+    text = value.strip()
+    if not text:
+        return None
+    for source_format in _SOURCE_DATETIME_FORMATS:
+        try:
+            return datetime.strptime(text, source_format).isoformat()
+        except ValueError:
+            continue
+    return None
 
 
 def content_hash(data: bytes) -> str:
@@ -229,7 +259,7 @@ def _canonical_record(raw: Mapping[str, Any], mapping: Mapping[str, str], proven
             continue
         value = get(field)
         if field in {"snapshot_at", "occurred_at"}:
-            record[field] = _timestamp(value)
+            record[field] = normalize_source_datetime(value)
         elif field in {"source_stock_quantity", "source_position_balance", "cell_picking_order", "actual_quantity",
                        "accounting_quantity", "box_quantity", "reported_pallets", "quantity", "source_pick_order",
                        "weight", "length", "width", "height", "boxes_per_layer", "layers_per_pallet", "quantity_per_box"}:
@@ -254,9 +284,10 @@ def normalize_table(table: pd.DataFrame, *, dataset_id: str, filename: str, data
         provenance = {"dataset_id": dataset_id, "source_file_name": filename, "content_hash": data_hash,
                       "source_type": source_type, "parser_version": parser_version, "sheet": sheet,
                       "source_row": ordinal, "source_index": _json_value(source_index), "imported_at": imported_at}
-        raw = {str(key): _json_value(value) for key, value in series.items()}
+        source_values = {str(key): value for key, value in series.items()}
+        raw = {key: _json_value(value) for key, value in source_values.items()}
         raw_records.append({**provenance, "raw": raw})
-        canonical.append(_canonical_record(raw, mapping, provenance))
+        canonical.append(_canonical_record(source_values, mapping, provenance))
     return raw_records, canonical
 
 
@@ -407,6 +438,9 @@ def _import_excel_dataset_buffered(data: bytes, filename: str, *, sheet: str | N
     digest = content_hash(data)
     root.mkdir(parents=True, exist_ok=True)
     registry = load_registry(root)
+    obsolete_content_match = any(item.get("content_hash") == digest
+        and item.get("parser_version") != parser_version
+        and (sheet is None or item.get("sheet") == sheet) for item in registry["datasets"])
     content_match = next((item for item in registry["datasets"]
         if item.get("content_hash") == digest and item.get("parser_version") == parser_version
         and (sheet is None or item.get("sheet") == sheet)), None)
@@ -487,7 +521,7 @@ def _import_excel_dataset_buffered(data: bytes, filename: str, *, sheet: str | N
     registry["datasets"].sort(key=lambda item: (item.get("imported_at", ""), item["dataset_id"]))
     registry["registry_version"] = 2
     _atomic_json(root / "registry.json", registry)
-    return {**metadata, "reused": False}
+    return {**metadata, "reused": False, "reparsed_for_parser_upgrade": obsolete_content_match}
 
 
 BUSINESS_KEYS = {
@@ -538,6 +572,9 @@ def _stream_xlsx_dataset(data: bytes, filename: str, *, sheet: str | None, root:
     digest = content_hash(data)
     root.mkdir(parents=True, exist_ok=True)
     registry = load_registry(root)
+    obsolete_content_match = any(item.get("content_hash") == digest
+        and item.get("parser_version") != parser_version
+        and (sheet is None or item.get("sheet") == sheet) for item in registry["datasets"])
     content_match = next((item for item in registry["datasets"]
         if item.get("content_hash") == digest and item.get("parser_version") == parser_version
         and (sheet is None or item.get("sheet") == sheet)), None)
@@ -588,7 +625,8 @@ def _stream_xlsx_dataset(data: bytes, filename: str, *, sheet: str | None, root:
                     continue
                 if fail_after_rows is not None and row_count >= fail_after_rows:
                     raise RuntimeError("injected_streaming_import_failure")
-                raw_values = {header: _json_value(value) for header, value in zip(headers, values) if header}
+                source_values = {header: value for header, value in zip(headers, values) if header}
+                raw_values = {header: _json_value(value) for header, value in source_values.items()}
                 provenance = {"dataset_id": dataset_id, "source_file_name": filename, "content_hash": digest,
                     "source_type": source_type, "parser_version": parser_version, "sheet": selected,
                     "source_row": source_row, "source_index": source_row - 2, "imported_at": imported_at}
@@ -597,7 +635,7 @@ def _stream_xlsx_dataset(data: bytes, filename: str, *, sheet: str | None, root:
                 raw_fp = hashlib.sha256(raw_json.encode()).hexdigest()
                 duplicate_raw += raw_fp in raw_hashes; raw_hashes.add(raw_fp)
                 raw_writer.write(json.dumps(raw_record, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
-                record = _canonical_record(raw_values, detection["mapping"], provenance)
+                record = _canonical_record(source_values, detection["mapping"], provenance)
                 day = _day(record) or "undated"; days.add(day)
                 if day not in writers:
                     target = staging / "canonical" / f"date={day}.jsonl.gz"; target.parent.mkdir(parents=True, exist_ok=True)
@@ -680,7 +718,7 @@ def _stream_xlsx_dataset(data: bytes, filename: str, *, sheet: str | None, root:
     registry["datasets"].sort(key=lambda item: (item.get("imported_at", ""), item["dataset_id"]))
     registry["registry_version"] = 3
     _atomic_json(root / "registry.json", registry)
-    return {**metadata, "reused": False}
+    return {**metadata, "reused": False, "reparsed_for_parser_upgrade": obsolete_content_match}
 
 
 def import_excel_dataset(data: bytes, filename: str, *, sheet: str | None = None, root: Path = DATA_ROOT,
