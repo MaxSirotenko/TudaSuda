@@ -114,3 +114,31 @@ def test_complete_july_monthly_readiness_contract(tmp_path):
     result = build_monthly_data_readiness(load_registry(tmp_path), model, "2026-07-01", "2026-07-31", root=tmp_path)
     assert result["monthly_replay_ready"] is True
     assert result["coverage"]["placement_checkpoints"] == 32
+
+
+def test_blocked_monthly_readiness_exposes_structured_reasons(tmp_path):
+    result = build_monthly_data_readiness({}, {"model_id": "M", "cells": []},
+                                          "2026-07-01", "2026-07-31", root=tmp_path)
+
+    assert result["monthly_replay_ready"] is False
+    assert result["diagnostics"]["ready"] is False
+    checks = {check["name"]: check for check in result["diagnostics"]["checks"]}
+    assert checks["placement_snapshot"]["status"] == "fail"
+    assert checks["placement_snapshot"]["expected_days"] == 32
+    assert len(checks["placement_snapshot"]["missing_dates"]) == 32
+    assert checks["outbound"]["available"] is False
+    assert checks["receipts"]["available"] is False
+    assert checks["vgh_coverage"]["missing_sku_count"] == 0
+    assert checks["inventory"]["available"] is False
+
+
+def test_monthly_readiness_ui_formatter_is_human_readable():
+    from warehouse_workspace_ui import format_monthly_readiness_check
+
+    rendered = format_monthly_readiness_check({
+        "name": "vgh_coverage", "status": "fail", "title": "ВГХ", "details": "658 / 924 SKU",
+        "missing_sku_count": 266, "percentage": 71.2,
+    })
+    assert rendered.startswith("❌ **ВГХ**")
+    assert "658 / 924 SKU" in rendered
+    assert "Не хватает: 266 SKU" in rendered

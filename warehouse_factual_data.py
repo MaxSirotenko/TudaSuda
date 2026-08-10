@@ -1015,6 +1015,43 @@ def build_monthly_data_readiness(registry: Mapping[str, Any], model: Mapping[str
     vgh_ready = not missing_vgh and not analyses["vgh"]["conflicts"]
     cell_ready = not unresolved_demand and bool(route_checks)
     registry_ready = not registry_blockers
+    period_days = set(required_days[:-1])
+
+    def source_counts(source_type: str) -> tuple[int, int]:
+        datasets = active_datasets(registry, source_type)
+        rows = documents = 0
+        for dataset in datasets:
+            daily = dataset.get("index", {}).get("daily", {})
+            for day, counts in daily.items():
+                if day in period_days:
+                    rows += int(counts.get("rows", 0) or 0)
+                    documents += int(counts.get("documents", 0) or 0)
+        return rows, documents
+
+    outbound_count, outbound_documents = source_counts("outbound")
+    receipt_rows, receipt_documents = source_counts("receipts")
+    inventory_rows, inventory_documents = source_counts("inventory")
+    required_sku = len(demanded)
+    covered_sku = len(demanded & vgh_keys)
+    checks = [
+        {"name": "placement_snapshot", "status": "pass" if placement_ready else "fail",
+         "title": "Срезы размещения", "expected_days": len(required_days),
+         "available_days": len(required_days) - len(missing), "missing_dates": missing,
+         "details": f"{len(required_days) - len(missing)} / {len(required_days)} дней"},
+        {"name": "outbound", "status": "pass" if outbound_ready else "fail", "title": "Расходные ордера",
+         "available": bool(outbound_rows), "rows": outbound_count, "documents": outbound_documents,
+         "details": f"{outbound_count} строк · {outbound_documents} документов" if outbound_rows else "отсутствуют"},
+        {"name": "receipts", "status": "pass" if receipts_ready else "fail", "title": "Приходы",
+         "available": bool(period_days & receipt_dates), "rows": receipt_rows, "documents": receipt_documents,
+         "details": f"{receipt_rows} строк · {receipt_documents} документов" if period_days & receipt_dates else "отсутствуют"},
+        {"name": "vgh_coverage", "status": "pass" if vgh_ready else "fail", "title": "ВГХ",
+         "covered_sku": covered_sku, "total_required_sku": required_sku,
+         "percentage": round(100 * covered_sku / required_sku, 1) if required_sku else 100.0,
+         "missing_sku_count": len(missing_vgh), "details": f"{covered_sku} / {required_sku} SKU"},
+        {"name": "inventory", "status": "pass" if inventory_rows else "info", "title": "Инвентаризация",
+         "available": bool(inventory_rows), "rows": inventory_rows, "documents": inventory_documents,
+         "details": f"{inventory_rows} строк · {inventory_documents} документов" if inventory_rows else "отсутствует (не блокирует replay)"},
+    ]
     return {"monthly_replay_ready": not blockers, "period_from": period_from, "period_to": period_to,
         "control_endpoint": required_days[-1], "placement_ready": placement_ready, "outbound_ready": outbound_ready,
         "receipts_ready": receipts_ready, "vgh_ready": vgh_ready, "cell_resolution_ready": cell_ready,
@@ -1022,4 +1059,5 @@ def build_monthly_data_readiness(registry: Mapping[str, Any], model: Mapping[str
         "coverage": {"placement_checkpoints": len(required_days) - len(missing), "placement_checkpoints_required": len(required_days),
                      "demanded_sku": len(demanded), "vgh_covered_sku": len(demanded & vgh_keys),
                      "demand_relevant_unresolved_cells": unresolved_demand, "source_conflicts": source_conflict_count},
+        "diagnostics": {"ready": not blockers, "checks": checks},
         "active_dataset_signature": active_signature, "cell_mapping_signature": mapping_signature}

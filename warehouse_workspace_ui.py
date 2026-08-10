@@ -64,6 +64,20 @@ def build_weight_zone_readiness(receipts: list[Mapping[str, Any]] | None) -> dic
         "unresolved_sku": unresolved,
         "coverage_percent": round(100 * confirmed / total, 1) if total else 0.0,
     }
+
+
+def format_monthly_readiness_check(check: Mapping[str, Any]) -> str:
+    """Format one structured readiness check for the non-technical UI."""
+    icon = {"pass": "✅", "fail": "❌", "info": "ℹ️"}.get(str(check.get("status")), "ℹ️")
+    text = f"{icon} **{check.get('title', check.get('name', 'Проверка'))}**  \n{check.get('details', '')}"
+    missing = check.get("missing_dates") or []
+    if missing:
+        text += f"  \nНе хватает дат: {', '.join(map(str, missing))}"
+    if check.get("name") == "vgh_coverage" and check.get("missing_sku_count"):
+        text += f"  \nНе хватает: {check['missing_sku_count']} SKU · покрытие {check.get('percentage', 0)}%"
+    return text
+
+
 LIMITATION_LABELS = {
     "intraday_receipts_not_modeled": "Приходы внутри дня не моделируются.",
     "intermediate_full_picking_pallet_return_not_modeled": "Возврат полного паллета комплектации между РО не моделируется.",
@@ -317,6 +331,12 @@ def render_factual_data_layer(model: Mapping[str, Any] | None) -> None:
                 st.caption(f"ВГХ: {c['vgh_covered_sku']} / {c['demanded_sku']} востребованных SKU")
                 (st.success if readiness["monthly_replay_ready"] else st.error)(
                     "Готово к месячному replay" if readiness["monthly_replay_ready"] else "Месячный replay заблокирован")
+                if readiness["monthly_replay_ready"] is not True:
+                    st.markdown("#### Причины блокировки")
+                    for check in readiness.get("diagnostics", {}).get("checks", []):
+                        st.markdown(format_monthly_readiness_check(check))
+                    with st.expander("Техническая диагностика"):
+                        st.json(readiness.get("hard_blockers", []))
 
 
 def render_monthly_fact_baseline(model: Mapping[str, Any] | None, session_state: Mapping[str, Any]) -> None:
