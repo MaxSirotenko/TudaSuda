@@ -18,7 +18,9 @@ from warehouse_scenario_comparison_ui import build_scenario_rule_config
 from warehouse_ui_messages import get_ui_message
 from warehouse_workflow_ui_state import state_from_session
 from warehouse_factual_data import (
-    SOURCE_LABELS, active_datasets, cross_source_coverage, date_summary, import_excel_dataset, load_registry,
+    SOURCE_LABELS, activate_dataset_version, active_datasets, build_monthly_data_readiness,
+    cross_source_coverage, date_summary, import_excel_dataset, load_effective_placement, load_registry,
+    save_historical_cell_mapping,
 )
 
 WORKSPACE_TABS = ("Склад", "Данные", "Условия модели", "CURRENT / PROPOSED", "Пробег", "Аналитика")
@@ -214,7 +216,10 @@ def render_factual_data_layer(model: Mapping[str, Any] | None) -> None:
                 if result.get("required_missing"):
                     st.caption("Не сопоставлены обязательные поля: " + " · ".join(result["required_missing"]))
             elif result.get("reused"):
-                st.info(f"{uploaded.name}: уже импортирован, использован сохранённый артефакт")
+                if result.get("reuse_state") == "existing_superseded_version":
+                    st.warning(f"{uploaded.name}: Эта версия уже существует, но не активна.")
+                else:
+                    st.info(f"{uploaded.name}: уже импортирован, использован сохранённый артефакт")
             else:
                 st.success(f"{uploaded.name}: {SOURCE_LABELS[result['source_type']]}")
     registry = load_registry()
@@ -237,6 +242,10 @@ def render_factual_data_layer(model: Mapping[str, Any] | None) -> None:
         if superseded:
             st.dataframe(pd.DataFrame([{"Файл": i.get("source_file_name"), "Тип": i.get("source_label"),
                 "Версия": str(i.get("version") or i.get("content_hash") or "")[:10], "Заменён": i.get("superseded_by")} for i in superseded]), hide_index=True)
+            version = st.selectbox("Неактивная версия", [i["dataset_id"] for i in superseded], key="factual_inactive_version")
+            if st.button("Сделать эту версию активной", key="factual_activate_version"):
+                activate_dataset_version(version)
+                st.success("Активная версия источника подтверждена.")
     for item in active:
         with st.expander(f"{item.get('source_file_name')} · {item.get('source_label')}"):
             st.json({key: item.get(key) for key in (
@@ -252,6 +261,36 @@ def render_factual_data_layer(model: Mapping[str, Any] | None) -> None:
         with st.expander("Покрытие SKU между источниками"):
             coverage = cross_source_coverage(registry)
             st.dataframe(pd.DataFrame(coverage), use_container_width=True, hide_index=True)
+        if model:
+            placement = load_effective_placement(selected, model, registry=registry, strict=False)
+            unresolved = sorted({str(row.get("source_cell")) for row in placement["rows"]
+                                 if row.get("cell_resolution_status") in {"unresolved", "ambiguous", "stale"}})
+            statuses = pd.Series([row.get("cell_resolution_status") for row in placement["rows"]]).value_counts()
+            st.caption(f"Исторические ячейки: разрешено {int(statuses.get('resolved', 0))}; "
+                       f"не разрешено {len(unresolved)}; неоднозначно {int(statuses.get('ambiguous', 0))}.")
+            if unresolved:
+                query = st.text_input("Поиск исторической ячейки", key="historical_cell_search")
+                page = [value for value in unresolved if query.casefold() in value.casefold()][:50]
+                source_cell = st.selectbox("Историческая ячейка", page, key="historical_source_cell")
+                target_query = st.text_input("Поиск ячейки геометрии", key="geometry_cell_search")
+                targets = sorted(str(cell.get("cell_key")) for cell in model.get("cells", []) if cell.get("cell_key"))
+                targets = [value for value in targets if target_query.casefold() in value.casefold()][:100]
+                if targets:
+                    target = st.selectbox("Ячейка геометрии", targets, key="historical_geometry_target")
+                    if st.button("Сохранить сопоставление", key="save_historical_cell_mapping"):
+                        save_historical_cell_mapping(source_cell, target, model, source_evidence={"day": selected})
+                        st.success("Сопоставление сохранено как подтверждённое пользователем.")
+            readiness = build_monthly_data_readiness(registry, model, "2026-07-01", "2026-07-31")
+            st.subheader("Готовность к месячному replay")
+            c = readiness["coverage"]
+            st.caption(f"Срезы START: {c['placement_checkpoints']} / {c['placement_checkpoints_required']}")
+            st.caption(f"ВГХ: {c['vgh_covered_sku']} / {c['demanded_sku']} востребованных SKU")
+            st.caption(f"Конфликты источников: {c['source_conflicts']}")
+            if readiness["monthly_replay_ready"]:
+                st.success("Готово к месячному replay")
+            else:
+                st.error("Месячный replay заблокирован")
+                st.json(readiness["hard_blockers"])
 
 
 def authoritative_analytics_metrics(comparison: Mapping[str, Any]) -> dict[str, Any] | None:
