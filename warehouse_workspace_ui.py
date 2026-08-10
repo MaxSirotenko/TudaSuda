@@ -226,6 +226,11 @@ def render_factual_data_layer(model: Mapping[str, Any] | None) -> None:
                     st.warning(f"{uploaded.name}: Эта версия уже существует, но не активна.")
                 else:
                     st.info(f"{uploaded.name}: уже импортирован, использован сохранённый артефакт")
+            elif result.get("reparsed_for_parser_upgrade"):
+                st.info(
+                    f"{uploaded.name}: файл уже был импортирован старой версией парсера. "
+                    "Данные пересобраны с исправленным форматом дат."
+                )
             else:
                 st.success(f"{uploaded.name}: {SOURCE_LABELS[result['source_type']]}")
     registry = load_registry()

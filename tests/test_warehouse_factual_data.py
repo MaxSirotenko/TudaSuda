@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from io import BytesIO
 
 import pandas as pd
@@ -7,6 +8,7 @@ import pandas as pd
 from warehouse_factual_data import (
     PARSER_VERSION, cross_source_coverage, date_summary, detect_source_type,
     import_excel_dataset, load_dataset_rows, load_registry, positive_outbound,
+    normalize_source_datetime,
 )
 
 
@@ -15,6 +17,36 @@ def _xlsx(rows):
     with pd.ExcelWriter(stream, engine="openpyxl") as writer:
         pd.DataFrame(rows).to_excel(writer, index=False, sheet_name="Данные")
     return stream.getvalue()
+
+
+def test_factual_source_datetime_formats_are_explicit_and_day_first():
+    assert normalize_source_datetime("01.07.2026") == "2026-07-01T00:00:00"
+    assert normalize_source_datetime("12.07.2026") == "2026-07-12T00:00:00"
+    assert normalize_source_datetime("31.07.2026") == "2026-07-31T00:00:00"
+    assert normalize_source_datetime("07.08.2026") == "2026-08-07T00:00:00"
+    assert normalize_source_datetime("01.07.2026 08:12:38") == "2026-07-01T08:12:38"
+    assert normalize_source_datetime("2026-07-01") == "2026-07-01T00:00:00"
+    native = datetime(2026, 7, 1, 10, 30)
+    assert normalize_source_datetime(native) == "2026-07-01T10:30:00"
+    assert normalize_source_datetime("07/08/2026") is None
+
+
+def test_russian_dates_partition_every_factual_family_and_periods(tmp_path):
+    families = {
+        "placement.xlsx": [_placement("01.07.2026 00:00:00"), _placement("01.08.2026 00:00:00", pallet="P2")],
+        "inventory.xlsx": [{"Инвентаризация": "I", "Номер": 1, "Дата": day, "НомерСтроки": i,
+            "Склад": "A", "Номенклатура": "N", "Характеристика": "C", "КоличествоФакт": 1,
+            "КоличествоУчет": 1} for i, day in enumerate(("01.07.2026", "12.07.2026", "31.07.2026"), 1)],
+        "receipts.xlsx": [{"Ссылка": "R", "Номер": "R", "Дата": "01.07.2026 08:12:38", "Склад": "A",
+            "НомерСтроки": 1, "Номенклатура": "N", "Характеристика": "C", "КоличествоКоробок": 1}],
+        "outbound.xlsx": [_outbound(day="01.07.2026")],
+    }
+    results = {name: import_excel_dataset(_xlsx(rows), name, root=tmp_path) for name, rows in families.items()}
+    assert (results["placement.xlsx"]["period_from"], results["placement.xlsx"]["period_to"]) == ("2026-07-01", "2026-08-01")
+    assert (results["inventory.xlsx"]["period_from"], results["inventory.xlsx"]["period_to"]) == ("2026-07-01", "2026-07-31")
+    assert results["receipts.xlsx"]["partitions"] == ["2026-07-01"]
+    assert results["outbound.xlsx"]["partitions"] == ["2026-07-01"]
+    assert load_dataset_rows(results["receipts.xlsx"], "2026-07-01")[0]["occurred_at"] == "2026-07-01T08:12:38"
 
 
 def _placement(date="2026-07-15", pallet="P1", name="Товар", characteristic="Красный", cell="1-1", order=10):
@@ -131,8 +163,8 @@ def _outbound(qty=1, day="2026-07-15"):
 
 
 def test_lifecycle_parser_upgrade_multifile_and_renamed_duplicate(tmp_path):
-    a = import_excel_dataset(_xlsx([_outbound(1)]), "РО июль.xlsx", root=tmp_path)
-    b = import_excel_dataset(_xlsx([_outbound(2)]), "РО июль.xlsx", root=tmp_path)
+    a = import_excel_dataset(_xlsx([_outbound(1)]), "РО июль.xlsx", root=tmp_path, parser_version="factual-july-v2")
+    b = import_excel_dataset(_xlsx([_outbound(2)]), "РО июль.xlsx", root=tmp_path, parser_version="factual-july-v2")
     registry = load_registry(tmp_path)
     assert not next(x for x in registry["datasets"] if x["dataset_id"] == a["dataset_id"])["active"]
     assert b["active"] and b["supersedes"] == a["dataset_id"]
@@ -143,9 +175,11 @@ def test_lifecycle_parser_upgrade_multifile_and_renamed_duplicate(tmp_path):
     renamed = import_excel_dataset(continuation_data, "renamed.xlsx", root=tmp_path)
     assert renamed["reused"] and renamed["dataset_id"] == continuation["dataset_id"]
 
-    upgraded = import_excel_dataset(_xlsx([_outbound(2)]), "РО июль.xlsx", root=tmp_path, parser_version="factual-july-v3")
+    upgraded = import_excel_dataset(_xlsx([_outbound(2)]), "РО июль.xlsx", root=tmp_path)
     registry = load_registry(tmp_path)
     assert upgraded["active"]
+    assert upgraded["reparsed_for_parser_upgrade"] is True
+    assert upgraded["parser_version"] == PARSER_VERSION
     assert len([x for x in registry["datasets"] if x["active"] and x["logical_source_id"] == upgraded["logical_source_id"]]) == 1
 
 
