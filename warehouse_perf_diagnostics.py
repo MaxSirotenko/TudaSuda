@@ -10,9 +10,14 @@ from collections import Counter, deque
 from contextlib import contextmanager
 from functools import wraps
 import os
-import resource
+import sys
 import time
 from typing import Iterator
+
+try:
+    import resource
+except ImportError:  # The module is not part of the standard library on Windows.
+    resource = None
 
 
 ENABLED = os.getenv("WAREHOUSE_DEBUG_PERF", "").strip() == "1"
@@ -22,14 +27,25 @@ _artifact_reads = 0
 _artifact_bytes = 0
 
 
-def rss_bytes() -> int:
-    """Return current RSS with Linux/macOS ``ru_maxrss`` as safe fallback."""
+def get_process_rss_bytes() -> int | None:
+    """Return current RSS, or ``None`` when no platform provider is available."""
     try:
         with open("/proc/self/statm", encoding="ascii") as stream:
             return int(stream.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
-    except (OSError, ValueError, IndexError):
+    except (AttributeError, OSError, ValueError, IndexError):
+        pass
+
+    if resource is None:
+        return None
+    try:
         value = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        return int(value if os.uname().sysname == "Darwin" else value * 1024)
+        return int(value if sys.platform == "darwin" else value * 1024)
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
+# Retain the original public name used by developer tooling.
+rss_bytes = get_process_rss_bytes
 
 
 @contextmanager
@@ -37,15 +53,16 @@ def measure(name: str, *, cache_status: str | None = None) -> Iterator[None]:
     if not ENABLED:
         yield
         return
-    before, started = rss_bytes(), time.perf_counter()
+    before, started = get_process_rss_bytes(), time.perf_counter()
     try:
         yield
     finally:
-        after = rss_bytes()
+        after = get_process_rss_bytes()
         _counts[name] += 1
         _events.append({"name": name, "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
-                        "rss_before_mb": round(before / 1048576, 2), "rss_after_mb": round(after / 1048576, 2),
-                        "rss_delta_mb": round((after - before) / 1048576, 2),
+                        "rss_before_mb": _to_megabytes(before), "rss_after_mb": _to_megabytes(after),
+                        "rss_delta_mb": (_to_megabytes(after - before)
+                                         if before is not None and after is not None else None),
                         "call_count": _counts[name], "cache_status": cache_status or "n/a"})
 
 
@@ -67,10 +84,14 @@ def record_artifact_read(byte_count: int) -> None:
         _artifact_bytes += max(0, int(byte_count))
 
 
+def _to_megabytes(value: int | None) -> float | None:
+    return round(value / 1048576, 2) if value is not None else None
+
+
 def snapshot() -> dict:
     events = list(_events)
     cache_counts = Counter(item["cache_status"] for item in events if item["cache_status"] != "n/a")
-    return {"rss_mb": round(rss_bytes() / 1048576, 2), "artifact_reads": _artifact_reads,
+    return {"rss_mb": _to_megabytes(get_process_rss_bytes()), "artifact_reads": _artifact_reads,
             "artifact_bytes": _artifact_bytes, "events": events, "cache_status": dict(cache_counts),
             "last_render_ms": next((item["elapsed_ms"] for item in reversed(events)
                                     if item["name"] == "workspace.root"), None),
