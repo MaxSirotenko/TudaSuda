@@ -1858,7 +1858,8 @@ def render_service_tab(saved_model: dict | None, model: dict | None) -> None:
 def render_warehouse_workspace(model: dict | None) -> None:
     """Physical configuration only; simulation results never appear here."""
     if not model:
-        st.info("Сначала загрузите схему склада.")
+        st.info("Нет схемы склада: без рядов, ячеек и проездов нельзя привязать данные и построить маршрут.\n\n"
+                "**Сначала:**\n1. Загрузите схему склада здесь.\n2. Проверьте ряды и проезды.\n3. Настройте ворота.")
         return
     render_map_geometry_fragment(model)
     from warehouse_workspace_ui import build_warehouse_zone_summary
@@ -1904,7 +1905,7 @@ def render_warehouse_workspace(model: dict | None) -> None:
                         "road_type": road.get("road_type"), "x": float(x), "y": float(y),
                     }],
                 }
-                st.success("Ворота сохранены. Следующий шаг: Данные.")
+                st.success("Ворота сохранены. Следующее действие: загрузить данные.")
             saved_gate = st.session_state.get("workspace_gate_state")
             if saved_gate and saved_gate.get("model_id") == model.get("model_id"):
                 gate = saved_gate["gates"][0]
@@ -1921,7 +1922,9 @@ def render_data_workspace(model: dict | None) -> None:
     from warehouse_workspace_ui import render_factual_data_layer
     render_factual_data_layer(model)
     if not model:
-        st.warning("Для загрузки данных V1 сначала настройте склад. Фактический Data Layer доступен независимо.")
+        st.warning("Основные данные пока нельзя связать со складом.\n\n**Причина:** схема склада не настроена.\n\n"
+                   "**Что сделать:** перейдите в «Настройка склада», загрузите схему и настройте ворота. "
+                   "Фактический слой данных выше доступен независимо.")
         return
     st.divider()
     st.subheader("Совместимость V1")
@@ -1941,7 +1944,8 @@ def render_rules_workspace(model: dict | None) -> None:
 
 def render_comparison_workspace(model: dict | None) -> None:
     if not model:
-        st.info("Загрузите схему склада в разделе Склад.")
+        st.info("Нет вариантов для сравнения.\n\n**Сначала:**\n1. Настройте склад.\n2. Загрузите и проверьте данные."
+                "\n3. Настройте правила размещения.\n\nПерейдите в «Настройка склада».")
         return
     # The existing authoritative input/scenario adapter remains the sole owner
     # of upload-to-SimulationState orchestration and calculation buttons.
@@ -1953,7 +1957,9 @@ def render_distance_workspace(model: dict | None) -> None:
     st.subheader("Пробег CURRENT / PROPOSED")
     replay = st.session_state.get("placement_comparison_distance_replay")
     if not replay:
-        st.info("Сначала постройте PROPOSED и нажмите «Рассчитать CURRENT / PROPOSED» в предыдущем разделе.")
+        st.info("Нет данных для расчёта маршрутов.\n\n**Сначала:**\n1. Загрузите РО и размещение."
+                "\n2. Проверьте качество данных.\n3. Постройте варианты в разделе «Сравнение вариантов»."
+                "\n4. Запустите расчёт для исходного и предлагаемого вариантов.")
         return
     from warehouse_route_ui import render_replay_routes
     render_replay_routes(replay)
@@ -1966,7 +1972,7 @@ def render_business_analytics_workspace(model: dict | None) -> None:
 
 def render_excel_geometry_warehouse() -> None:
     st.title("Симулятор скорости сборки")
-    st.caption("Рабочий процесс: настройте склад на карте, добавьте приход, зафиксируйте инвент и проверьте результат в аналитике.")
+    st.caption("Пройдите семь шагов: от настройки склада и загрузки данных до сравнения маршрутов и рекомендаций.")
     with measure_step("load_geometry_model"):
         saved_model = load_geometry_model()
     if saved_model and "geometry_model" not in st.session_state:

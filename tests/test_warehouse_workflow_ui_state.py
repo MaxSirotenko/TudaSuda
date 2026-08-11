@@ -18,7 +18,8 @@ def complete(**changes):
 def test_missing_model_blocks_every_step_and_ready_warehouse_unlocks_data():
     missing = derive_workflow_ui_state({})
     assert not any(s["ready"] for s in missing["steps"])
-    assert derive_workflow_ui_state(complete(start_ready=False))["steps"][0]["status"] == "current"
+    assert derive_workflow_ui_state(complete(start_ready=False))["steps"][0]["status"] == "completed"
+    assert derive_workflow_ui_state(complete(start_ready=False))["steps"][1]["status"] == "current"
 
 
 def test_data_and_rules_unlock_in_sequence():
@@ -30,9 +31,9 @@ def test_data_and_rules_unlock_in_sequence():
 
 def test_full_workflow_is_complete():
     result = derive_workflow_ui_state(complete())
-    assert STEP_NAMES == ("Загрузить данные", "Проверить качество данных", "Настроить правила модели",
-                          "Проверить готовность расчёта", "Выполнить расчёт",
-                          "Сравнить результат", "Посмотреть рекомендации")
+    assert STEP_NAMES == ("Склад", "Загрузка данных", "Проверка качества данных",
+                          "Настройка модели", "Расчёт маршрутов",
+                          "Сравнение результатов", "Аналитика и рекомендации")
     assert all(step["ready"] for step in result["steps"])
     assert result["current_ready"] and result["analytics_ready"]
 

@@ -25,7 +25,13 @@ from warehouse_factual_data import (
 )
 from warehouse_perf_diagnostics import ENABLED as PERF_ENABLED, measure, snapshot
 
-WORKSPACE_TABS = ("Склад", "Данные", "Условия модели", "Исходное / предлагаемое", "Пробег", "Аналитика")
+# The keys used by renderers and session data stay unchanged.  Only these
+# customer-facing navigation labels are business terms.
+WORKSPACE_TABS = ("Настройка склада", "Загрузка данных", "Правила размещения", "Сравнение вариантов", "Расчёт маршрутов", "Результаты")
+LEGACY_WORKSPACE_TABS = dict(zip(
+    ("Склад", "Данные", "Условия модели", "Исходное / предлагаемое", "Пробег", "Аналитика"),
+    WORKSPACE_TABS,
+))
 SUPPORTED_RULES = (
     "weight_zones", "velocity", "adjacency", "picking_storage", "replenishment",
     "deep_lane_optimization", "base_sku_capacity",
@@ -103,13 +109,23 @@ LIMITATION_LABELS = {
 }
 
 STEP_CONTEXT = {
-    "Склад": ("Настраиваем физическую схему, ряды, зоны и Ворота.", "Геометрия определяет доступные места и физический маршрут.", "Сохранённая модель склада для следующих шагов."),
-    "Данные": ("Загружаем начальные остатки и расходные ордера выбранного дня.", "Начальные остатки станут неизменяемым исходным размещением, а ордера — одинаковым спросом для сравнения.", "Подтверждённое исходное размещение и фактический ПорядокСборки."),
-    "Условия модели": ("Выбираем правила, по которым проект перестроит размещение товара.", "Правила формируют предлагаемое размещение, не изменяя фактическое исходное размещение.", "Новая раскладка тех же исходных остатков."),
-    "Исходное / предлагаемое": ("Строим предлагаемое размещение и повторяем одинаковые РО на двух размещениях.", "Так сравнивается пробег сборщика при одинаковом спросе.", "Две карты, пробег по исходному и предлагаемому размещению и экономия."),
-    "Пробег": ("Рассчитываем одинаковые расходные ордера для исходного и предлагаемого размещения.", "Используются выбранный день, спрос и ворота из предыдущих шагов.", "Авторитетный пробег и маршруты выбранного РО."),
-    "Аналитика": ("Изучаем текущий результат сравнения.", "Метрики помогают оценить эффект без подмены фактического исходного размещения.", "Сводка пробега, качества и ограничений расчёта."),
+    "Настройка склада": ("Настраиваем физическую схему склада.", "Модель склада, ряды, ячейки, зоны и одни ворота.", "Сохранённая схема для загрузки фактических данных."),
+    "Загрузка данных": ("Загружаем фактические данные для моделирования.", "РО, историческое размещение, инвентаризация и ВГХ.", "Единый набор исходных данных для проверки."),
+    "Правила размещения": ("Задаём правила предлагаемого размещения.", "Проверенные данные и выбранные правила модели.", "Конфигурация, по которой строится предлагаемый вариант."),
+    "Сравнение вариантов": ("Строим и сопоставляем исходное и предлагаемое размещение.", "Готовые данные, правила размещения и настроенные ворота.", "Два сопоставимых варианта размещения."),
+    "Расчёт маршрутов": ("Рассчитываем одинаковые РО для двух вариантов.", "Исходный и предлагаемый варианты, РО и ворота.", "Пробег и маршруты выбранных РО."),
+    "Результаты": ("Изучаем эффект и получаем рекомендации.", "Завершённый сопоставимый расчёт маршрутов.", "Метрики, ограничения и рекомендации по размещению."),
 }
+
+WORKFLOW_DETAILS = (
+    ("Склад", "Настраиваем физическую схему склада.", "Модель склада, ряды, ячейки, зоны и ворота.", "Готовая схема склада."),
+    ("Загрузка данных", "Собираем факты для моделирования.", "РО, размещение, инвентаризация и ВГХ.", "Единый набор исходных данных."),
+    ("Проверка качества данных", "Проверяем, хватает ли данных для расчёта.", "РО, размещение, инвентаризация и ВГХ.", "Понимание, можно ли запускать расчёт."),
+    ("Настройка модели", "Выбираем правила предлагаемого размещения.", "Проверенные данные и правила размещения.", "Готовая конфигурация модели."),
+    ("Расчёт маршрутов", "Считаем одинаковый спрос для двух размещений.", "Правила, РО, варианты размещения и ворота.", "Маршруты и измеренный пробег."),
+    ("Сравнение результатов", "Сопоставляем исходный и предлагаемый варианты.", "Завершённый сопоставимый расчёт.", "Разница пробега без изменения исходных фактов."),
+    ("Аналитика и рекомендации", "Разбираем эффект и ограничения.", "Результаты сравнения и диагностика.", "Выводы и следующие решения по складу."),
+)
 
 
 def deep_lane_edit_issue(row_type: str, width: Any, access_side: Any) -> dict[str, str] | None:
@@ -120,20 +136,48 @@ def deep_lane_edit_issue(row_type: str, width: Any, access_side: Any) -> dict[st
 
 
 def render_context_block(step: str) -> None:
-    doing, why, result = STEP_CONTEXT[step]
-    st.markdown(f'<div class="workflow-context"><b>Что делаем</b><br>{doing}<br><b>Зачем</b><br>{why}<br><b>Что получится</b><br>{result}</div>', unsafe_allow_html=True)
+    doing, needed, result = STEP_CONTEXT[step]
+    st.markdown(f'<div class="workflow-context"><b>Что делаем:</b><br>{doing}<br><b>Что нужно:</b><br>{needed}<br><b>Результат:</b><br>{result}</div>', unsafe_allow_html=True)
 
 
 def render_workflow_stepper(model: Mapping[str, Any] | None, session_state: Mapping[str, Any]) -> None:
     state = state_from_session(model, session_state)
-    symbols = {"completed": "✓", "current": "●", "available": "○", "blocked": "—", "stale": "↻"}
+    symbols = {"completed": "✅", "current": "⚠️", "available": "⬜", "blocked": "⬜", "stale": "⚠️"}
     items = "".join(f'<span class="workflow-step {item["status"]}">{item["number"]}. {item["name"]} {symbols[item["status"]]}</span>' for item in state["steps"])
     current = next((item for item in state["steps"] if item["status"] in {"current", "stale"}), state["steps"][-1])
     completed = sum(item["ready"] for item in state["steps"])
     next_text = current["name"] if not current["ready"] else "Рабочий процесс завершён"
     summary = (f'<div class="workflow-summary"><b>ШАГ {current["number"]} из {len(state["steps"])}</b>'
                f'<br>✅ Выполнено этапов: {completed}<br>➡ <b>Следующее действие:</b> {next_text}</div>')
-    st.markdown(f'{summary}<div class="workflow-stepper">{items}</div>', unsafe_allow_html=True)
+    st.markdown(f'<b>Рабочий процесс:</b>{summary}<div class="workflow-stepper">{items}</div>', unsafe_allow_html=True)
+    details = WORKFLOW_DETAILS[current["number"] - 1]
+    st.markdown(
+        f'<div class="workflow-context"><b>Шаг: {details[0]}</b><br>'
+        f'<b>Что делаем:</b><br>{details[1]}<br><b>Что нужно:</b><br>{details[2]}<br>'
+        f'<b>Результат:</b><br>{details[3]}</div>', unsafe_allow_html=True,
+    )
+
+
+def _next_section(selected: str) -> str | None:
+    index = WORKSPACE_TABS.index(selected)
+    return WORKSPACE_TABS[index + 1] if index + 1 < len(WORKSPACE_TABS) else None
+
+
+def render_next_action(selected: str, state: Mapping[str, Any]) -> None:
+    """Always leave the user with an actionable, explained navigation choice."""
+    target = _next_section(selected)
+    st.markdown("### Следующее действие")
+    if target is None:
+        if state["analytics_ready"]:
+            st.success("Рабочий процесс завершён. Изучите рекомендации и сохраните выводы.")
+        else:
+            st.warning("Недоступно.\n\n**Причина:** ещё нет завершённого сопоставимого расчёта.\n\n**Что сделать:** вернитесь к первому незавершённому шагу рабочего процесса.")
+            target = "Загрузка данных"
+    else:
+        st.write(target)
+    if target and st.button(f"Перейти: {target}", key=f"workspace_next_{WORKSPACE_TABS.index(selected)}"):
+        st.session_state["workspace_section"] = target
+        st.rerun()
 
 
 def normalize_rule_selection(values: Mapping[str, Any]) -> dict[str, bool]:
@@ -184,7 +228,11 @@ def render_operational_workspace(model: dict | None, *, warehouse_renderer: Call
     .workflow-summary{background:#eff6ff;border-left:4px solid #2563eb;border-radius:8px;padding:.7rem .9rem;margin-bottom:.55rem;line-height:1.5}.workflow-context{background:white;border:1px solid #e5e7eb;border-left:3px solid #94a3b8;border-radius:8px;padding:.7rem .9rem;line-height:1.45;margin:.25rem 0 1rem}
     </style>""", unsafe_allow_html=True)
     with measure("workspace.root"):
+        workflow_state = state_from_session(model, st.session_state)
         render_workflow_stepper(model, st.session_state)
+        legacy = st.session_state.get("workspace_section")
+        if legacy in LEGACY_WORKSPACE_TABS:
+            st.session_state["workspace_section"] = LEGACY_WORKSPACE_TABS[legacy]
         selected = st.radio("Раздел", WORKSPACE_TABS, horizontal=True, key="workspace_section",
                             label_visibility="collapsed")
         renderers = dict(zip(WORKSPACE_TABS, (warehouse_renderer, data_renderer, rules_renderer,
@@ -192,6 +240,7 @@ def render_operational_workspace(model: dict | None, *, warehouse_renderer: Call
         render_context_block(selected)
         with measure(f"workspace.section.{selected}"):
             renderers[selected](model)
+        render_next_action(selected, workflow_state)
     if PERF_ENABLED:
         perf = snapshot()
         with st.expander("Диагностика производительности", expanded=False):
