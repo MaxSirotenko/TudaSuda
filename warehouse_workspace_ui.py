@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Mapping
+from html import escape
 from pathlib import Path
 from typing import Any, Callable
 
@@ -51,6 +52,47 @@ IMPORT_STATUS_LABELS = {
     "ready": "✅ Готово",
     "ready_with_warnings": "⚠️ Готово с ограничениями",
 }
+
+STATUS_PRESENTATION = {
+    "success": ("✅", "Готово"),
+    "warning": ("⚠️", "Есть ограничения"),
+    "error": ("❌", "Требуется исправление"),
+    "empty": ("⬜", "Не выполнено"),
+}
+
+
+def format_compact_number(value: Any) -> str:
+    """Format a UI count consistently without changing the underlying value."""
+    if value is None:
+        return "—"
+    if isinstance(value, bool):
+        return str(value)
+    try:
+        return f"{int(value):,}".replace(",", " ")
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def status_card_html(title: str, value: Any, explanation: str, status: str = "empty") -> str:
+    """Return one accessible, presentation-only status card."""
+    tone = status if status in STATUS_PRESENTATION else "empty"
+    icon, label = STATUS_PRESENTATION[tone]
+    return (
+        f'<div class="ui-status-card {tone}" role="status">'
+        f'<div class="ui-status-heading"><span aria-hidden="true">{icon}</span>'
+        f'<span>{escape(str(title))}</span></div>'
+        f'<div class="ui-status-value">{escape(format_compact_number(value))}</div>'
+        f'<div class="ui-status-label">{label}</div>'
+        f'<div class="ui-status-explanation">{escape(str(explanation))}</div></div>'
+    )
+
+
+def render_status_grid(cards: list[Mapping[str, Any]]) -> None:
+    """Render compact summaries from values already present in memory."""
+    body = "".join(status_card_html(str(card["title"]), card.get("value"),
+                                    str(card.get("explanation", "")), str(card.get("status", "empty")))
+                   for card in cards)
+    st.markdown(f'<div class="ui-status-grid">{body}</div>', unsafe_allow_html=True)
 
 
 def import_status_label(status: Any) -> str:
@@ -253,9 +295,14 @@ def render_operational_workspace(model: dict | None, *, warehouse_renderer: Call
                                  comparison_renderer: Callable, distance_renderer: Callable,
                                  analytics_renderer: Callable) -> None:
     st.markdown("""<style>
-    .stApp {background:#f6f7f9}.workflow-stepper{display:flex;gap:.45rem;flex-wrap:wrap;background:white;border:1px solid #e5e7eb;border-radius:10px;padding:.65rem .8rem;margin-bottom:.8rem}
-    .workflow-step{color:#64748b;padding:.15rem .35rem}.workflow-step.completed{color:#397354}.workflow-step.current{color:#1d4ed8;font-weight:650}.workflow-step.stale{color:#a16207}
-    .workflow-summary{background:#eff6ff;border-left:4px solid #2563eb;border-radius:8px;padding:.7rem .9rem;margin-bottom:.55rem;line-height:1.5}.workflow-context{background:white;border:1px solid #e5e7eb;border-left:3px solid #94a3b8;border-radius:8px;padding:.7rem .9rem;line-height:1.45;margin:.25rem 0 1rem}
+    :root{--ui-green:#287a4b;--ui-green-bg:#edf8f1;--ui-yellow:#9a6700;--ui-yellow-bg:#fff8df;--ui-red:#b42318;--ui-red-bg:#fff1f0;--ui-gray:#52606d;--ui-border:#dfe3e8}
+    .stApp{background:#f6f7f9}.block-container{max-width:1280px;padding-top:1.8rem}.workflow-stepper{display:flex;gap:.45rem;flex-wrap:wrap;background:white;border:1px solid var(--ui-border);border-radius:12px;padding:.65rem .8rem;margin-bottom:.8rem}
+    .workflow-step{color:#64748b;padding:.15rem .35rem}.workflow-step.completed{color:var(--ui-green)}.workflow-step.current{color:var(--ui-yellow);font-weight:650}.workflow-step.stale{color:var(--ui-yellow)}
+    .workflow-summary{background:#f1f3f5;border-left:4px solid var(--ui-gray);border-radius:8px;padding:.7rem .9rem;margin-bottom:.55rem;line-height:1.5}.workflow-context{background:white;border:1px solid var(--ui-border);border-left:3px solid var(--ui-gray);border-radius:8px;padding:.7rem .9rem;line-height:1.45;margin:.25rem 0 1rem}
+    .ui-page-title{margin:.2rem 0 .25rem;font-size:1.65rem;font-weight:720;color:#1f2933}.ui-page-kicker{color:#667085;margin-bottom:.75rem}
+    .ui-status-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:.7rem;margin:.4rem 0 1rem}.ui-status-card{background:white;border:1px solid var(--ui-border);border-top:4px solid var(--ui-gray);border-radius:12px;padding:.75rem .85rem;min-height:132px}.ui-status-card.success{border-top-color:var(--ui-green);background:var(--ui-green-bg)}.ui-status-card.warning{border-top-color:var(--ui-yellow);background:var(--ui-yellow-bg)}.ui-status-card.error{border-top-color:var(--ui-red);background:var(--ui-red-bg)}.ui-status-heading{display:flex;gap:.4rem;font-weight:700}.ui-status-value{font-size:1.35rem;font-weight:750;margin:.5rem 0 .1rem}.ui-status-label{font-size:.82rem;font-weight:650;color:var(--ui-gray)}.ui-status-explanation{font-size:.85rem;color:#667085;margin-top:.35rem;line-height:1.35}
+    div.stButton>button[kind="primary"]{background:var(--ui-green);border-color:var(--ui-green);font-weight:650}div.stButton>button[kind="secondary"]{border-color:#aeb6bf;color:#344054}div[data-testid="stExpander"]{background:white;border-color:var(--ui-border);border-radius:10px}
+    @media(max-width:900px){.block-container{padding-left:1rem;padding-right:1rem}.ui-status-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:560px){.ui-status-grid{grid-template-columns:1fr}}
     </style>""", unsafe_allow_html=True)
     with measure("workspace.root"):
         workflow_state = state_from_session(model, st.session_state)
@@ -265,6 +312,13 @@ def render_operational_workspace(model: dict | None, *, warehouse_renderer: Call
             st.session_state["workspace_section"] = LEGACY_WORKSPACE_TABS[legacy]
         selected = st.radio("Раздел", WORKSPACE_TABS, horizontal=True, key="workspace_section",
                             label_visibility="collapsed")
+        st.markdown(f'<div class="ui-page-title">{escape(selected)}</div><div class="ui-page-kicker">Рабочее пространство склада</div>', unsafe_allow_html=True)
+        current_step = next((item for item in workflow_state["steps"] if item["status"] in {"current", "stale"}), workflow_state["steps"][-1])
+        render_status_grid([
+            {"title": "Схема склада", "value": "Настроена" if model else "Нет данных", "explanation": "Основа для размещения и маршрутов.", "status": "success" if model else "empty"},
+            {"title": "Рабочий процесс", "value": f'{sum(item["ready"] for item in workflow_state["steps"])} из {len(workflow_state["steps"])}', "explanation": f'Текущий этап: {current_step["name"]}.', "status": "success" if all(item["ready"] for item in workflow_state["steps"]) else "warning"},
+            {"title": "Следующий шаг", "value": current_step["name"], "explanation": "Продолжите с первого незавершённого этапа.", "status": "success" if current_step["ready"] else "empty"},
+        ])
         renderers = dict(zip(WORKSPACE_TABS, (warehouse_renderer, data_renderer, rules_renderer,
                                              comparison_renderer, distance_renderer, analytics_renderer)))
         render_context_block(selected)
@@ -372,8 +426,11 @@ def render_factual_data_layer(model: Mapping[str, Any] | None) -> None:
     cached_readiness = st.session_state.get("monthly_data_readiness")
 
     st.markdown("### Данные июля")
-    for card in cards:
-        st.write(f"{card['title']} {card['status'].split()[0]}")
+    render_status_grid([{
+        "title": card["title"], "value": format_compact_number(card["rows"]) + " строк" if card["sources"] else "Нет данных",
+        "explanation": card["period"] if card["sources"] else "Файл ещё не загружен.",
+        "status": "error" if card["status"].startswith("❌") else "warning" if card["status"].startswith("⚠️") else "success" if card["sources"] else "empty",
+    } for card in cards])
     mandatory_ready = all(card["sources"] for card in cards if card["source_type"] in {"historical_placement", "outbound", "receipts", "vgh"})
     (st.success if mandatory_ready else st.warning)("Основные данные загружены" if mandatory_ready else "Не хватает обязательных данных")
 
@@ -394,15 +451,14 @@ def render_factual_data_layer(model: Mapping[str, Any] | None) -> None:
     for card in cards:
         with st.container(border=True):
             st.markdown(f"#### {card['title']}")
-            st.markdown(f"**Зачем:** {card['purpose']}")
-            st.markdown(f"""**Текущий файл:** {card['file']}
-
-**Период:** {card['period']}
-
-**Строк:** {card['rows']} · **SKU:** {card['sku']}
+            st.caption(card['purpose'])
+            st.markdown(f"""**Основное:** {format_compact_number(card['rows'])} строк · {format_compact_number(card['sku'])} SKU · период {card['period']}
 
 **Статус:** {card['status']}""")
             _render_source_quality(card, cached_readiness)
+            with st.expander("Дополнительные сведения", expanded=False):
+                st.write(f"Файл: {card['file']}")
+                st.write(f"Документов: {format_compact_number(card['documents'])} · Ячеек: {format_compact_number(card['cells'])}")
             if card["sources"]:
                 with st.expander("Заменить текущий файл"):
                     replacement = st.file_uploader("Новый файл", type=["xlsx", "xls"], key=f"replace_{card['source_type']}")

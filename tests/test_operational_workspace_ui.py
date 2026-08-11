@@ -2,6 +2,7 @@ from warehouse_workspace_ui import (
     WORKSPACE_TABS, SUPPORTED_RULES, UNSUPPORTED_RULES, RULE_CARDS,
     build_warehouse_zone_summary, build_workspace_rule_config, normalize_rule_selection,
     build_data_source_cards, deep_lane_edit_issue, import_status_label,
+    format_compact_number, status_card_html,
 )
 import warehouse_workspace_ui as workspace
 
@@ -104,3 +105,17 @@ def test_data_upload_cards_cover_five_sources_using_metadata_only():
     assert outbound["status"] == "✅ Готово"
     assert (outbound["documents"], outbound["rows"], outbound["sku"]) == (3, 12, 2)
     assert all(card["status"] == "⬜ Не загружено" for card in cards if card is not outbound)
+
+
+def test_design_system_status_cards_are_consistent_and_escape_content():
+    assert format_compact_number(643910) == "643 910"
+    card = status_card_html("Расходные <ордера>", 643910, "Данные готовы", "success")
+    assert "✅" in card and "Готово" in card and "643 910" in card
+    assert "Расходные &lt;ордера&gt;" in card
+    assert "ui-status-card success" in card
+
+
+def test_unknown_status_uses_neutral_not_completed_presentation():
+    card = status_card_html("Проверка качества", "Нет данных", "Запустите проверку", "unknown")
+    assert "⬜" in card and "Не выполнено" in card
+    assert "ui-status-card empty" in card
