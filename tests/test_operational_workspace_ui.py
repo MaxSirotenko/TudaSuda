@@ -7,7 +7,7 @@ import warehouse_workspace_ui as workspace
 
 
 def test_six_business_workspace_tabs_are_fixed():
-    assert WORKSPACE_TABS == ("Склад", "Данные", "Условия модели", "CURRENT / PROPOSED", "Пробег", "Аналитика")
+    assert WORKSPACE_TABS == ("Склад", "Данные", "Условия модели", "Исходное / предлагаемое", "Пробег", "Аналитика")
 
 
 class _WorkspaceStreamlit:
@@ -66,7 +66,7 @@ def test_zone_summary_uses_canonical_zone_ids_and_physical_capacity():
     ]}
     rows = build_warehouse_zone_summary(model)
     assert [row["ID зоны"] for row in rows] == ["heavy", "medium_light", "unassigned"]
-    assert rows[1]["Количество ячеек"] == 1 and rows[1]["Deep lane"] == 4
+    assert rows[1]["Количество ячеек"] == 1 and rows[1]["Набивные места"] == 4
 
 
 def test_normal_row_deep_controls_have_actionable_regression_message():

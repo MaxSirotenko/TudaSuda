@@ -8,7 +8,11 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-STEP_NAMES = ("Склад", "Данные", "Условия", "PROPOSED", "Пробег", "Аналитика")
+STEP_NAMES = (
+    "Загрузить данные", "Проверить качество данных", "Настроить правила модели",
+    "Проверить готовность расчёта", "Выполнить расчёт", "Сравнить результат",
+    "Посмотреть рекомендации",
+)
 
 
 def _yes(source: Mapping[str, Any], *keys: str) -> bool:
@@ -32,8 +36,11 @@ def derive_workflow_ui_state(source: Mapping[str, Any]) -> dict[str, Any]:
     benchmark_prereqs = proposed and bool(source.get("gate_valid")) and source.get("benchmark_prerequisites_ready") is True and bool(source.get("pick_order_authoritative"))
     benchmark = benchmark_prereqs and benchmark_exists and not benchmark_stale
     analytics = benchmark
-    ready = (warehouse, data, rules, proposed, benchmark, analytics)
-    stale = (False, False, False, proposed_stale, benchmark_stale, benchmark_stale)
+    data_loaded = warehouse and _yes(source, "start_ready", "outbound_orders_loaded")
+    quality_checked = data_loaded and _yes(source, "warehouse_selected", "operational_date_selected", "pick_order_authoritative", "mandatory_data_checks_passed")
+    calculation_ready = rules and bool(source.get("gate_valid"))
+    ready = (data_loaded, quality_checked, rules, calculation_ready, proposed, benchmark, analytics)
+    stale = (False, False, False, proposed_stale, proposed_stale, benchmark_stale, benchmark_stale)
     first_incomplete = next((i for i, value in enumerate(ready) if not value), len(ready) - 1)
     steps = []
     for index, name in enumerate(STEP_NAMES):
