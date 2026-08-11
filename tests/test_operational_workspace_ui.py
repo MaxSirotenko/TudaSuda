@@ -1,7 +1,7 @@
 from warehouse_workspace_ui import (
     WORKSPACE_TABS, SUPPORTED_RULES, UNSUPPORTED_RULES, RULE_CARDS,
     build_warehouse_zone_summary, build_workspace_rule_config, normalize_rule_selection,
-    deep_lane_edit_issue,
+    deep_lane_edit_issue, import_status_label,
 )
 import warehouse_workspace_ui as workspace
 
@@ -76,3 +76,9 @@ def test_normal_row_deep_controls_have_actionable_regression_message():
     assert "Изменений нет" not in width["message"]
     assert "Сначала измените тип ряда" in access["solution"]
     assert deep_lane_edit_issue("deep_lane", 5, "left") is None
+
+
+def test_import_statuses_are_presented_in_russian_without_changing_contract_values():
+    assert import_status_label("ready") == "Загружено"
+    assert import_status_label("ready_with_warnings") == "Загружено с предупреждениями"
+    assert import_status_label("unexpected_internal_status") == "Статус не определён"

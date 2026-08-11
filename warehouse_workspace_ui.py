@@ -41,6 +41,16 @@ RULE_CARDS = {
     "base_sku_capacity": ("Минимальная ёмкость товара", "Для активного товара резервируется минимум одно обычное место при доступной ёмкости."),
 }
 
+IMPORT_STATUS_LABELS = {
+    "ready": "Загружено",
+    "ready_with_warnings": "Загружено с предупреждениями",
+}
+
+
+def import_status_label(status: Any) -> str:
+    """Translate persisted import statuses without changing their data contract."""
+    return IMPORT_STATUS_LABELS.get(str(status or ""), "Статус не определён")
+
 
 def build_weight_zone_readiness(receipts: list[Mapping[str, Any]] | None) -> dict[str, Any]:
     """Report receipt zone coverage without participating in V1 readiness."""
@@ -203,7 +213,7 @@ def render_rules_control_panel(model: Mapping[str, Any] | None, session_state: M
         if disabled:
             st.caption("Заблокировано: требуется правило «Комплектация / хранение».")
         else:
-            st.caption("Готово" if model else "Нет данных")
+            st.caption("Готово" if model else "Данные склада не загружены. Загрузите схему склада, чтобы применить правило.")
         if rule == "weight_zones" and values[rule]:
             receipt_state = session_state.get("receipts_state") or {}
             coverage = build_weight_zone_readiness(receipt_state.get("receipts", []))
@@ -253,7 +263,14 @@ def render_factual_data_layer(model: Mapping[str, Any] | None) -> None:
                         st.caption("Найдены поля: " + ", ".join(result.get("diagnostic_found", [])) + ".")
                         st.caption("Не найдено: " + ", ".join(result.get("diagnostic_missing", [])) + ".")
                     else:
-                        st.error(f"{uploaded.name}: требуется сопоставление полей" if family else f"{uploaded.name}: Неизвестный тип файла")
+                        title = "Требуется сопоставление полей" if family else "Не удалось определить тип файла"
+                        render_ui_message({
+                            "severity": "error", "title": title,
+                            "reason": f"Структура файла «{uploaded.name}» не соответствует известным шаблонам.",
+                            "impact": "Файл не загружен и не будет использован в расчёте.",
+                            "action": "Проверьте структуру колонок и повторите загрузку.",
+                            "target": "Данные", "next_action_label": "Перейти к загрузке файла",
+                        })
                         st.caption("Обнаруженные колонки: " + " · ".join(result.get("detected_columns", [])))
                     if result.get("required_missing"):
                         st.caption("Не сопоставлены обязательные поля: " + " · ".join(result["required_missing"]))
@@ -261,7 +278,7 @@ def render_factual_data_layer(model: Mapping[str, Any] | None) -> None:
                     if result.get("reuse_state") == "existing_superseded_version":
                         st.warning(f"{uploaded.name}: Эта версия уже существует, но не активна.")
                     else:
-                        st.info(f"{uploaded.name}: уже импортирован, использован сохранённый артефакт")
+                        st.info(f"{uploaded.name}: уже импортирован, использованы сохранённые данные")
                 elif result.get("reparsed_for_parser_upgrade"):
                     st.info(
                         f"{uploaded.name}: файл уже был импортирован старой версией парсера. "
@@ -276,7 +293,8 @@ def render_factual_data_layer(model: Mapping[str, Any] | None) -> None:
         return
     active = active_datasets(registry)
     compact = [{
-        "Файл": item.get("source_file_name"), "Тип": item.get("source_label"), "Статус": item.get("status"),
+        "Файл": item.get("source_file_name"), "Тип": item.get("source_label"),
+        "Статус": import_status_label(item.get("status")),
         "Версия": str(item.get("version") or item.get("content_hash") or "")[:10], "Активен": "да",
         "Период": " — ".join(filter(None, (item.get("period_from"), item.get("period_to")))) or "—",
         "Строк": item.get("rows", 0), "SKU": item.get("unique_sku", 0),
@@ -329,7 +347,7 @@ def render_factual_data_layer(model: Mapping[str, Any] | None) -> None:
                     if st.button("Сохранить сопоставление", key="save_historical_cell_mapping"):
                         save_historical_cell_mapping(source_cell, target, model, source_evidence={"day": selected})
                         st.success("Сопоставление сохранено как подтверждённое пользователем.")
-            st.subheader("Готовность к месячному replay")
+            st.subheader("Готовность к расчёту месяца")
             st.caption("Полная проверка читает месячные партиции и запускается только явно.")
             if st.button("Проверить готовность месяца", key="monthly_readiness_check"):
                 with st.spinner("Проверяем индексы и дневные партиции июля…"), measure("factual.build_monthly_data_readiness"):
@@ -338,10 +356,25 @@ def render_factual_data_layer(model: Mapping[str, Any] | None) -> None:
             readiness = st.session_state.get("monthly_data_readiness")
             if readiness:
                 c = readiness["coverage"]
-                st.caption(f"Срезы START: {c['placement_checkpoints']} / {c['placement_checkpoints_required']}")
+                st.caption(f"Срезы начального размещения: {c['placement_checkpoints']} / {c['placement_checkpoints_required']}")
                 st.caption(f"ВГХ: {c['vgh_covered_sku']} / {c['demanded_sku']} востребованных SKU")
-                (st.success if readiness["monthly_replay_ready"] else st.error)(
-                    "Готово к месячному replay" if readiness["monthly_replay_ready"] else "Месячный replay заблокирован")
+                if readiness["monthly_replay_ready"]:
+                    render_ui_message({
+                        "severity": "success", "title": "Данные готовы к расчёту месяца",
+                        "reason": "Все обязательные проверки данных пройдены.",
+                        "impact": "Историю размещения можно корректно восстановить за выбранный месяц.",
+                        "action": "Перейдите к расчёту месяца.", "target": "Расчёт месяца",
+                        "next_action_label": "Перейти к расчёту месяца",
+                    })
+                else:
+                    render_ui_message({
+                        "severity": "error", "title": "Расчёт месяца невозможен",
+                        "reason": (f"Срезы размещения: {c['placement_checkpoints']} из "
+                                   f"{c['placement_checkpoints_required']} дней."),
+                        "impact": "Нельзя корректно восстановить историю расположения товаров.",
+                        "action": "Проверьте файл исторического размещения и повторите загрузку.",
+                        "target": "Данные", "next_action_label": "Перейти к загрузке исторического размещения",
+                    })
                 if readiness["monthly_replay_ready"] is not True:
                     st.markdown("#### Причины блокировки")
                     for check in readiness.get("diagnostics", {}).get("checks", []):
@@ -352,13 +385,13 @@ def render_factual_data_layer(model: Mapping[str, Any] | None) -> None:
 
 def render_monthly_fact_baseline(model: Mapping[str, Any] | None, session_state: Mapping[str, Any]) -> None:
     """Run and inspect persisted July FACT partitions without предлагаемое размещение logic."""
-    st.subheader("FACT — июльский baseline")
+    st.subheader("Фактический расчёт за июль")
     if not model:
         st.info("Сначала загрузите схему склада."); return
     registry = load_registry()
     readiness = session_state.get("monthly_data_readiness")
     if readiness is None:
-        st.info("Перед FACT явно проверьте готовность месяца в разделе «Данные»."); return
+        st.info("Перед фактическим расчётом проверьте готовность месяца в разделе «Данные»."); return
     if readiness.get("monthly_replay_ready") is not True:
         failed = next((check for check in readiness.get("checks", []) if check.get("status") == "fail"), {})
         render_ui_message({
@@ -374,7 +407,7 @@ def render_monthly_fact_baseline(model: Mapping[str, Any] | None, session_state:
     gate_state = session_state.get("workspace_gate_state")
     if not gate_state:
         st.error("Не настроены авторитетные ворота."); return
-    if st.button("Рассчитать FACT за июль", key="monthly_fact_run"):
+    if st.button("Рассчитать фактические данные за июль", key="monthly_fact_run"):
         from warehouse_monthly_fact_replay import replay_monthly_fact
         bar, label = st.progress(0), st.empty()
         def progress(event: dict[str, Any]) -> None:
@@ -386,8 +419,8 @@ def render_monthly_fact_baseline(model: Mapping[str, Any] | None, session_state:
     if not summary: return
     values = (("Дней", summary.get("days_total")), ("РО", summary.get("orders_total")),
               ("Коробов", summary.get("picked_boxes")), ("Дефицит", summary.get("shortage_boxes")),
-              ("FACT, км", round((summary.get("strict_fact_picker_distance_m") or 0)/1000, 3)),
-              ("Strict coverage", f"{100*(summary.get('route_order_coverage') or 0):.1f}%"))
+              ("Фактический пробег, км", round((summary.get("strict_fact_picker_distance_m") or 0)/1000, 3)),
+              ("Строгое покрытие", f"{100*(summary.get('route_order_coverage') or 0):.1f}%"))
     for column, (label, value) in zip(st.columns(6), values): column.metric(label, value)
     artifact = Path(str(summary.get("artifact_path") or "")); files = sorted(artifact.glob("day=*.json")) if artifact.is_dir() else []
     if files:
@@ -395,8 +428,8 @@ def render_monthly_fact_baseline(model: Mapping[str, Any] | None, session_state:
         daily = [json.loads(path.read_text(encoding="utf-8")) for path in files]
         st.dataframe(pd.DataFrame([{"Дата": d["operational_day"], "РО": d["orders_total"],
             "Запрошено коробов": d["requested_boxes"], "Собрано": d["picked_boxes"], "Дефицит": d["shortage_boxes"],
-            "FACT, м": d["picker_distance_m"], "strict status": d["status"],
-            "ambiguities": d["source_location_ambiguity_count"]} for d in daily]), use_container_width=True, hide_index=True)
+            "Фактический пробег, м": d["picker_distance_m"], "Строгий статус": d["status"],
+            "Неоднозначные ячейки": d["source_location_ambiguity_count"]} for d in daily]), use_container_width=True, hide_index=True)
         selected_day = st.selectbox("День для детализации РО", [d["operational_day"] for d in daily])
         chosen = next(d for d in daily if d["operational_day"] == selected_day)
         identities = [o["order_identity"].get("document_number") or o["order_identity"].get("document_ref") for o in chosen["order_results"]]
@@ -406,7 +439,7 @@ def render_monthly_fact_baseline(model: Mapping[str, Any] | None, session_state:
                      "shortage_boxes": order["shortage_boxes"], "strict_comparable": order["strict_comparable"],
                      "route_legs": order["route_legs"], "factual_pick_stops": order["factual_pick_stops"],
                      "source_location_ambiguity": order["source_location_ambiguous"], "blockers": order["blockers"]})
-    st.caption("Приходы и инвентаризации не изменяют START; неоднозначные ячейки не угадываются; Паллета — техническая ссылка; каждый день сбрасывается на D 00:00; предлагаемое размещение и экономия не рассчитываются.")
+    st.caption("Приходы и инвентаризации не изменяют начальное размещение; неоднозначные ячейки не угадываются; паллета — техническая ссылка; каждый день начинается с состояния на 00:00; предлагаемое размещение и экономия не рассчитываются.")
 
 
 def authoritative_analytics_metrics(comparison: Mapping[str, Any]) -> dict[str, Any] | None:
