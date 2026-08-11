@@ -16,7 +16,7 @@ import streamlit as st
 
 from warehouse_placement_zones import PLACEMENT_ZONE_IDS, get_placement_zone_label, is_assignable_placement_zone, normalize_placement_zone
 from warehouse_scenario_comparison_ui import build_scenario_rule_config
-from warehouse_ui_messages import get_ui_message
+from warehouse_ui_messages import get_ui_message, render_ui_message
 from warehouse_workflow_ui_state import state_from_session
 from warehouse_factual_data import (
     SOURCE_LABELS, activate_dataset_version, active_datasets, build_monthly_data_readiness,
@@ -25,7 +25,7 @@ from warehouse_factual_data import (
 )
 from warehouse_perf_diagnostics import ENABLED as PERF_ENABLED, measure, snapshot
 
-WORKSPACE_TABS = ("Склад", "Данные", "Условия модели", "CURRENT / PROPOSED", "Пробег", "Аналитика")
+WORKSPACE_TABS = ("Склад", "Данные", "Условия модели", "Исходное / предлагаемое", "Пробег", "Аналитика")
 SUPPORTED_RULES = (
     "weight_zones", "velocity", "adjacency", "picking_storage", "replenishment",
     "deep_lane_optimization", "base_sku_capacity",
@@ -37,8 +37,8 @@ RULE_CARDS = {
     "adjacency": ("Товарное соседство", "Разная номенклатура с одинаковой непустой характеристикой не размещается в соседних ячейках."),
     "picking_storage": ("Комплектация / хранение", "Для SKU выделяется позиция комплектации; остальной поддерживаемый запас может использовать хранение."),
     "replenishment": ("Пополнение", "При опустошении позиции комплектации моделируется поддерживаемое пополнение из хранения."),
-    "deep_lane_optimization": ("Deep lane", "Поддерживаемый складской запас может использовать набивные ряды с сохранением one-SKU-per-lane и существующего depth contract."),
-    "base_sku_capacity": ("Минимальная ёмкость SKU", "Для активного SKU резервируется минимум одна normal-позиция при доступной ёмкости."),
+    "deep_lane_optimization": ("Набивные ряды", "Поддерживаемый складской запас может использовать набивные ряды: в каждом канале хранится один товар."),
+    "base_sku_capacity": ("Минимальная ёмкость товара", "Для активного товара резервируется минимум одно обычное место при доступной ёмкости."),
 }
 
 
@@ -94,11 +94,11 @@ LIMITATION_LABELS = {
 
 STEP_CONTEXT = {
     "Склад": ("Настраиваем физическую схему, ряды, зоны и Ворота.", "Геометрия определяет доступные места и физический маршрут.", "Сохранённая модель склада для следующих шагов."),
-    "Данные": ("Загружаем фактический START и расходные РО выбранного дня.", "START станет неизменяемым CURRENT, а РО — одинаковым спросом для сравнения.", "Подтверждённое исходное размещение и фактический ПорядокСборки."),
-    "Условия модели": ("Выбираем правила, по которым проект перестроит размещение товара.", "Правила формируют PROPOSED, не изменяя фактический CURRENT.", "Новая раскладка тех же исходных остатков."),
-    "CURRENT / PROPOSED": ("Строим PROPOSED и повторяем одинаковые РО на двух размещениях.", "Так сравнивается пробег сборщика при одинаковом спросе.", "Две карты, CURRENT и PROPOSED метры и экономия."),
-    "Пробег": ("Рассчитываем одинаковые расходные РО для CURRENT и PROPOSED.", "Используются выбранный день, спрос и ворота из предыдущих шагов.", "Авторитетный пробег и маршруты выбранного РО."),
-    "Аналитика": ("Изучаем текущий результат сравнения.", "Метрики помогают оценить эффект без подмены фактического CURRENT.", "Сводка пробега, качества и ограничений расчёта."),
+    "Данные": ("Загружаем начальные остатки и расходные ордера выбранного дня.", "Начальные остатки станут неизменяемым исходным размещением, а ордера — одинаковым спросом для сравнения.", "Подтверждённое исходное размещение и фактический ПорядокСборки."),
+    "Условия модели": ("Выбираем правила, по которым проект перестроит размещение товара.", "Правила формируют предлагаемое размещение, не изменяя фактическое исходное размещение.", "Новая раскладка тех же исходных остатков."),
+    "Исходное / предлагаемое": ("Строим предлагаемое размещение и повторяем одинаковые РО на двух размещениях.", "Так сравнивается пробег сборщика при одинаковом спросе.", "Две карты, пробег по исходному и предлагаемому размещению и экономия."),
+    "Пробег": ("Рассчитываем одинаковые расходные ордера для исходного и предлагаемого размещения.", "Используются выбранный день, спрос и ворота из предыдущих шагов.", "Авторитетный пробег и маршруты выбранного РО."),
+    "Аналитика": ("Изучаем текущий результат сравнения.", "Метрики помогают оценить эффект без подмены фактического исходного размещения.", "Сводка пробега, качества и ограничений расчёта."),
 }
 
 
@@ -118,7 +118,12 @@ def render_workflow_stepper(model: Mapping[str, Any] | None, session_state: Mapp
     state = state_from_session(model, session_state)
     symbols = {"completed": "✓", "current": "●", "available": "○", "blocked": "—", "stale": "↻"}
     items = "".join(f'<span class="workflow-step {item["status"]}">{item["number"]}. {item["name"]} {symbols[item["status"]]}</span>' for item in state["steps"])
-    st.markdown(f'<div class="workflow-stepper">{items}</div>', unsafe_allow_html=True)
+    current = next((item for item in state["steps"] if item["status"] in {"current", "stale"}), state["steps"][-1])
+    completed = sum(item["ready"] for item in state["steps"])
+    next_text = current["name"] if not current["ready"] else "Рабочий процесс завершён"
+    summary = (f'<div class="workflow-summary"><b>ШАГ {current["number"]} из {len(state["steps"])}</b>'
+               f'<br>✅ Выполнено этапов: {completed}<br>➡ <b>Следующее действие:</b> {next_text}</div>')
+    st.markdown(f'{summary}<div class="workflow-stepper">{items}</div>', unsafe_allow_html=True)
 
 
 def normalize_rule_selection(values: Mapping[str, Any]) -> dict[str, bool]:
@@ -155,7 +160,7 @@ def build_warehouse_zone_summary(model: Mapping[str, Any]) -> list[dict[str, Any
              "Ряды": ", ".join(sorted(totals[zone]["rows"])),
              "Количество ячеек": totals[zone]["cells"],
              "Физическая вместимость": totals[zone]["physical"],
-             "Normal": totals[zone]["normal"], "Deep lane": totals[zone]["deep"]}
+             "Обычные места": totals[zone]["normal"], "Набивные места": totals[zone]["deep"]}
             for zone in PLACEMENT_ZONE_IDS if totals[zone]["cells"]]
 
 
@@ -166,7 +171,7 @@ def render_operational_workspace(model: dict | None, *, warehouse_renderer: Call
     st.markdown("""<style>
     .stApp {background:#f6f7f9}.workflow-stepper{display:flex;gap:.45rem;flex-wrap:wrap;background:white;border:1px solid #e5e7eb;border-radius:10px;padding:.65rem .8rem;margin-bottom:.8rem}
     .workflow-step{color:#64748b;padding:.15rem .35rem}.workflow-step.completed{color:#397354}.workflow-step.current{color:#1d4ed8;font-weight:650}.workflow-step.stale{color:#a16207}
-    .workflow-context{background:white;border:1px solid #e5e7eb;border-left:3px solid #94a3b8;border-radius:8px;padding:.7rem .9rem;line-height:1.45;margin:.25rem 0 1rem}
+    .workflow-summary{background:#eff6ff;border-left:4px solid #2563eb;border-radius:8px;padding:.7rem .9rem;margin-bottom:.55rem;line-height:1.5}.workflow-context{background:white;border:1px solid #e5e7eb;border-left:3px solid #94a3b8;border-radius:8px;padding:.7rem .9rem;line-height:1.45;margin:.25rem 0 1rem}
     </style>""", unsafe_allow_html=True)
     with measure("workspace.root"):
         render_workflow_stepper(model, st.session_state)
@@ -179,16 +184,16 @@ def render_operational_workspace(model: dict | None, *, warehouse_renderer: Call
             renderers[selected](model)
     if PERF_ENABLED:
         perf = snapshot()
-        with st.expander("Performance diagnostics", expanded=False):
+        with st.expander("Диагностика производительности", expanded=False):
             rss = f"{perf['rss_mb']} MB" if perf["rss_mb"] is not None else "недоступно"
-            st.caption(f"RSS: {rss} · section: {selected} · last render: {perf['last_render_ms']} ms")
-            st.caption(f"Artifact reads: {perf['artifact_reads']} / {perf['artifact_bytes']} bytes · cache: {perf['cache_status']}")
+            st.caption(f"RSS: {rss} · раздел: {selected} · последнее отображение: {perf['last_render_ms']} ms")
+            st.caption(f"Чтение файлов: {perf['artifact_reads']} / {perf['artifact_bytes']} байт · кэш: {perf['cache_status']}")
             st.json(perf["top_slow_blocks"])
 
 
 def render_rules_control_panel(model: Mapping[str, Any] | None, session_state: Mapping[str, Any]) -> None:
-    st.subheader("Условия модели PROPOSED")
-    st.caption("CURRENT остаётся неизменным; настройки применяются только после явного пересчёта PROPOSED.")
+    st.subheader("Условия предлагаемого размещения")
+    st.caption("Исходное остаётся неизменным; настройки применяются только после явного пересчёта предлагаемого размещения.")
     values = {}
     for rule in SUPPORTED_RULES:
         title, description = RULE_CARDS[rule]
@@ -227,13 +232,13 @@ def render_rules_control_panel(model: Mapping[str, Any] | None, session_state: M
 
 def render_factual_data_layer(model: Mapping[str, Any] | None) -> None:
     """Render the sole monthly factual registry inside the existing Data tab."""
-    st.subheader("Фактический Data Layer")
-    st.caption("RAW + CANONICAL · реестр по хешу содержимого · исторические данные не изменяют CURRENT V1 автоматически")
+    st.subheader("Слой фактических данных")
+    st.caption("Исходные и проверенные наборы · реестр версий · исторические данные не изменяют исходное размещение автоматически")
     files = st.file_uploader(
         "Добавить фактические Excel", type=["xlsx", "xls"], accept_multiple_files=True,
         key="factual_data_uploads",
     )
-    if files and st.button("Импортировать в Data Layer", type="primary", key="factual_data_import"):
+    if files and st.button("Импортировать в слой данных", type="primary", key="factual_data_import"):
         with st.spinner("Импорт и индексация фактических Excel…"):
             for uploaded in files:
                 try:
@@ -346,7 +351,7 @@ def render_factual_data_layer(model: Mapping[str, Any] | None) -> None:
 
 
 def render_monthly_fact_baseline(model: Mapping[str, Any] | None, session_state: Mapping[str, Any]) -> None:
-    """Run and inspect persisted July FACT partitions without PROPOSED logic."""
+    """Run and inspect persisted July FACT partitions without предлагаемое размещение logic."""
     st.subheader("FACT — июльский baseline")
     if not model:
         st.info("Сначала загрузите схему склада."); return
@@ -355,8 +360,17 @@ def render_monthly_fact_baseline(model: Mapping[str, Any] | None, session_state:
     if readiness is None:
         st.info("Перед FACT явно проверьте готовность месяца в разделе «Данные»."); return
     if readiness.get("monthly_replay_ready") is not True:
-        st.error("Месячный FACT заблокирован"); st.json(readiness.get("hard_blockers", [])); return
-    st.success("Фактический Data Layer готов")
+        failed = next((check for check in readiness.get("checks", []) if check.get("status") == "fail"), {})
+        render_ui_message({
+            "severity": "error", "title": "Расчёт месяца невозможен",
+            "reason": failed.get("details") or "Обязательная проверка данных не пройдена.",
+            "impact": "Нельзя достоверно построить маршруты и сравнить результат за весь месяц.",
+            "action": "1. Проверьте указанный исходный файл.\n2. Добавьте отсутствующие даты или строки.\n3. Повторите импорт и проверку качества данных.",
+            "target": "Данные", "next_action_label": "Исправить ошибки качества данных",
+            "technical_code": "monthly_data_not_ready",
+        })
+        return
+    st.success("Слой фактических данных готов")
     gate_state = session_state.get("workspace_gate_state")
     if not gate_state:
         st.error("Не настроены авторитетные ворота."); return
@@ -371,7 +385,7 @@ def render_monthly_fact_baseline(model: Mapping[str, Any] | None, session_state:
     summary = session_state.get("monthly_fact_summary")
     if not summary: return
     values = (("Дней", summary.get("days_total")), ("РО", summary.get("orders_total")),
-              ("Коробов", summary.get("picked_boxes")), ("Shortage", summary.get("shortage_boxes")),
+              ("Коробов", summary.get("picked_boxes")), ("Дефицит", summary.get("shortage_boxes")),
               ("FACT, км", round((summary.get("strict_fact_picker_distance_m") or 0)/1000, 3)),
               ("Strict coverage", f"{100*(summary.get('route_order_coverage') or 0):.1f}%"))
     for column, (label, value) in zip(st.columns(6), values): column.metric(label, value)
@@ -380,7 +394,7 @@ def render_monthly_fact_baseline(model: Mapping[str, Any] | None, session_state:
         import json
         daily = [json.loads(path.read_text(encoding="utf-8")) for path in files]
         st.dataframe(pd.DataFrame([{"Дата": d["operational_day"], "РО": d["orders_total"],
-            "Запрошено коробов": d["requested_boxes"], "Собрано": d["picked_boxes"], "Shortage": d["shortage_boxes"],
+            "Запрошено коробов": d["requested_boxes"], "Собрано": d["picked_boxes"], "Дефицит": d["shortage_boxes"],
             "FACT, м": d["picker_distance_m"], "strict status": d["status"],
             "ambiguities": d["source_location_ambiguity_count"]} for d in daily]), use_container_width=True, hide_index=True)
         selected_day = st.selectbox("День для детализации РО", [d["operational_day"] for d in daily])
@@ -392,7 +406,7 @@ def render_monthly_fact_baseline(model: Mapping[str, Any] | None, session_state:
                      "shortage_boxes": order["shortage_boxes"], "strict_comparable": order["strict_comparable"],
                      "route_legs": order["route_legs"], "factual_pick_stops": order["factual_pick_stops"],
                      "source_location_ambiguity": order["source_location_ambiguous"], "blockers": order["blockers"]})
-    st.caption("Приходы и инвентаризации не изменяют START; неоднозначные ячейки не угадываются; Паллета — техническая ссылка; каждый день сбрасывается на D 00:00; PROPOSED и экономия не рассчитываются.")
+    st.caption("Приходы и инвентаризации не изменяют START; неоднозначные ячейки не угадываются; Паллета — техническая ссылка; каждый день сбрасывается на D 00:00; предлагаемое размещение и экономия не рассчитываются.")
 
 
 def authoritative_analytics_metrics(comparison: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -409,41 +423,41 @@ def authoritative_analytics_metrics(comparison: Mapping[str, Any]) -> dict[str, 
 
 def render_monthly_placement_comparison(comparison: Mapping[str, Any] | None) -> None:
     """Render a persisted monthly artifact; this function never runs replay."""
-    st.subheader("FACT vs PROPOSED — июль")
+    st.subheader("Исходное и предлагаемое размещение — июль")
     if not comparison:
         st.info("Сохранённое месячное сравнение ещё не сформировано.")
         return
     readiness = comparison.get("readiness", "partial")
-    (st.success if readiness == "ready" else st.warning)(f"Готовность: {readiness}")
-    metrics = (("FACT", comparison.get("fact_meters")), ("PROPOSED", comparison.get("proposed_meters")),
+    (st.success if readiness == "ready" else st.warning)(f"Готовность данных: {readiness}")
+    metrics = (("Фактическое, м", comparison.get("fact_meters")), ("Предлагаемое", comparison.get("proposed_meters")),
                ("Экономия", comparison.get("saved_meters")), ("Экономия, %", comparison.get("saved_percent")))
     for column, (label, value) in zip(st.columns(4), metrics):
         column.metric(label, f"{float(value or 0)/1000:.3f} км" if label != "Экономия, %" else f"{float(value or 0):.2f}%")
     st.caption(f"Сопоставимо {comparison.get('comparable_orders', 0)} / {comparison.get('full_order_count', 0)} РО · "
-               f"исключено {comparison.get('excluded_orders', 0)} · coverage FACT/PROPOSED "
+               f"исключено {comparison.get('excluded_orders', 0)} · покрытие данных фактического / предлагаемого размещения "
                f"{100*float(comparison.get('fact_coverage', 0)):.1f}% / {100*float(comparison.get('proposed_coverage', 0)):.1f}%")
     daily = comparison.get("daily_results") or []
     if daily:
-        st.dataframe(pd.DataFrame(daily).rename(columns={"date": "Дата", "ro_count": "РО", "fact_meters": "FACT м",
-            "proposed_meters": "PROPOSED м", "saved_meters": "Δ м", "saved_percent": "Δ %",
-            "strict_coverage": "Coverage", "warnings": "Warnings"}), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(daily).rename(columns={"date": "Дата", "ro_count": "РО", "fact_meters": "Фактическое, м",
+            "proposed_meters": "Предлагаемое м", "saved_meters": "Δ м", "saved_percent": "Δ %",
+            "strict_coverage": "Покрытие данных", "warnings": "Предупреждения"}), use_container_width=True, hide_index=True)
     orders = comparison.get("order_comparisons") or []
     if orders:
         labels = [str(x.get("order_identity", {}).get("document_number") or x.get("order_identity", {}).get("document_ref") or i)
                   for i, x in enumerate(orders)]
-        selected = st.selectbox("РО для детализации FACT / PROPOSED", labels, key="monthly_comparison_ro")
+        selected = st.selectbox("Расходный ордер для детализации", labels, key="monthly_comparison_ro")
         order = orders[labels.index(selected)]
-        st.json({"FACT": {"distance": order.get("fact_meters"), "route": order.get("fact_route"),
+        st.json({"Фактическое": {"distance": order.get("fact_meters"), "route": order.get("fact_route"),
                           "pick_stops": order.get("fact_pick_stops")},
-                 "PROPOSED": {"distance": order.get("proposed_meters"), "route": order.get("proposed_route"),
+                 "Предлагаемое": {"distance": order.get("proposed_meters"), "route": order.get("proposed_route"),
                               "pick_stops": order.get("proposed_pick_stops")},
                  "changed_skus": order.get("changed_skus"), "warnings": order.get("warnings")})
         graph = comparison.get("route_graph") or {}
         if graph:
             from warehouse_route_ui import build_route_overlay
-            st.json({"FACT overlay": build_route_overlay({"route_legs": order.get("fact_route"),
+            st.json({"Маршрут фактического размещения": build_route_overlay({"route_legs": order.get("fact_route"),
                 "pick_events": order.get("fact_pick_stops"), "picker_distance_m": order.get("fact_meters")}, graph, "current"),
-                "PROPOSED overlay": build_route_overlay({"route_legs": order.get("proposed_route"),
+                "Маршрут предлагаемого размещения": build_route_overlay({"route_legs": order.get("proposed_route"),
                 "pick_events": order.get("proposed_pick_stops"), "picker_distance_m": order.get("proposed_meters")}, graph, "proposed")})
     if comparison.get("contribution_analysis"):
         st.markdown("**Измеренный вклад по SKU / зоне / ряду**")
@@ -456,22 +470,22 @@ def render_monthly_placement_comparison(comparison: Mapping[str, Any] | None) ->
 def render_cached_analytics(session_state: Mapping[str, Any], model: Mapping[str, Any] | None = None) -> None:
     """Render only cached authoritative benchmark output; never recalculate it."""
     render_monthly_placement_comparison(session_state.get("monthly_placement_comparison"))
-    st.subheader("Аналитика CURRENT / PROPOSED")
+    st.subheader("Аналитика исходного и предлагаемого размещения")
     comparison = session_state.get("placement_comparison_distance_comparison")
     if not comparison:
-        st.info("Рассчитайте пробег CURRENT / PROPOSED в одноимённом разделе.")
+        st.info("Рассчитайте пробег исходного и предлагаемого размещения в одноимённом разделе.")
     elif session_state.get("placement_comparison_distance_signature") != session_state.get("placement_comparison_active_distance_signature"):
         st.warning("Результат пробега устарел — пересчитайте.")
     elif comparison.get("full_day_effect_valid") is not True:
         st.warning("Эффект полного дня недоступен")
-        st.write(" · ".join(comparison.get("blockers") or comparison.get("limitations") or ["Сервис CURRENT и PROPOSED не эквивалентен."]))
+        st.write(" · ".join(comparison.get("blockers") or comparison.get("limitations") or ["Объём отбора в исходном и предлагаемом размещении различается."]))
     else:
         summary = authoritative_analytics_metrics(comparison) or {}
-        keys = (("CURRENT, м", "current_picker_distance_m"), ("PROPOSED, м", "proposed_picker_distance_m"),
+        keys = (("Исходное, м", "current_picker_distance_m"), ("Предлагаемое, м", "proposed_picker_distance_m"),
                 ("Экономия, м", "picker_distance_saved_m"), ("Экономия, %", "picker_distance_saved_percent"),
-                ("РО", "orders_total"), ("Собрано CURRENT", "current_picked_boxes"),
-                ("Собрано PROPOSED", "proposed_picked_boxes"), ("Shortage CURRENT", "current_shortage_boxes"),
-                ("Shortage PROPOSED", "proposed_shortage_boxes"), ("Сервис эквивалентен", "service_equivalent"))
+                ("РО", "orders_total"), ("Собрано в исходном", "current_picked_boxes"),
+                ("Собрано в предлагаемом", "proposed_picked_boxes"), ("Дефицит в исходном", "current_shortage_boxes"),
+                ("Дефицит в предлагаемом", "proposed_shortage_boxes"), ("Сервис эквивалентен", "service_equivalent"))
         for column, (label, key) in zip(st.columns(len(keys)), keys): column.metric(label, summary.get(key, "—"))
     if comparison:
         orders = comparison.get("orders") or comparison.get("order_comparisons") or []
