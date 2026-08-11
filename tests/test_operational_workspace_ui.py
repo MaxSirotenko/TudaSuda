@@ -7,7 +7,8 @@ import warehouse_workspace_ui as workspace
 
 
 def test_six_business_workspace_tabs_are_fixed():
-    assert WORKSPACE_TABS == ("Склад", "Данные", "Условия модели", "Исходное / предлагаемое", "Пробег", "Аналитика")
+    assert WORKSPACE_TABS == ("Настройка склада", "Загрузка данных", "Правила размещения",
+                              "Сравнение вариантов", "Расчёт маршрутов", "Результаты")
 
 
 class _WorkspaceStreamlit:
@@ -16,10 +17,14 @@ class _WorkspaceStreamlit:
 
     def markdown(self, *args, **kwargs): pass
     def radio(self, _label, _options, **kwargs): return self.session_state["workspace_section"]
+    def write(self, *_args, **_kwargs): pass
+    def warning(self, *_args, **_kwargs): pass
+    def success(self, *_args, **_kwargs): pass
+    def button(self, *_args, **_kwargs): return False
 
 
 def test_only_selected_workspace_section_executes(monkeypatch):
-    fake = _WorkspaceStreamlit("Данные")
+    fake = _WorkspaceStreamlit("Загрузка данных")
     monkeypatch.setattr(workspace, "st", fake)
     calls = []
     renderers = {key: (lambda _model, key=key: calls.append(key)) for key in (
@@ -27,7 +32,7 @@ def test_only_selected_workspace_section_executes(monkeypatch):
         "distance_renderer", "analytics_renderer")}
     workspace.render_operational_workspace(None, **renderers)
     assert calls == ["data_renderer"]
-    fake.session_state["workspace_section"] = "Аналитика"
+    fake.session_state["workspace_section"] = "Результаты"
     calls.clear()
     workspace.render_operational_workspace(None, **renderers)
     assert calls == ["analytics_renderer"]

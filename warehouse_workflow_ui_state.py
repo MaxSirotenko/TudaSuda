@@ -1,4 +1,4 @@
-"""Pure projection of authoritative application state onto the six UX steps.
+"""Pure projection of authoritative application state onto the seven UX steps.
 
 No optimizer, graph builder or replay is called here.  Staleness is determined
 only by comparing IDs/signatures already stored by their owning business layer.
@@ -9,9 +9,9 @@ from collections.abc import Mapping
 from typing import Any
 
 STEP_NAMES = (
-    "Загрузить данные", "Проверить качество данных", "Настроить правила модели",
-    "Проверить готовность расчёта", "Выполнить расчёт", "Сравнить результат",
-    "Посмотреть рекомендации",
+    "Склад", "Загрузка данных", "Проверка качества данных",
+    "Настройка модели", "Расчёт маршрутов", "Сравнение результатов",
+    "Аналитика и рекомендации",
 )
 
 
@@ -39,8 +39,11 @@ def derive_workflow_ui_state(source: Mapping[str, Any]) -> dict[str, Any]:
     data_loaded = warehouse and _yes(source, "start_ready", "outbound_orders_loaded")
     quality_checked = data_loaded and _yes(source, "warehouse_selected", "operational_date_selected", "pick_order_authoritative", "mandatory_data_checks_passed")
     calculation_ready = rules and bool(source.get("gate_valid"))
-    ready = (data_loaded, quality_checked, rules, calculation_ready, proposed, benchmark, analytics)
-    stale = (False, False, False, proposed_stale, proposed_stale, benchmark_stale, benchmark_stale)
+    # Presentation sequence only: keep all readiness decisions above intact and
+    # map them to the seven business steps shown to the user.
+    ready = (warehouse, data_loaded, quality_checked, rules, benchmark, benchmark, analytics)
+    stale = (False, False, False, False, proposed_stale or benchmark_stale,
+             benchmark_stale, benchmark_stale)
     first_incomplete = next((i for i, value in enumerate(ready) if not value), len(ready) - 1)
     steps = []
     for index, name in enumerate(STEP_NAMES):
