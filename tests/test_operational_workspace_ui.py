@@ -1,7 +1,7 @@
 from warehouse_workspace_ui import (
     WORKSPACE_TABS, SUPPORTED_RULES, UNSUPPORTED_RULES, RULE_CARDS,
     build_warehouse_zone_summary, build_workspace_rule_config, normalize_rule_selection,
-    deep_lane_edit_issue, import_status_label,
+    build_data_source_cards, deep_lane_edit_issue, import_status_label,
 )
 import warehouse_workspace_ui as workspace
 
@@ -84,6 +84,23 @@ def test_normal_row_deep_controls_have_actionable_regression_message():
 
 
 def test_import_statuses_are_presented_in_russian_without_changing_contract_values():
-    assert import_status_label("ready") == "Загружено"
-    assert import_status_label("ready_with_warnings") == "Загружено с предупреждениями"
-    assert import_status_label("unexpected_internal_status") == "Статус не определён"
+    assert import_status_label("ready") == "✅ Готово"
+    assert import_status_label("ready_with_warnings") == "⚠️ Готово с ограничениями"
+    assert import_status_label("unexpected_internal_status") == "❌ Требуется исправление"
+
+
+def test_data_upload_cards_cover_five_sources_using_metadata_only():
+    registry = {"datasets": [{
+        "active": True, "source_type": "outbound", "source_file_name": "РО июль.xlsx",
+        "rows": 12, "warnings": [], "errors": [],
+        "index": {"sku_keys": ["A", "B"], "dates": ["2026-07-01"],
+                  "daily": {"2026-07-01": {"rows": 12, "documents": 3, "cells": 0}}},
+    }]}
+    cards = build_data_source_cards(registry)
+    assert [card["source_type"] for card in cards] == [
+        "historical_placement", "outbound", "receipts", "inventory", "vgh"]
+    outbound = next(card for card in cards if card["source_type"] == "outbound")
+    assert outbound["file"] == "РО июль.xlsx"
+    assert outbound["status"] == "✅ Готово"
+    assert (outbound["documents"], outbound["rows"], outbound["sku"]) == (3, 12, 2)
+    assert all(card["status"] == "⬜ Не загружено" for card in cards if card is not outbound)

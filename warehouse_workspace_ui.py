@@ -48,14 +48,44 @@ RULE_CARDS = {
 }
 
 IMPORT_STATUS_LABELS = {
-    "ready": "Загружено",
-    "ready_with_warnings": "Загружено с предупреждениями",
+    "ready": "✅ Готово",
+    "ready_with_warnings": "⚠️ Готово с ограничениями",
 }
 
 
 def import_status_label(status: Any) -> str:
     """Translate persisted import statuses without changing their data contract."""
-    return IMPORT_STATUS_LABELS.get(str(status or ""), "Статус не определён")
+    return IMPORT_STATUS_LABELS.get(str(status or ""), "❌ Требуется исправление")
+
+
+DATA_SOURCE_CARDS = (
+    ("historical_placement", "Историческое размещение", "Показывает, где фактически находился товар на каждый день."),
+    ("outbound", "Расходные ордера", "Показывают фактический спрос и последовательность отбора товаров."),
+    ("receipts", "Приходные ордера", "Показывают поступления товара в течение выбранного периода."),
+    ("inventory", "Инвентаризации", "Позволяют сверить фактические остатки и обнаружить расхождения."),
+    ("vgh", "ВГХ / паллетизация", "Задаёт габариты товара и правила укладки на паллету."),
+)
+
+
+def build_data_source_cards(registry: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Build the upload screen exclusively from persisted compact metadata."""
+    active = active_datasets(registry)
+    cards = []
+    for source_type, title, purpose in DATA_SOURCE_CARDS:
+        sources = [item for item in active if item.get("source_type") == source_type]
+        rows = sum(int(item.get("rows", 0) or 0) for item in sources)
+        sku = len({key for item in sources for key in item.get("index", {}).get("sku_keys", [])})
+        dates = sorted({day for item in sources for day in item.get("index", {}).get("dates", item.get("partitions", [])) if day != "undated"})
+        warnings = sum(len(item.get("warnings", [])) for item in sources)
+        errors = sum(len(item.get("errors", [])) for item in sources)
+        status = "❌ Требуется исправление" if errors else "⚠️ Готово с ограничениями" if warnings else "✅ Готово" if sources else "⬜ Не загружено"
+        daily = [counts for item in sources for counts in item.get("index", {}).get("daily", {}).values()]
+        cards.append({"source_type": source_type, "title": title, "purpose": purpose, "sources": sources,
+                      "file": ", ".join(str(item.get("source_file_name") or "—") for item in sources) or "—",
+                      "period": f"{dates[0]} — {dates[-1]}" if dates else "—", "dates": dates,
+                      "rows": rows, "sku": sku, "documents": sum(int(x.get("documents", 0) or 0) for x in daily),
+                      "cells": sum(int(x.get("cells", 0) or 0) for x in daily), "status": status})
+    return cards
 
 
 def build_weight_zone_readiness(receipts: list[Mapping[str, Any]] | None) -> dict[str, Any]:
@@ -289,148 +319,141 @@ def render_rules_control_panel(model: Mapping[str, Any] | None, session_state: M
         st.write(" · ".join(UNSUPPORTED_RULES))
 
 
+def _render_import_result(result: Mapping[str, Any], filename: str) -> None:
+    """Explain recognition without exposing the source lifecycle contract."""
+    if result.get("source_type") == "unknown":
+        render_ui_message({
+            "severity": "error", "title": "Не удалось определить тип файла",
+            "reason": "Не найден обязательный набор колонок.",
+            "impact": "Файл не загружен и не будет использоваться в расчётах.",
+            "action": "Проверьте выгрузку и повторите загрузку.",
+            "target": "Загрузка данных", "next_action_label": "Выбрать другой файл",
+        })
+        found = result.get("diagnostic_found") or result.get("detected_columns") or []
+        missing = result.get("diagnostic_missing") or result.get("required_missing") or []
+        st.markdown(f"**Найдены:** {', '.join(map(str, found)) or 'обязательные колонки не распознаны'}")
+        st.markdown(f"**Ожидаются:** {', '.join(map(str, missing)) or 'колонки одного из поддерживаемых типов файлов'}")
+        return
+    label = SOURCE_LABELS.get(str(result.get("source_type")), "Фактические данные")
+    if result.get("reused"):
+        st.info(f"ℹ️ Файл «{filename}» уже загружен. Используются сохранённые данные.")
+    else:
+        st.success(f"✅ Определён тип: «{label}»")
+
+
+def _render_source_quality(card: Mapping[str, Any], readiness: Mapping[str, Any] | None) -> None:
+    source_type = card["source_type"]
+    if source_type == "historical_placement":
+        st.caption(f"Срезов: {len(card['dates'])} · Период: {card['period']} · SKU: {card['sku']} · Ячеек: {card['cells']}")
+        check = next((x for x in (readiness or {}).get("diagnostics", {}).get("checks", []) if x.get("name") == "placement_snapshot"), None)
+        if check and check.get("missing_dates"):
+            st.caption("Пропущенные даты: " + ", ".join(check["missing_dates"]))
+    elif source_type == "vgh":
+        coverage = (readiness or {}).get("coverage", {})
+        demanded, covered = int(coverage.get("demanded_sku", 0)), int(coverage.get("vgh_covered_sku", card["sku"]))
+        percent = round(100 * covered / demanded, 1) if demanded else 100.0
+        st.caption(f"SKU с ВГХ: {card['sku']} · востребованные SKU без ВГХ: {max(0, demanded-covered)} · покрытие: {percent}%")
+        if demanded and covered < demanded:
+            st.warning(f"""⚠️ ВГХ покрывает {covered} из {demanded} востребованных SKU.
+
+**Что это означает:** для SKU без ВГХ часть правил размещения может работать с ограничениями.
+
+**Что делать:** при возможности загрузите более полный файл ВГХ.""")
+    else:
+        st.caption(f"Документов: {card['documents']} · Строк: {card['rows']} · SKU: {card['sku']} · Период: {card['period']}")
+
+
 def render_factual_data_layer(model: Mapping[str, Any] | None) -> None:
-    """Render the sole monthly factual registry inside the existing Data tab."""
-    st.subheader("Слой фактических данных")
-    st.caption("Исходные и проверенные наборы · реестр версий · исторические данные не изменяют исходное размещение автоматически")
-    files = st.file_uploader(
-        "Добавить фактические Excel", type=["xlsx", "xls"], accept_multiple_files=True,
-        key="factual_data_uploads",
-    )
-    if files and st.button("Импортировать в слой данных", type="primary", key="factual_data_import"):
-        with st.spinner("Импорт и индексация фактических Excel…"):
+    """Render a guided metadata-only upload screen; expensive checks stay explicit."""
+    st.subheader("Загрузка данных")
+    st.caption("Добавьте пять источников, проверьте качество и переходите к правилам размещения.")
+    registry = load_registry()
+    cards = build_data_source_cards(registry)
+    cached_readiness = st.session_state.get("monthly_data_readiness")
+
+    st.markdown("### Данные июля")
+    for card in cards:
+        st.write(f"{card['title']} {card['status'].split()[0]}")
+    mandatory_ready = all(card["sources"] for card in cards if card["source_type"] in {"historical_placement", "outbound", "receipts", "vgh"})
+    (st.success if mandatory_ready else st.warning)("Основные данные загружены" if mandatory_ready else "Не хватает обязательных данных")
+
+    st.markdown("### Добавить файл")
+    files = st.file_uploader("Выберите один или несколько Excel-файлов", type=["xlsx", "xls"], accept_multiple_files=True, key="factual_data_uploads")
+    if files and st.button("Добавить выбранные файлы", type="primary", key="factual_data_import"):
+        with st.spinner("Распознаём и сохраняем файлы…"):
             for uploaded in files:
                 try:
                     result = import_excel_dataset(uploaded.getvalue(), uploaded.name)
                 except (OSError, ValueError) as exc:
-                    st.error(f"{uploaded.name}: файл не импортирован ({exc})")
-                    continue
-                if result.get("source_type") == "unknown":
-                    family = result.get("detected_source_family")
-                    if result.get("diagnostic_code") == "outbound_document_identity_missing":
-                        st.error(f"{uploaded.name}: Файл похож на расходные ордера, но не прошёл классификацию.")
-                        st.caption("Найдены поля: " + ", ".join(result.get("diagnostic_found", [])) + ".")
-                        st.caption("Не найдено: " + ", ".join(result.get("diagnostic_missing", [])) + ".")
-                    else:
-                        title = "Требуется сопоставление полей" if family else "Не удалось определить тип файла"
-                        render_ui_message({
-                            "severity": "error", "title": title,
-                            "reason": f"Структура файла «{uploaded.name}» не соответствует известным шаблонам.",
-                            "impact": "Файл не загружен и не будет использован в расчёте.",
-                            "action": "Проверьте структуру колонок и повторите загрузку.",
-                            "target": "Данные", "next_action_label": "Перейти к загрузке файла",
-                        })
-                        st.caption("Обнаруженные колонки: " + " · ".join(result.get("detected_columns", [])))
-                    if result.get("required_missing"):
-                        st.caption("Не сопоставлены обязательные поля: " + " · ".join(result["required_missing"]))
-                elif result.get("reused"):
-                    if result.get("reuse_state") == "existing_superseded_version":
-                        st.warning(f"{uploaded.name}: Эта версия уже существует, но не активна.")
-                    else:
-                        st.info(f"{uploaded.name}: уже импортирован, использованы сохранённые данные")
-                elif result.get("reparsed_for_parser_upgrade"):
-                    st.info(
-                        f"{uploaded.name}: файл уже был импортирован старой версией парсера. "
-                        "Данные пересобраны с исправленным форматом дат."
-                    )
+                    render_ui_message({"severity": "error", "title": "Файл не загружен", "reason": str(exc),
+                        "impact": "Данные из этого файла не участвуют в расчётах.", "action": "Проверьте формат Excel и повторите загрузку.", "target": "Загрузка данных"})
                 else:
-                    st.success(f"{uploaded.name}: {SOURCE_LABELS[result['source_type']]}")
-    registry = load_registry()
-    datasets = registry.get("datasets", [])
-    if not datasets:
-        st.info("Фактические месячные наборы ещё не импортированы.")
-        return
-    active = active_datasets(registry)
-    compact = [{
-        "Файл": item.get("source_file_name"), "Тип": item.get("source_label"),
-        "Статус": import_status_label(item.get("status")),
-        "Версия": str(item.get("version") or item.get("content_hash") or "")[:10], "Активен": "да",
-        "Период": " — ".join(filter(None, (item.get("period_from"), item.get("period_to")))) or "—",
-        "Строк": item.get("rows", 0), "SKU": item.get("unique_sku", 0),
-        "Ошибки": len(item.get("errors", [])), "Предупреждения": len(item.get("warnings", [])),
-        "Импортирован": item.get("imported_at"),
-    } for item in active]
-    st.dataframe(pd.DataFrame(compact), use_container_width=True, hide_index=True)
-    superseded = [item for item in datasets if not item.get("active", True)]
-    with st.expander("Предыдущие версии / технические детали"):
-        if superseded:
-            st.dataframe(pd.DataFrame([{"Файл": i.get("source_file_name"), "Тип": i.get("source_label"),
-                "Версия": str(i.get("version") or i.get("content_hash") or "")[:10], "Заменён": i.get("superseded_by")} for i in superseded]), hide_index=True)
-            version = st.selectbox("Неактивная версия", [i["dataset_id"] for i in superseded], key="factual_inactive_version")
-            if st.button("Сделать эту версию активной", key="factual_activate_version"):
-                activate_dataset_version(version)
-                st.success("Активная версия источника подтверждена.")
-    for item in active:
-        with st.expander(f"{item.get('source_file_name')} · {item.get('source_label')}"):
-            st.json({key: item.get(key) for key in (
-                "dataset_id", "content_hash", "parser_version", "sheet", "imported_at", "artifact",
-                "detected_columns", "diagnostics",
-            )})
-    available_days = sorted({day for item in active for day in item.get("partitions", []) if day != "undated"})
-    if available_days:
-        selected = st.selectbox("Операционный день", available_days, key="factual_operational_day")
-        with measure("factual.date_summary", cache_status="metadata"):
-            summary = date_summary(registry, selected)
-        st.subheader(f"Срез на {selected}")
-        st.json(summary)
-        with st.expander("Покрытие SKU между источниками"):
-            with measure("factual.cross_source_coverage", cache_status="metadata"):
-                coverage = cross_source_coverage(registry)
-            st.dataframe(pd.DataFrame(coverage), use_container_width=True, hide_index=True)
-        if model:
-            placement = load_effective_placement(selected, model, registry=registry, strict=False)
-            unresolved = sorted({str(row.get("source_cell")) for row in placement["rows"]
-                                 if row.get("cell_resolution_status") in {"unresolved", "ambiguous", "stale"}})
-            statuses = pd.Series([row.get("cell_resolution_status") for row in placement["rows"]]).value_counts()
-            st.caption(f"Исторические ячейки: разрешено {int(statuses.get('resolved', 0))}; "
-                       f"не разрешено {len(unresolved)}; неоднозначно {int(statuses.get('ambiguous', 0))}.")
-            if unresolved:
-                query = st.text_input("Поиск исторической ячейки", key="historical_cell_search")
-                page = [value for value in unresolved if query.casefold() in value.casefold()][:50]
-                source_cell = st.selectbox("Историческая ячейка", page, key="historical_source_cell")
-                target_query = st.text_input("Поиск ячейки геометрии", key="geometry_cell_search")
-                targets = sorted(str(cell.get("cell_key")) for cell in model.get("cells", []) if cell.get("cell_key"))
-                targets = [value for value in targets if target_query.casefold() in value.casefold()][:100]
-                if targets:
-                    target = st.selectbox("Ячейка геометрии", targets, key="historical_geometry_target")
-                    if st.button("Сохранить сопоставление", key="save_historical_cell_mapping"):
-                        save_historical_cell_mapping(source_cell, target, model, source_evidence={"day": selected})
-                        st.success("Сопоставление сохранено как подтверждённое пользователем.")
-            st.subheader("Готовность к расчёту месяца")
-            st.caption("Полная проверка читает месячные партиции и запускается только явно.")
-            if st.button("Проверить готовность месяца", key="monthly_readiness_check"):
-                with st.spinner("Проверяем индексы и дневные партиции июля…"), measure("factual.build_monthly_data_readiness"):
-                    readiness = build_monthly_data_readiness(registry, model, "2026-07-01", "2026-07-31")
-                st.session_state["monthly_data_readiness"] = readiness
-            readiness = st.session_state.get("monthly_data_readiness")
-            if readiness:
-                c = readiness["coverage"]
-                st.caption(f"Срезы начального размещения: {c['placement_checkpoints']} / {c['placement_checkpoints_required']}")
-                st.caption(f"ВГХ: {c['vgh_covered_sku']} / {c['demanded_sku']} востребованных SKU")
-                if readiness["monthly_replay_ready"]:
-                    render_ui_message({
-                        "severity": "success", "title": "Данные готовы к расчёту месяца",
-                        "reason": "Все обязательные проверки данных пройдены.",
-                        "impact": "Историю размещения можно корректно восстановить за выбранный месяц.",
-                        "action": "Перейдите к расчёту месяца.", "target": "Расчёт месяца",
-                        "next_action_label": "Перейти к расчёту месяца",
-                    })
-                else:
-                    render_ui_message({
-                        "severity": "error", "title": "Расчёт месяца невозможен",
-                        "reason": (f"Срезы размещения: {c['placement_checkpoints']} из "
-                                   f"{c['placement_checkpoints_required']} дней."),
-                        "impact": "Нельзя корректно восстановить историю расположения товаров.",
-                        "action": "Проверьте файл исторического размещения и повторите загрузку.",
-                        "target": "Данные", "next_action_label": "Перейти к загрузке исторического размещения",
-                    })
-                if readiness["monthly_replay_ready"] is not True:
-                    st.markdown("#### Причины блокировки")
-                    for check in readiness.get("diagnostics", {}).get("checks", []):
-                        st.markdown(format_monthly_readiness_check(check))
-                    with st.expander("Техническая диагностика"):
-                        st.json(readiness.get("hard_blockers", []))
+                    _render_import_result(result, uploaded.name)
 
+    st.markdown("### Нужные источники")
+    for card in cards:
+        with st.container(border=True):
+            st.markdown(f"#### {card['title']}")
+            st.markdown(f"**Зачем:** {card['purpose']}")
+            st.markdown(f"""**Текущий файл:** {card['file']}
+
+**Период:** {card['period']}
+
+**Строк:** {card['rows']} · **SKU:** {card['sku']}
+
+**Статус:** {card['status']}""")
+            _render_source_quality(card, cached_readiness)
+            if card["sources"]:
+                with st.expander("Заменить текущий файл"):
+                    replacement = st.file_uploader("Новый файл", type=["xlsx", "xls"], key=f"replace_{card['source_type']}")
+                    st.markdown(f"""**Текущий файл:** {card['file']}
+
+**Новый файл:** {getattr(replacement, 'name', 'не выбран')}
+
+**Что произойдёт:** новый файл станет использоваться в расчётах. Предыдущая версия сохранится в истории.""")
+                    if replacement and st.button("Заменить файл", key=f"replace_confirm_{card['source_type']}"):
+                        try:
+                            result = import_excel_dataset(replacement.getvalue(), replacement.name)
+                        except (OSError, ValueError) as exc:
+                            render_ui_message({"severity": "error", "title": "Не удалось заменить файл", "reason": str(exc), "impact": "Текущий файл продолжает использоваться.", "action": "Исправьте новый файл и повторите замену.", "target": "Загрузка данных"})
+                        else:
+                            _render_import_result(result, replacement.name)
+            else:
+                st.caption("Действие: добавьте файл через общий загрузчик выше.")
+
+    st.markdown("### Проверка готовности")
+    st.markdown("""**Что будет проверено:**
+- наличие обязательных источников;
+- период;
+- срезы размещения;
+- конфликты;
+- покрытие ВГХ.""")
+    if not model:
+        st.info("Для проверки сначала загрузите схему склада.")
+    if st.button("Проверить готовность данных июля", key="monthly_readiness_check", disabled=not bool(model)):
+        with st.spinner("Проверяем данные июля…"), measure("factual.build_monthly_data_readiness"):
+            cached_readiness = build_monthly_data_readiness(registry, model or {}, "2026-07-01", "2026-07-31")
+        st.session_state["monthly_data_readiness"] = cached_readiness
+    if cached_readiness:
+        if cached_readiness.get("monthly_replay_ready"):
+            render_ui_message({"severity": "success", "title": "Данные июля готовы", "reason": "Все обязательные проверки пройдены.", "impact": "Можно перейти к настройке правил размещения.", "action": "Перейдите к правилам размещения.", "target": "Правила размещения"})
+            st.markdown("### Следующий шаг: «Перейти к правилам размещения»")
+        else:
+            blockers = cached_readiness.get("hard_blockers", [])
+            render_ui_message({"severity": "error", "title": "Требуется исправление", "reason": f"Обнаружено проблем: {len(blockers)}.", "impact": "Переход к корректному расчёту пока недоступен.", "action": "Исправьте перечисленные проблемы и повторите проверку.", "target": "Загрузка данных"})
+            st.markdown(f"### Следующий шаг: «Исправить {len(blockers)} проблем»")
+            for check in cached_readiness.get("diagnostics", {}).get("checks", []):
+                if check.get("status") == "fail": st.markdown(format_monthly_readiness_check(check))
+
+    datasets = registry.get("datasets", [])
+    with st.expander("История загруженных файлов"):
+        if not datasets:
+            st.caption("История пока пуста.")
+        for item in sorted(datasets, key=lambda x: x.get("imported_at", ""), reverse=True):
+            state = "используется сейчас" if item.get("active", True) else "предыдущая версия"
+            st.write(f"{item.get('source_file_name', '—')} · {item.get('imported_at', '—')} · {state}")
+    with st.expander("Технические сведения"):
+        st.json([{"dataset_id": item.get("dataset_id"), "hash": item.get("content_hash"), "parser version": item.get("parser_version"), "active": item.get("active"), "logical_source_id": item.get("logical_source_id")} for item in datasets])
 
 def render_monthly_fact_baseline(model: Mapping[str, Any] | None, session_state: Mapping[str, Any]) -> None:
     """Run and inspect persisted July FACT partitions without предлагаемое размещение logic."""
