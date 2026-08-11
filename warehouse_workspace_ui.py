@@ -159,10 +159,10 @@ def format_monthly_readiness_check(check: Mapping[str, Any]) -> str:
     icon = {"pass": "✅", "fail": "❌", "info": "ℹ️"}.get(str(check.get("status")), "ℹ️")
     text = f"{icon} **{check.get('title', check.get('name', 'Проверка'))}**  \n{check.get('details', '')}"
     missing = check.get("missing_dates") or []
-    if check.get("name") == "placement_snapshot" and check.get("status") == "fail":
+    if check.get("name") == "placement_snapshot":
         extra = check.get("extra_dates") or []
         text += (f"  \nОжидаемые даты: {check.get('expected_days', 0)}"
-                 f"  \nИмпортированные даты размещения: {check.get('imported_days', 0)}"
+                 f"  \nОбнаруженные даты: {len(check.get('detected_dates', [])) or check.get('imported_days', 0)}"
                  f"  \nОтсутствующие даты: {', '.join(map(str, missing)) or 'нет'}"
                  f"  \nЛишние даты: {', '.join(map(str, extra)) or 'нет'}")
     elif missing:
