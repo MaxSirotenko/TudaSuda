@@ -1,6 +1,6 @@
 import pytest
 
-from warehouse_ui_messages import MESSAGE_CATALOG, get_ui_message, group_ui_issues
+from warehouse_ui_messages import MESSAGE_CATALOG, get_ui_message, group_ui_issues, render_ui_message
 
 
 @pytest.mark.parametrize("code", [
@@ -26,3 +26,14 @@ def test_unknown_code_has_safe_actionable_fallback():
 def test_repeated_errors_are_grouped():
     group = group_ui_issues("unknown_start_cell", list(range(17)))
     assert group["count"] == 17 and len(group["visible_details"]) == 5 and group["hidden_count"] == 12
+
+
+def test_reusable_message_renders_all_actionable_sections_in_russian():
+    class UI:
+        def error(self, body): self.body = body
+        def caption(self, _body): pass
+
+    ui = UI()
+    render_ui_message(get_ui_message("missing_start"), ui=ui)
+    assert all(label in ui.body for label in ("Статус", "Причина", "Влияние", "Что делать"))
+    assert "Ошибка" in ui.body

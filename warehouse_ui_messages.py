@@ -84,7 +84,10 @@ def render_ui_message(issue: Mapping[str, Any] | str, *, ui: Any = None, show_te
         import streamlit as ui
     item = get_ui_message(issue) if isinstance(issue, str) else dict(issue)
     icon = {"error": "❌", "warning": "⚠️", "info": "ℹ️", "success": "✅"}.get(item.get("severity"), "ℹ️")
+    status = {"error": "Ошибка", "warning": "Предупреждение", "info": "Информация",
+              "success": "Готово"}.get(item.get("severity"), "Информация")
     body = (f"{icon} **{item.get('title', 'Сообщение')}**\n\n"
+            f"**Статус**\n\n{item.get('status', status)}\n\n"
             f"**Причина**\n\n{item.get('reason') or item.get('message', 'Не указана.')}\n\n"
             f"**Влияние**\n\n{item.get('impact', 'Не влияет на обязательные этапы.')}\n\n"
             f"**Что делать**\n\n{item.get('action') or item.get('solution', 'Дополнительные действия не требуются.')}" )
