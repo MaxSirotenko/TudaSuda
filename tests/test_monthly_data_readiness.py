@@ -155,6 +155,37 @@ def test_mixed_excel_placement_dates_preserve_all_july_snapshots(tmp_path):
     assert placement["missing_dates"] == placement["extra_dates"] == []
 
 
+def test_readiness_normalizes_legacy_registry_placement_dates(tmp_path):
+    days = [date(2026, 7, 1) + timedelta(days=i) for i in range(32)]
+    placements = [{"ДатаСреза": day, "Паллета": f"P{i}", "Номенклатура": "N",
+        "Характеристика": "C", "КоличествоОстатокТовара": 1, "Ячейка": "A-01",
+        "ПорядокСборки": 1, "КоличествоОстатокПоложения": 1}
+        for i, day in enumerate(days)]
+    imported = import_excel_dataset(_xlsx(placements), "размещение июль.xlsx", root=tmp_path)
+    registry = load_registry(tmp_path)
+    placement_dataset = next(item for item in registry["datasets"]
+                             if item["dataset_id"] == imported["dataset_id"])
+    placement_dataset["index"]["dates"] = [
+        (day - date(1899, 12, 30)).days if i < 6
+        else f"{day.isoformat()} 00:00:00" if i < 12
+        else pd.Timestamp(day) if i < 20
+        else day.isoformat()
+        for i, day in enumerate(days)
+    ]
+
+    result = build_monthly_data_readiness(registry, {"model_id": "M", "cells": []},
+                                          "2026-07-01", "2026-07-31", root=tmp_path,
+                                          receipts_required=False)
+    placement = next(check for check in result["diagnostics"]["checks"]
+                     if check["name"] == "placement_snapshot")
+
+    assert placement["available_days"] == 32
+    assert placement["detected_dates"] == [day.isoformat() for day in days]
+    assert placement["missing_dates"] == placement["extra_dates"] == []
+    assert not any(blocker["code"] == "missing_placement_snapshot"
+                   for blocker in result["hard_blockers"])
+
+
 def test_blocked_monthly_readiness_exposes_structured_reasons(tmp_path):
     result = build_monthly_data_readiness({}, {"model_id": "M", "cells": []},
                                           "2026-07-01", "2026-07-31", root=tmp_path)
@@ -192,6 +223,6 @@ def test_failed_placement_readiness_formatter_exposes_date_diagnostics():
         "missing_dates": ["2026-07-01"], "extra_dates": ["2026-06-30"],
     })
     assert "Ожидаемые даты: 32" in rendered
-    assert "Импортированные даты размещения: 32" in rendered
+    assert "Обнаруженные даты: 32" in rendered
     assert "Отсутствующие даты: 2026-07-01" in rendered
     assert "Лишние даты: 2026-06-30" in rendered

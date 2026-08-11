@@ -337,6 +337,17 @@ def _day(record: Mapping[str, Any]) -> str | None:
     return normalize_operational_day(value)
 
 
+def _dataset_operational_dates(dataset: Mapping[str, Any]) -> set[str]:
+    """Return canonical days advertised by an imported dataset.
+
+    Registry entries created by earlier parser versions can contain the same
+    Excel day in several representations.  Treat the index as an import
+    boundary too, rather than comparing its raw values with ISO day strings.
+    """
+    values = dataset.get("index", {}).get("dates", dataset.get("partitions", []))
+    return {day for value in values if (day := normalize_operational_day(value))}
+
+
 def _duplicates(raw_records: list[dict[str, Any]]) -> int:
     values = [json.dumps(row["raw"], ensure_ascii=False, sort_keys=True, separators=(",", ":")) for row in raw_records]
     return len(values) - len(set(values))
@@ -885,7 +896,7 @@ def load_effective_rows(source_type: str, day: str | None = None, *, registry: M
     registry = registry or load_registry(root)
     if source_type == "historical_placement":
         candidates = [dataset for dataset in active_datasets(registry, source_type)
-                      if day is None or day in dataset.get("index", {}).get("dates", dataset.get("partitions", []))]
+                      if day is None or normalize_operational_day(day) in _dataset_operational_dates(dataset)]
         if day is not None and len(candidates) > 1:
             conflict = {"code": "multiple_active_placement_sources_for_snapshot", "day": day,
                         "dataset_ids": [item["dataset_id"] for item in candidates]}
@@ -1016,13 +1027,14 @@ def build_monthly_data_readiness(registry: Mapping[str, Any], model: Mapping[str
     blockers: list[dict[str, Any]] = []; warnings: list[dict[str, Any]] = []
     registry_blockers = [d for d in registry.get("diagnostics", []) if d.get("code") == "registry_activation_review_required"]
     if registry_blockers: blockers.append({"code": "registry_activation_review_required", "message": "Требуется подтвердить активную версию источника."})
-    placement_sources = {day: [d for d in active_datasets(registry, "historical_placement")
-        if day in d.get("index", {}).get("dates", d.get("partitions", []))] for day in required_days}
+    placement_datasets = active_datasets(registry, "historical_placement")
+    placement_dates_by_dataset = {str(dataset.get("dataset_id")): _dataset_operational_dates(dataset)
+                                  for dataset in placement_datasets}
+    placement_sources = {day: [dataset for dataset in placement_datasets
+        if day in placement_dates_by_dataset[str(dataset.get("dataset_id"))]] for day in required_days}
     missing = [day for day, sources in placement_sources.items() if not sources]
     overlaps = [day for day, sources in placement_sources.items() if len(sources) > 1]
-    imported_placement_dates = sorted({normalized for dataset in active_datasets(registry, "historical_placement")
-        for raw_day in dataset.get("index", {}).get("dates", dataset.get("partitions", []))
-        if (normalized := normalize_operational_day(raw_day))})
+    imported_placement_dates = sorted({day for dates in placement_dates_by_dataset.values() for day in dates})
     extra_placement_dates = sorted(set(imported_placement_dates) - set(required_days))
     if missing: blockers.append({"code": "missing_placement_snapshot", "dates": missing})
     if overlaps: blockers.append({"code": "multiple_active_placement_sources_for_snapshot", "dates": overlaps})
@@ -1083,6 +1095,7 @@ def build_monthly_data_readiness(registry: Mapping[str, Any], model: Mapping[str
          "available_days": len(required_days) - len(missing),
          "imported_days": len(imported_placement_dates), "missing_dates": missing,
          "extra_dates": extra_placement_dates,
+         "expected_dates": required_days, "detected_dates": imported_placement_dates,
          "details": f"{len(required_days) - len(missing)} / {len(required_days)} дней"},
         {"name": "outbound", "status": "pass" if outbound_ready else "fail", "title": "Расходные ордера",
          "available": bool(outbound_rows), "rows": outbound_count, "documents": outbound_documents,
