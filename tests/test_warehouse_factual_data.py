@@ -10,7 +10,8 @@ import tracemalloc
 import pandas as pd
 
 from warehouse_factual_data import (
-    PARSER_VERSION, cross_source_coverage, date_summary, detect_source_type,
+    AUTHORITATIVE_CONTRACTS, CONTRACT_ALIAS_STATUS, CONTRACTS, LEGACY_CONTRACT_ALIASES, PARSER_VERSION,
+    build_data_contract_diagnostics, cross_source_coverage, date_summary, detect_source_type,
     import_excel_dataset, load_dataset_rows, load_registry, positive_outbound,
     normalize_source_datetime,
 )
@@ -268,9 +269,10 @@ def test_unconfirmed_outbound_names_are_not_authoritative():
     assert detect_source_type(plausible)["source_type"] == "unknown"
 
 
-def test_real_outbound_ro_headers_aliases_and_filename_independence(tmp_path):
-    row = {"РасходныйОрдер": "ref", "НомерРО": "O-1", "ДатаРО": "2026-07-01", "ДеньРО": 1,
-           "Склад": "A", "НомерСтроки": 1, "Номенклатура": "N", "Характеристика": "C", "Количество": 3}
+def test_authoritative_outbound_quantity_wins_and_source_quantity_is_raw_evidence(tmp_path):
+    row = {"СсылкаРО": "ref", "НомерРО": "O-1", "ДатаРО": "2026-07-01", "ДеньРО": 1,
+           "Склад": "A", "НомерСтроки": 1, "Номенклатура": "N", "Характеристика": "C",
+           "Количество": 24, "РасчетноеОтгруженоКоробок": 3, "ПорядокСборки": 7}
     detected = detect_source_type(row)
     assert detected["source_type"] == "outbound"
     assert detected["mapping"]["document_number"] == "НомерРО"
@@ -280,21 +282,49 @@ def test_real_outbound_ro_headers_aliases_and_filename_independence(tmp_path):
     assert result["source_label"] == "Расходные ордера"
     assert result["period_from"] == result["period_to"] == "2026-07-01"
     assert load_dataset_rows(result, raw=True)[0]["raw"]["НомерРО"] == "O-1"
+    canonical = load_dataset_rows(result)[0]
+    assert canonical["quantity"] == 3
+    assert canonical["source_line_quantity_raw"] == 24
 
 
-def test_normalized_outbound_headers_are_detected():
+def test_broad_outbound_aliases_are_not_authoritative():
     headers = ["РасходныйОрдер", "Номер", "Дата", "Номенклатура", "Характеристика", "Количество"]
-    assert detect_source_type(headers)["source_type"] == "outbound"
-
-    conflict = headers + ["КоличествоКоробовВОдномСлоеНаПаллете", "КоличествоСлоевНаПаллете"]
-    detected = detect_source_type(conflict)
-    assert detected["status"] == "ambiguous_schema"
-    assert detected["source_type"] == "unknown"
-    assert detected["matches"] == ["outbound", "vgh"]
+    assert detect_source_type(headers)["source_type"] == "unknown"
 
 
 def test_outbound_shape_without_document_identity_returns_targeted_diagnostic():
-    detected = detect_source_type(["Номенклатура", "Характеристика", "Количество"])
+    detected = detect_source_type(["Номенклатура", "Характеристика", "РасчетноеОтгруженоКоробок"])
     assert detected["source_type"] == "unknown"
     assert detected["diagnostic_code"] == "outbound_document_identity_missing"
-    assert detected["diagnostic_missing"] == ["РасходныйОрдер или Номер + Дата"]
+    assert detected["diagnostic_missing"] == ["СсылкаРО или НомерРО + ДатаРО"]
+
+
+def test_contract_alias_classification_is_explicit_and_outbound_has_no_legacy_aliases():
+    assert AUTHORITATIVE_CONTRACTS["outbound"]["quantity"] == ("РасчетноеОтгруженоКоробок",)
+    assert "outbound" not in LEGACY_CONTRACT_ALIASES
+    assert CONTRACTS["outbound"] == AUTHORITATIVE_CONTRACTS["outbound"]
+    assert set(CONTRACTS) == {"historical_placement", "outbound", "receipts", "inventory", "vgh"}
+    for source, fields in CONTRACTS.items():
+        assert {alias for aliases in fields.values() for alias in aliases} == set(CONTRACT_ALIAS_STATUS[source])
+        assert set(CONTRACT_ALIAS_STATUS[source].values()) <= {"authoritative", "legacy_compatibility"}
+
+
+def test_filename_variant_is_diagnosed_as_overlapping_active_source(tmp_path):
+    first = import_excel_dataset(_xlsx([_outbound(1)]), "РО июль.xlsx", root=tmp_path)
+    second = import_excel_dataset(_xlsx([_outbound(2)]), "РО июль(1).xlsx", root=tmp_path)
+    diagnostics = build_data_contract_diagnostics(load_registry(tmp_path), root=tmp_path)
+    rows = {row["dataset_id"]: row for row in diagnostics["datasets"]}
+    assert first["logical_source_id"] != second["logical_source_id"]
+    assert rows[first["dataset_id"]]["overlapping_active_sources"][0]["source_filename"] == "РО июль(1).xlsx"
+    assert rows[first["dataset_id"]]["conflicting_business_keys"] == 1
+    occurrences = rows[first["dataset_id"]]["conflict_preview"][0]["occurrences"]
+    assert {(item["source_file_name"], item["source_row"]) for item in occurrences} == {
+        ("РО июль.xlsx", 2), ("РО июль(1).xlsx", 2)}
+
+
+def test_vgh_business_key_keeps_characteristics_distinct(tmp_path):
+    rows = [{"Номенклатура": "N", "Характеристика": value,
+             "КоличествоКоробовВОдномСлоеНаПаллете": 2, "КоличествоСлоевНаПаллете": 3}
+            for value in ("Красный", "Синий")]
+    imported = import_excel_dataset(_xlsx(rows), "ВГХ.xlsx", root=tmp_path)
+    assert len({row["sku_key"] for row in load_dataset_rows(imported)}) == 2

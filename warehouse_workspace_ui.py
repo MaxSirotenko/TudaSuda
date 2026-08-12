@@ -22,7 +22,7 @@ from warehouse_scenario_comparison_ui import build_scenario_rule_config
 from warehouse_ui_messages import get_ui_message, render_ui_message
 from warehouse_workflow_ui_state import state_from_session
 from warehouse_factual_data import (
-    SOURCE_LABELS, activate_dataset_version, active_datasets, build_monthly_data_readiness,
+    SOURCE_LABELS, activate_dataset_version, active_datasets, build_data_contract_diagnostics, build_monthly_data_readiness,
     cross_source_coverage, date_summary, import_excel_dataset, load_effective_placement, load_registry,
     save_historical_cell_mapping,
 )
@@ -179,6 +179,10 @@ READINESS_BLOCKER_PRESENTATION: dict[str, tuple[str, str]] = {
     "registry_activation_review_required": (
         "Не подтверждена активная версия файлов",
         "Откройте историю загрузок и подтвердите версию источника, которая должна использоваться в расчёте.",
+    ),
+    "parser_reimport_required": (
+        "Файлы разобраны старой версией parser",
+        "Повторно импортируйте уже сохранённые исходные Excel; новая выгрузка из 1С не требуется.",
     ),
     "missing_placement_snapshot": (
         "Не хватает срезов размещения",
@@ -629,6 +633,16 @@ def render_factual_data_layer(model: Mapping[str, Any] | None) -> None:
             st.write(f"{item.get('source_file_name', '—')} · {item.get('imported_at', '—')} · {state}")
     with st.expander("Технические сведения"):
         st.json([{"dataset_id": item.get("dataset_id"), "hash": item.get("content_hash"), "parser version": item.get("parser_version"), "active": item.get("active"), "logical_source_id": item.get("logical_source_id")} for item in datasets])
+    with st.expander("Диагностика Data Contract"):
+        st.caption("Проверка только читает metadata и компактные business indexes; registry и исходные данные не изменяются.")
+        if st.button("Построить диагностику", key="factual_contract_diagnostics"):
+            with st.spinner("Читаем metadata и компактные indexes…"):
+                st.session_state["factual_contract_diagnostics_result"] = build_data_contract_diagnostics(registry)
+        contract_diagnostics = st.session_state.get("factual_contract_diagnostics_result")
+        if contract_diagnostics:
+            if contract_diagnostics["requires_reimport"]:
+                st.error("Есть активные artifacts старой версии parser. Повторно импортируйте исходные Excel без новой выгрузки из 1С.")
+            st.json(contract_diagnostics)
 
 def render_monthly_fact_baseline(model: Mapping[str, Any] | None, session_state: Mapping[str, Any]) -> None:
     """Run and inspect persisted July FACT partitions without предлагаемое размещение logic."""

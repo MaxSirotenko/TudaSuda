@@ -28,7 +28,7 @@ from warehouse_perf_diagnostics import measure, profiled, record_artifact_read
 
 from warehouse_business_identity import build_canonical_sku_identity, find_canonical_identity_collisions
 
-PARSER_VERSION = "factual-july-v4"
+PARSER_VERSION = "factual-july-v5"
 DATA_ROOT = Path("data/last_import/factual")
 REGISTRY_PATH = DATA_ROOT / "registry.json"
 UNKNOWN_SOURCE = "unknown"
@@ -41,8 +41,11 @@ SOURCE_LABELS = {
     UNKNOWN_SOURCE: "Неизвестный тип файла",
 }
 
-# Contracts contain only fields confirmed in the task or existing importers.
-CONTRACTS: dict[str, dict[str, tuple[str, ...]]] = {
+# Authoritative aliases are deliberately reviewable and immutable by accident:
+# each spelling below is present in the audited contract document and a real
+# project export or checked-in 1C query.  Compatibility aliases are kept in a
+# separate table so a synthetic fixture cannot promote one to source authority.
+AUTHORITATIVE_CONTRACTS: dict[str, dict[str, tuple[str, ...]]] = {
     "historical_placement": {
         "snapshot_at": ("ДатаСреза",), "source_pallet_ref": ("Паллета",),
         "nomenclature": ("Номенклатура",), "characteristic": ("Характеристика",),
@@ -51,16 +54,16 @@ CONTRACTS: dict[str, dict[str, tuple[str, ...]]] = {
         "source_position_balance": ("КоличествоОстатокПоложения",),
     },
     "inventory": {
-        "inventory_ref": ("Ссылка", "Инвентаризация", "СсылкаИнвентаризации"),
-        "inventory_number": ("НомерИнвентаризации", "Номер"),
-        "occurred_at": ("ДатаИнвентаризации", "Дата"), "line_number": ("НомерСтроки",),
+        "inventory_ref": ("Ссылка",),
+        "inventory_number": ("Номер",),
+        "occurred_at": ("Дата",), "line_number": ("НомерСтроки",),
         "warehouse": ("Склад",), "nomenclature": ("Номенклатура",),
-        "characteristic": ("Характеристика",), "actual_quantity": ("КоличествоФакт", "ФактическоеКоличество"),
-        "accounting_quantity": ("КоличествоУчет", "УчетноеКоличество"),
+        "characteristic": ("Характеристика",), "actual_quantity": ("КоличествоФакт",),
+        "accounting_quantity": ("КоличествоУчет",),
     },
     "receipts": {
-        "document_ref": ("Ссылка", "СсылкаПриходногоОрдера"), "document_number": ("Номер", "НомерПриходногоОрдера"),
-        "occurred_at": ("Дата", "ДатаПриходногоОрдера"), "warehouse": ("Склад",),
+        "document_ref": ("Ссылка",), "document_number": ("Номер",),
+        "occurred_at": ("Дата",), "warehouse": ("Склад",),
         "line_number": ("НомерСтроки",), "nomenclature": ("Номенклатура",),
         "characteristic": ("Характеристика",), "box_quantity": ("КоличествоКоробок",),
         "reported_pallets": ("КоличествоПаллет",),
@@ -68,12 +71,12 @@ CONTRACTS: dict[str, dict[str, tuple[str, ...]]] = {
         "expected_receipt": ("ОжидаемыйПриход",),
     },
     "outbound": {
-        "document_ref": ("РасходныйОрдер", "СсылкаРО"),
-        "document_number": ("Номер", "НомерРО"),
-        "occurred_at": ("Дата", "ДатаРО"), "warehouse": ("Склад",),
+        "document_ref": ("СсылкаРО",),
+        "document_number": ("НомерРО",),
+        "occurred_at": ("ДатаРО",), "warehouse": ("Склад",),
         "line_number": ("НомерСтроки",), "nomenclature": ("Номенклатура",),
         "characteristic": ("Характеристика",),
-        "quantity": ("Количество", "РасчетноеОтгруженоКоробок"),
+        "quantity": ("РасчетноеОтгруженоКоробок",),
         "source_pick_order": ("ПорядокСборки",),
     },
     "vgh": {
@@ -84,6 +87,35 @@ CONTRACTS: dict[str, dict[str, tuple[str, ...]]] = {
         "quantity_per_box": ("КоличествоВКоробке",),
     },
 }
+LEGACY_CONTRACT_ALIASES: dict[str, dict[str, tuple[str, ...]]] = {
+    "inventory": {
+        "inventory_ref": ("Инвентаризация", "СсылкаИнвентаризации"),
+        "inventory_number": ("НомерИнвентаризации",), "occurred_at": ("ДатаИнвентаризации",),
+        "actual_quantity": ("ФактическоеКоличество",), "accounting_quantity": ("УчетноеКоличество",),
+    },
+    "receipts": {
+        "document_ref": ("СсылкаПриходногоОрдера",), "document_number": ("НомерПриходногоОрдера",),
+        "occurred_at": ("ДатаПриходногоОрдера",),
+    },
+}
+
+
+def _executable_contracts() -> dict[str, dict[str, tuple[str, ...]]]:
+    result = {source: dict(fields) for source, fields in AUTHORITATIVE_CONTRACTS.items()}
+    for source, fields in LEGACY_CONTRACT_ALIASES.items():
+        for field, aliases in fields.items():
+            result[source][field] = result[source].get(field, ()) + aliases
+    return result
+
+
+CONTRACTS = _executable_contracts()
+CONTRACT_ALIAS_STATUS = {
+    source: {alias: "authoritative" for aliases in fields.values() for alias in aliases}
+    for source, fields in AUTHORITATIVE_CONTRACTS.items()
+}
+for _source, _fields in LEGACY_CONTRACT_ALIASES.items():
+    CONTRACT_ALIAS_STATUS.setdefault(_source, {}).update(
+        {alias: "legacy_compatibility" for aliases in _fields.values() for alias in aliases})
 # Each accepted spelling is traceable to the task's confirmed exports or to a
 # checked-in 1C query.  Keeping the evidence beside the executable contract
 # prevents a synthetic fixture from silently becoming source authority.
@@ -252,7 +284,7 @@ def detect_source_type(columns: Iterable[Any]) -> dict[str, Any]:
         diagnostic_code = "outbound_document_identity_missing"
         diagnostic_found = [outbound_mapping[field] for field in ("nomenclature", "characteristic", "quantity", "occurred_at")
                             if field in outbound_mapping]
-        diagnostic_missing = ["РасходныйОрдер или Номер + Дата"]
+        diagnostic_missing = ["СсылкаРО или НомерРО + ДатаРО"]
     if source_type == UNKNOWN_SOURCE and not matches and diagnostic_code is None:
         # Family signatures are exact, confirmed source fields, not fuzzy
         # aliases.  They allow a useful mapping_required diagnostic without
@@ -309,6 +341,11 @@ def _canonical_record(raw: Mapping[str, Any], mapping: Mapping[str, str], proven
             record[field + "_raw"] = _json_value(value)
         else:
             record[field] = _json_value(value)
+    # The mass RO query intentionally exports both the source line quantity and
+    # calculated shipped boxes.  Keep the former as control evidence, never as
+    # canonical factual quantity.
+    if provenance["source_type"] == "outbound" and "Количество" in raw:
+        record["source_line_quantity_raw"] = _json_value(raw.get("Количество"))
     if provenance["source_type"] == "vgh":
         a, b = record.get("boxes_per_layer"), record.get("layers_per_pallet")
         record["source_boxes_per_pallet"] = a * b if isinstance(a, (int, float)) and isinstance(b, (int, float)) else None
@@ -491,7 +528,9 @@ def logical_source_identity(source_type: str, filename: str, sheet: str) -> str:
 def active_datasets(registry: Mapping[str, Any], source_type: str | None = None) -> list[dict[str, Any]]:
     """The single business-query boundary for lifecycle filtering."""
     return [item for item in registry.get("datasets", [])
-            if item.get("active", True) and (source_type is None or item.get("source_type") == source_type)]
+            if item.get("active", True)
+            and (not item.get("parser_version") or item.get("parser_version") == PARSER_VERSION)
+            and (source_type is None or item.get("source_type") == source_type)]
 
 
 def _import_excel_dataset_buffered(data: bytes, filename: str, *, sheet: str | None = None, root: Path = DATA_ROOT,
@@ -967,6 +1006,56 @@ def _readiness_source_conflicts(registry: Mapping[str, Any], source_type: str,
             pass
 
 
+def build_data_contract_diagnostics(registry: Mapping[str, Any], *, root: Path = DATA_ROOT,
+                                    preview_limit: int = 10) -> dict[str, Any]:
+    """Build read-only diagnostics from registry metadata and compact indexes."""
+    datasets = [dict(item) for item in registry.get("datasets", [])]
+    active = [item for item in datasets if item.get("active", True)]
+    analyses = {source: _readiness_source_conflicts(registry, source, preview_limit=preview_limit)
+                for source in BUSINESS_KEYS}
+    overlaps: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for index, left in enumerate(active):
+        for right in active[index + 1:]:
+            if left.get("source_type") != right.get("source_type"):
+                continue
+            dates = sorted(_dataset_operational_dates(left) & _dataset_operational_dates(right))
+            keys = set(left.get("index", {}).get("document_keys", [])) & set(right.get("index", {}).get("document_keys", []))
+            if not dates and not keys:
+                continue
+            for current, other in ((left, right), (right, left)):
+                overlaps[str(current.get("dataset_id"))].append({
+                    "dataset_id": other.get("dataset_id"), "source_filename": other.get("source_file_name"),
+                    "period_from": other.get("period_from"), "period_to": other.get("period_to"),
+                    "overlapping_dates": dates, "overlapping_document_keys": len(keys)})
+    rows = []
+    for item in datasets:
+        source = str(item.get("source_type", UNKNOWN_SOURCE))
+        analysis = analyses.get(source, {"duplicate_count": 0, "conflict_count": 0, "preview": []})
+        compatible = not item.get("parser_version") or item.get("parser_version") == PARSER_VERSION
+        warnings = list(item.get("warnings", [])); errors = list(item.get("errors", []))
+        if item.get("active", True) and not compatible: errors.append("parser_reimport_required")
+        if overlaps.get(str(item.get("dataset_id"))): warnings.append("overlapping_active_sources")
+        rows.append({"source_type": source, "source_filename": item.get("source_file_name"),
+            "sheet": item.get("sheet"), "parser_version": item.get("parser_version"),
+            "current_parser_version": PARSER_VERSION, "parser_compatible": compatible,
+            "dataset_id": item.get("dataset_id"), "logical_source_id": item.get("logical_source_id"),
+            "active": bool(item.get("active", True)), "superseded_by": item.get("superseded_by"),
+            "detected_source_columns": item.get("detected_columns", []),
+            "canonical_mapping": item.get("mapping", {}), "rows": int(item.get("rows", 0) or 0),
+            "period_from": item.get("period_from"), "period_to": item.get("period_to"),
+            "unique_sku": int(item.get("unique_sku", 0) or 0),
+            "documents": len(item.get("index", {}).get("document_keys", [])),
+            "duplicate_business_keys": analysis["duplicate_count"] if item.get("active", True) else 0,
+            "conflicting_business_keys": analysis["conflict_count"] if item.get("active", True) else 0,
+            "conflict_preview": analysis["preview"] if item.get("active", True) else [],
+            "overlapping_active_sources": overlaps.get(str(item.get("dataset_id")), []),
+            "mapping_status": item.get("mapping_status", "unknown"),
+            "warnings": sorted(set(warnings)), "errors": sorted(set(errors))})
+    return {"parser_version": PARSER_VERSION, "datasets": rows,
+            "requires_reimport": [row["dataset_id"] for row in rows if row["active"] and not row["parser_compatible"]],
+            "read_only": True}
+
+
 @profiled("factual.load_effective_rows")
 def load_effective_rows(source_type: str, day: str | None = None, *, registry: Mapping[str, Any] | None = None,
                         root: Path = DATA_ROOT, strict: bool = True) -> dict[str, Any]:
@@ -1107,6 +1196,13 @@ def build_monthly_data_readiness(registry: Mapping[str, Any], model: Mapping[str
     blockers: list[dict[str, Any]] = []; warnings: list[dict[str, Any]] = []
     registry_blockers = [d for d in registry.get("diagnostics", []) if d.get("code") == "registry_activation_review_required"]
     if registry_blockers: blockers.append({"code": "registry_activation_review_required", "message": "Требуется подтвердить активную версию источника."})
+    obsolete_active = [item for item in registry.get("datasets", []) if item.get("active", True)
+                       and item.get("parser_version") and item.get("parser_version") != PARSER_VERSION]
+    if obsolete_active:
+        blockers.append({"code": "parser_reimport_required",
+            "message": "Сохранённые factual artifacts созданы несовместимой версией parser; повторно импортируйте исходные Excel.",
+            "datasets": [{"dataset_id": item.get("dataset_id"), "source_filename": item.get("source_file_name"),
+                          "parser_version": item.get("parser_version")} for item in obsolete_active]})
     placement_datasets = active_datasets(registry, "historical_placement")
     placement_dates_by_dataset = {str(dataset.get("dataset_id")): _dataset_operational_dates(dataset)
                                   for dataset in placement_datasets}
@@ -1178,7 +1274,7 @@ def build_monthly_data_readiness(registry: Mapping[str, Any], model: Mapping[str
     receipts_ready = (not receipts_required or bool(set(required_days[:-1]) & receipt_dates)) and not analyses["receipts"]["conflict_count"]
     vgh_ready = not missing_vgh and not analyses["vgh"]["conflict_count"]
     cell_ready = not unresolved_demand and bool(route_checks)
-    registry_ready = not registry_blockers
+    registry_ready = not registry_blockers and not obsolete_active
     period_days = set(required_days[:-1])
 
     def source_counts(source_type: str) -> tuple[int, int]:
@@ -1218,6 +1314,9 @@ def build_monthly_data_readiness(registry: Mapping[str, Any], model: Mapping[str
         {"name": "inventory", "status": "pass" if inventory_rows else "info", "title": "Инвентаризация",
          "available": bool(inventory_rows), "rows": inventory_rows, "documents": inventory_documents,
          "details": f"{inventory_rows} строк · {inventory_documents} документов" if inventory_rows else "отсутствует (не блокирует replay)"},
+        {"name": "parser_compatibility", "status": "fail" if obsolete_active else "pass",
+         "title": "Версия parser", "datasets": len(obsolete_active),
+         "details": "требуется reimport/reparse исходных Excel" if obsolete_active else PARSER_VERSION},
     ]
     return {"monthly_replay_ready": not blockers, "period_from": period_from, "period_to": period_to,
         "control_endpoint": required_days[-1], "placement_ready": placement_ready, "outbound_ready": outbound_ready,
