@@ -112,7 +112,24 @@ def test_demand_relevant_resolution_can_be_ready_below_overall_coverage():
     assert ready["overall_cell_coverage"] == {"resolved": 1, "total": 2}
     assert ready["demand_relevant_cell_coverage"] == {"resolved": 1, "total": 1}
     assert ready["fact_route_ready"]
-    assert not build_fact_route_readiness(rows, {"unused"}, {"A-key"})["fact_route_ready"]
+    unresolved = build_fact_route_readiness(rows, {"unused"}, {"A-key"})
+    assert not unresolved["fact_route_ready"]
+    assert unresolved["demand_relevant_unresolved_cells"] == ["B"]
+
+
+def test_monthly_readiness_exposes_unresolved_cell_addresses(tmp_path):
+    model = _ready_route_inputs(tmp_path)
+    model["cells"][0]["source_cell"] = "OTHER"
+
+    result = build_monthly_data_readiness(
+        load_registry(tmp_path), model, "2026-07-01", "2026-07-31", root=tmp_path
+    )
+    blocker = next(item for item in result["hard_blockers"]
+                   if item["code"] == "historical_cell_unresolved")
+
+    assert blocker["demand_relevant_cells"] == 1
+    assert blocker["unique_source_cells"] == 1
+    assert blocker["source_cell_preview"] == ["A-01"]
 
 
 def test_complete_july_monthly_readiness_contract(tmp_path):

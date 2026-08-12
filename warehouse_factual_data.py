@@ -1084,10 +1084,12 @@ def build_fact_route_readiness(placement_rows: Iterable[Mapping[str, Any]], dema
     demand_resolved = {str(r.get("source_cell") or r.get("cell")) for r in demand_rows
                        if r.get("resolved_geometry_cell_key") in usable}
     ambiguous = {str(r.get("source_cell") or r.get("cell")) for r in rows if r.get("cell_resolution_status") == "ambiguous"}
+    demand_unresolved = demand_cells - demand_resolved
     return {"placement_rows": len(rows), "unique_factual_cells": len(cells), "resolved_cells": len(resolved),
         "unresolved_cells": len(cells - resolved), "ambiguous_cells": len(ambiguous),
         "overall_cell_coverage": {"resolved": len(resolved), "total": len(cells)},
         "demand_relevant_cell_coverage": {"resolved": len(demand_resolved), "total": len(demand_cells)},
+        "demand_relevant_unresolved_cells": sorted(demand_unresolved),
         "resolved_row_sku_coverage": {"resolved": sum(bool(r.get("resolved_geometry_cell_key")) for r in rows), "total": len(rows)},
         "cells_without_usable_access_node": sorted({str(r.get("resolved_geometry_cell_key")) for r in demand_rows
             if r.get("resolved_geometry_cell_key") and r.get("resolved_geometry_cell_key") not in usable}),
@@ -1161,7 +1163,13 @@ def build_monthly_data_readiness(registry: Mapping[str, Any], model: Mapping[str
                 placement = load_effective_placement(day, model, registry=registry, root=root, strict=False)
                 route_checks.append(build_fact_route_readiness(placement["rows"], demanded_sku_by_day[day], usable))
     unresolved_demand = sum(x["demand_relevant_cell_coverage"]["total"] - x["demand_relevant_cell_coverage"]["resolved"] for x in route_checks)
-    if unresolved_demand: blockers.append({"code": "historical_cell_unresolved", "demand_relevant_cells": unresolved_demand})
+    unresolved_demand_cells = sorted({cell for check in route_checks
+                                      for cell in check.get("demand_relevant_unresolved_cells", [])})
+    if unresolved_demand:
+        blockers.append({"code": "historical_cell_unresolved",
+                         "demand_relevant_cells": unresolved_demand,
+                         "unique_source_cells": len(unresolved_demand_cells),
+                         "source_cell_preview": unresolved_demand_cells[:20]})
     active_signature = _fingerprint(sorted(d["dataset_id"] for d in active_datasets(registry)))
     mapping_signature = _fingerprint(load_cell_mappings(root))
     source_conflict_count = sum(x["conflict_count"] for x in analyses.values()) + len(overlaps)

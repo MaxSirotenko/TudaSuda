@@ -172,6 +172,90 @@ def format_monthly_readiness_check(check: Mapping[str, Any]) -> str:
     return text
 
 
+READINESS_BLOCKER_PRESENTATION: dict[str, tuple[str, str]] = {
+    "registry_activation_review_required": (
+        "Не подтверждена активная версия файлов",
+        "Откройте историю загрузок и подтвердите версию источника, которая должна использоваться в расчёте.",
+    ),
+    "missing_placement_snapshot": (
+        "Не хватает срезов размещения",
+        "Загрузите срезы размещения за указанные даты и повторите проверку.",
+    ),
+    "multiple_active_placement_sources_for_snapshot": (
+        "На одну дату найдено несколько активных срезов",
+        "Оставьте одну активную версию размещения для каждой даты.",
+    ),
+    "conflicting_factual_business_key": (
+        "В источнике найдены противоречащие записи",
+        "Проверьте активные версии источника и устраните конфликтующие строки.",
+    ),
+    "outbound_not_available": (
+        "Не найдены расходные ордера",
+        "Загрузите расходные ордера с положительным спросом за проверяемый месяц.",
+    ),
+    "receipts_not_available": (
+        "Не найдены приходы",
+        "Загрузите приходы за проверяемый месяц и повторите проверку.",
+    ),
+    "historical_cell_unresolved": (
+        "Исторические ячейки не сопоставлены с моделью склада",
+        "Проверьте указанные адреса в модели: добавьте отсутствующие ячейки или устраните неоднозначность.",
+    ),
+}
+
+_FACTUAL_SOURCE_LABELS = {
+    "historical_placement": "размещение",
+    "outbound": "расходные ордера",
+    "receipts": "приходы",
+    "inventory": "инвентаризация",
+    "vgh": "ВГХ",
+}
+
+
+def monthly_readiness_blocker_details(blocker: Mapping[str, Any]) -> dict[str, str]:
+    """Translate one hard blocker into an actionable, non-technical explanation."""
+    code = str(blocker.get("code") or "unknown")
+    title, action = READINESS_BLOCKER_PRESENTATION.get(
+        code,
+        ("Неизвестная блокировка готовности",
+         "Откройте технические сведения и передайте код блокировки разработчику."),
+    )
+    facts: list[str] = []
+    dates = blocker.get("dates") or []
+    if dates:
+        facts.append(f"Даты: {', '.join(map(str, dates))}.")
+    if code == "conflicting_factual_business_key":
+        source = _FACTUAL_SOURCE_LABELS.get(str(blocker.get("source_type")), str(blocker.get("source_type") or "источник"))
+        facts.append(f"Источник: {source}. Конфликтов: {int(blocker.get('count') or 0)}.")
+    elif code == "historical_cell_unresolved":
+        unique_count = blocker.get("unique_source_cells")
+        occurrences = blocker.get("demand_relevant_cells")
+        if isinstance(unique_count, int):
+            facts.append(f"Уникальных адресов: {unique_count}.")
+        if isinstance(occurrences, int):
+            facts.append(f"Повторений адресов по дням: {occurrences}.")
+        preview = blocker.get("source_cell_preview") or []
+        if preview:
+            samples = ", ".join(f"`{str(value).replace('`', '´')}`" for value in preview)
+            facts.append(f"Примеры: {samples}.")
+    message = str(blocker.get("message") or "").strip()
+    if message and not facts:
+        facts.append(message)
+    if code not in READINESS_BLOCKER_PRESENTATION:
+        facts.append(f"Технический код: `{code.replace('`', '´')}`.")
+    return {"code": code, "title": title, "details": " ".join(facts), "action": action}
+
+
+def format_monthly_readiness_blocker(blocker: Mapping[str, Any]) -> str:
+    """Format one hard blocker so it can never disappear behind the generic banner."""
+    item = monthly_readiness_blocker_details(blocker)
+    text = f"❌ **{item['title']}**"
+    if item["details"]:
+        text += f"  \n{item['details']}"
+    text += f"  \nЧто сделать: {item['action']}"
+    return text
+
+
 MONTHLY_ROUTE_REQUIRED_SOURCES = {"historical_placement", "outbound", "receipts"}
 
 
@@ -517,6 +601,10 @@ def render_factual_data_layer(model: Mapping[str, Any] | None) -> None:
             blockers = cached_readiness.get("hard_blockers", [])
             render_ui_message({"severity": "error", "title": "Требуется исправление", "reason": f"Обнаружено проблем: {len(blockers)}.", "impact": "Переход к корректному расчёту пока недоступен.", "action": "Исправьте перечисленные проблемы и повторите проверку.", "target": "Загрузка данных"})
             st.markdown(f"### Следующий шаг: «Исправить {len(blockers)} проблем»")
+            if blockers:
+                st.markdown("#### Причины блокировки")
+                for blocker in blockers:
+                    st.markdown(format_monthly_readiness_blocker(blocker))
             for check in cached_readiness.get("diagnostics", {}).get("checks", []):
                 if check.get("status") == "fail": st.markdown(format_monthly_readiness_check(check))
 
@@ -540,15 +628,23 @@ def render_monthly_fact_baseline(model: Mapping[str, Any] | None, session_state:
     if readiness is None:
         st.info("Перед фактическим расчётом проверьте готовность месяца в разделе «Данные»."); return
     if readiness.get("monthly_replay_ready") is not True:
-        failed = next((check for check in readiness.get("checks", []) if check.get("status") == "fail"), {})
+        blockers = readiness.get("hard_blockers", [])
+        blocker = monthly_readiness_blocker_details(blockers[0]) if blockers else {}
+        failed = next((check for check in readiness.get("diagnostics", {}).get("checks", [])
+                       if check.get("status") == "fail"), {})
+        reason = blocker.get("title") or failed.get("details") or "Обязательная проверка данных не пройдена."
+        if blocker.get("details"):
+            reason += f" {blocker['details']}"
         render_ui_message({
             "severity": "error", "title": "Расчёт месяца невозможен",
-            "reason": failed.get("details") or "Обязательная проверка данных не пройдена.",
+            "reason": reason,
             "impact": "Нельзя достоверно построить маршруты и сравнить результат за весь месяц.",
-            "action": "1. Проверьте указанный исходный файл.\n2. Добавьте отсутствующие даты или строки.\n3. Повторите импорт и проверку качества данных.",
+            "action": blocker.get("action") or "Исправьте ошибки качества данных и повторите проверку месяца.",
             "target": "Данные", "next_action_label": "Исправить ошибки качества данных",
-            "technical_code": "monthly_data_not_ready",
+            "technical_code": blocker.get("code") or "monthly_data_not_ready",
         })
+        for item in blockers:
+            st.markdown(format_monthly_readiness_blocker(item))
         return
     st.success("Слой фактических данных готов")
     gate_state = session_state.get("workspace_gate_state")
