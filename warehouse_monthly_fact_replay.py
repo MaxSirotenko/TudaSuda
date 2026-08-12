@@ -8,6 +8,8 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
+import tempfile
 from collections import defaultdict
 from collections.abc import Callable, Mapping
 from datetime import date, timedelta
@@ -21,7 +23,8 @@ from warehouse_factual_data import (
 from warehouse_physical_graph import build_physical_warehouse_graph
 from warehouse_simulation_outbound_replay import replay_factual_orders_on_graph
 
-REPLAY_VERSION = "monthly-fact-v1"
+LEGACY_REPLAY_VERSION = "monthly-fact-v1"
+REPLAY_VERSION = "monthly-fact-v2"
 LIMITATIONS = [
     "intraday_receipts_are_evidence_not_stock_mutation",
     "inventory_documents_are_validation_evidence_not_state_mutation",
@@ -34,6 +37,37 @@ LIMITATIONS = [
 
 def _canonical(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _atomic_json(path: Path, value: Any) -> None:
+    """Publish JSON in one replace operation (also safe on Windows)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as stream:
+            stream.write(_canonical(value)); stream.flush(); os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        try: os.unlink(temporary)
+        except FileNotFoundError: pass
+
+
+def _read_json(path: Path) -> dict[str, Any] | None:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else None
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+
+
+def _day_digest(value: Mapping[str, Any]) -> str:
+    return "sha256:" + hashlib.sha256(_canonical(value).encode("utf-8")).hexdigest()
+
+
+def _day_totals(day: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: day.get(key) for key in ("status", "orders_total", "orders_strict", "requested_boxes",
+        "picked_boxes", "shortage_boxes", "picker_distance_m", "source_location_ambiguity_count",
+        "unroutable_cell_count", "missing_opening_sku_count")}
 
 
 def monthly_fact_input_signature(*, active_dataset_signature: Any, cell_mapping_signature: Any,
@@ -189,37 +223,59 @@ def replay_monthly_fact(model: dict[str, Any], gate_state: dict[str, Any], perio
             "shortage_boxes": 0, "fact_picker_distance_m": None, "strict_fact_picker_distance_m": 0,
             "route_order_coverage": 0.0, "source_location_ambiguity_count": 0,
             "unresolved_fact_cell_count": 0, "daily_results": [], "blockers": blockers}
-    start, end = date.fromisoformat(period_from), date.fromisoformat(period_to); days = []
+    start, end = date.fromisoformat(period_from), date.fromisoformat(period_to)
     total_days = (end-start).days+1
+    destination = root / "monthly_fact" / signature.replace(":", "_")
+    manifest_path = destination / "manifest.json"
+    manifest = _read_json(manifest_path) if persist else None
+    if not manifest or manifest.get("format_version") != REPLAY_VERSION or manifest.get("input_signature") != signature:
+        manifest = {**base, "format_version": REPLAY_VERSION, "status": "in_progress",
+            "days_total": total_days, "days": {}}
+        if persist: _atomic_json(manifest_path, manifest)
     for index in range(total_days):
         day = (start+timedelta(days=index)).isoformat(); tomorrow = (start+timedelta(days=index+1)).isoformat()
+        filename = f"day={day}.json"; checkpoint = destination / filename
+        entry = manifest["days"].get(day) or {}
+        saved = _read_json(checkpoint) if persist and entry.get("status") == "complete" else None
+        if (saved is not None and saved.get("format_version") == REPLAY_VERSION and
+                saved.get("input_signature") == signature and saved.get("operational_day") == day and
+                entry.get("digest") == _day_digest(saved)):
+            if progress_callback: progress_callback({"phase": "day_skipped", "day_index": index+1,
+                "days_total": total_days, "operational_day": day, "orders_processed": saved.get("orders_total", 0)})
+            continue
         if progress_callback: progress_callback({"phase": "day_started", "day_index": index+1, "days_total": total_days, "operational_day": day})
         result = _replay_day(day, load_effective_placement(day, model, registry=registry, root=root, strict=False),
             load_effective_rows("outbound", day, registry=registry, root=root, strict=False),
             load_effective_placement(tomorrow, model, registry=registry, root=root, strict=False), model, graph)
-        days.append(result)
+        result.update(format_version=REPLAY_VERSION, input_signature=signature)
+        if persist:
+            _atomic_json(checkpoint, result)
+        manifest["days"][day] = {"status": "complete", "artifact": filename,
+            "digest": _day_digest(result), "aggregates": _day_totals(result)}
+        if persist:
+            _atomic_json(manifest_path, manifest)
         if progress_callback: progress_callback({"phase": "day_completed", "day_index": index+1, "days_total": total_days,
                                                   "operational_day": day, "orders_processed": result["orders_total"]})
-    orders = [o for d in days for o in d["order_results"]]; strict_orders = [o for o in orders if o["strict_comparable"]]
-    strict_distance = round(sum(float(d["picker_distance_m"]) for d in days), 6)
-    full = all(d["status"] == "ready" for d in days)
-    result = {**base, "full_month_fact_valid": full, "days_total": len(days),
-        "days_ready": sum(d["status"] == "ready" for d in days),
-        "days_partial": sum(d["status"] == "partial/non-strict" for d in days),
-        "days_blocked": sum(d["status"] == "blocked" for d in days), "orders_total": len(orders),
-        "strict_orders": len(strict_orders), "requested_boxes": _display(sum(float(o["requested_boxes"]) for o in orders)),
-        "picked_boxes": _display(sum(float(o["picked_boxes"]) for o in orders)),
-        "shortage_boxes": _display(sum(float(o["shortage_boxes"]) for o in orders)),
+    aggregates = [entry["aggregates"] for entry in manifest["days"].values() if entry.get("status") == "complete"]
+    strict_distance = round(sum(float(d.get("picker_distance_m") or 0) for d in aggregates), 6)
+    orders_total = sum(int(d.get("orders_total") or 0) for d in aggregates)
+    strict_orders = sum(int(d.get("orders_strict") or 0) for d in aggregates)
+    full = len(aggregates) == total_days and all(d.get("status") == "ready" for d in aggregates)
+    result = {**base, "format_version": REPLAY_VERSION, "full_month_fact_valid": full, "days_total": total_days,
+        "days_completed": len(aggregates), "days_ready": sum(d.get("status") == "ready" for d in aggregates),
+        "days_partial": sum(d.get("status") == "partial/non-strict" for d in aggregates),
+        "days_blocked": sum(d.get("status") == "blocked" for d in aggregates), "orders_total": orders_total,
+        "strict_orders": strict_orders, "requested_boxes": _display(sum(float(d.get("requested_boxes") or 0) for d in aggregates)),
+        "picked_boxes": _display(sum(float(d.get("picked_boxes") or 0) for d in aggregates)),
+        "shortage_boxes": _display(sum(float(d.get("shortage_boxes") or 0) for d in aggregates)),
         "fact_picker_distance_m": strict_distance if full else None, "strict_fact_picker_distance_m": strict_distance,
-        "route_order_coverage": len(strict_orders)/len(orders) if orders else 1.0,
-        "source_location_ambiguity_count": sum(d["source_location_ambiguity_count"] for d in days),
-        "unresolved_fact_cell_count": sum(d["unroutable_cell_count"] + d["missing_opening_sku_count"] for d in days),
-        "daily_results": days, "blockers": [b for d in days for b in d["blockers"]]}
+        "route_order_coverage": strict_orders/orders_total if orders_total else 1.0,
+        "source_location_ambiguity_count": sum(int(d.get("source_location_ambiguity_count") or 0) for d in aggregates),
+        "unresolved_fact_cell_count": sum(int(d.get("unroutable_cell_count") or 0) + int(d.get("missing_opening_sku_count") or 0) for d in aggregates),
+        "daily_artifacts": [manifest["days"][day]["artifact"] for day in sorted(manifest["days"])], "blockers": []}
     if persist:
-        destination = root / "monthly_fact" / signature.replace(":", "_"); destination.mkdir(parents=True, exist_ok=True)
-        for daily in days: (destination / f"day={daily['operational_day']}.json").write_text(_canonical(daily), encoding="utf-8")
-        summary = {k: v for k, v in result.items() if k != "daily_results"}
-        summary["daily_artifacts"] = [f"day={d['operational_day']}.json" for d in days]
-        (destination / "summary.json").write_text(_canonical(summary), encoding="utf-8")
+        _atomic_json(destination / "summary.json", result)
+        manifest["status"] = "complete"; manifest["days_completed"] = len(aggregates)
+        _atomic_json(manifest_path, manifest)
         result["artifact_path"] = str(destination)
     return result
