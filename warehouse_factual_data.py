@@ -15,13 +15,14 @@ import os
 import sqlite3
 import tempfile
 import shutil
+import time
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping
 from datetime import date, datetime, timedelta, timezone
 from io import BytesIO
 from numbers import Real
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import pandas as pd
 from warehouse_perf_diagnostics import measure, profiled, record_artifact_read
@@ -29,6 +30,12 @@ from warehouse_perf_diagnostics import measure, profiled, record_artifact_read
 from warehouse_business_identity import build_canonical_sku_identity, find_canonical_identity_collisions
 
 PARSER_VERSION = "factual-july-v5"
+# Level 6 retained ~97% of level-9 compression in the 10k-row benchmark while
+# spending materially less time in the three gzip writers.
+FACTUAL_GZIP_COMPRESSLEVEL = 6
+IMPORT_PROGRESS_ROW_INTERVAL = 5_000
+IMPORT_PROGRESS_TIME_INTERVAL_SECONDS = 0.75
+ImportProgressCallback = Callable[[dict[str, Any]], None]
 DATA_ROOT = Path("data/last_import/factual")
 REGISTRY_PATH = DATA_ROOT / "registry.json"
 UNKNOWN_SOURCE = "unknown"
@@ -197,6 +204,13 @@ def normalize_source_datetime(value: Any) -> str | None:
     text = value.strip()
     if not text:
         return None
+    # The common ISO representation is unambiguous and avoids repeated
+    # strptime format scans in the hot loop.
+    if len(text) >= 10 and text[4:5] == "-" and text[7:8] == "-":
+        try:
+            return datetime.fromisoformat(text.replace("Z", "+00:00")).isoformat()
+        except ValueError:
+            pass
     for source_format in _SOURCE_DATETIME_FORMATS:
         try:
             return datetime.strptime(text, source_format).isoformat()
@@ -230,6 +244,11 @@ def normalize_operational_day(value: Any) -> str | None:
     text = value.strip()
     if not text:
         return None
+    if len(text) >= 10 and text[4:5] == "-" and text[7:8] == "-":
+        try:
+            return date.fromisoformat(text[:10]).isoformat()
+        except ValueError:
+            pass
     for source_format in _SOURCE_DATETIME_FORMATS:
         try:
             return datetime.strptime(text, source_format).date().isoformat()
@@ -463,7 +482,7 @@ def _atomic_json(path: Path, value: Any) -> None:
 
 def _write_jsonl(path: Path, rows: Iterable[Mapping[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with gzip.open(path, "wt", encoding="utf-8") as stream:
+    with gzip.open(path, "wt", encoding="utf-8", compresslevel=FACTUAL_GZIP_COMPRESSLEVEL) as stream:
         for row in rows:
             stream.write(json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
 
@@ -664,7 +683,8 @@ def _business_evidence(row: Mapping[str, Any], source_type: str) -> dict[str, An
 
 def _stream_xlsx_dataset(data: bytes, filename: str, *, sheet: str | None, root: Path,
                          geometry_cells: Iterable[str] | None, parser_version: str,
-                         fail_after_rows: int | None = None) -> dict[str, Any]:
+                         fail_after_rows: int | None = None,
+                         progress_callback: ImportProgressCallback | None = None) -> dict[str, Any]:
     """Import XLSX with one canonical and one RAW record resident at a time.
 
     Memory is bounded by the uploaded XLSX bytes, openpyxl's read-only parser,
@@ -673,6 +693,8 @@ def _stream_xlsx_dataset(data: bytes, filename: str, *, sheet: str | None, root:
     """
     from openpyxl import load_workbook
 
+    import_started = time.perf_counter()
+    stage_seconds: dict[str, float] = defaultdict(float)
     digest = content_hash(data)
     root.mkdir(parents=True, exist_ok=True)
     registry = load_registry(root)
@@ -694,7 +716,9 @@ def _stream_xlsx_dataset(data: bytes, filename: str, *, sheet: str | None, root:
             raise ValueError("sheet_not_found")
         worksheet = workbook[selected]
         iterator = worksheet.iter_rows(values_only=True)
+        read_started = time.perf_counter()
         headers = [str(value).strip() if value is not None else "" for value in next(iterator, ())]
+        stage_seconds["xlsx_read"] += time.perf_counter() - read_started
         detection = detect_source_type(headers)
         if detection["source_type"] == UNKNOWN_SOURCE or detection["status"] != "detected":
             return {"status": detection["status"], "source_type": UNKNOWN_SOURCE,
@@ -705,6 +729,7 @@ def _stream_xlsx_dataset(data: bytes, filename: str, *, sheet: str | None, root:
                     "diagnostic_found": detection["diagnostic_found"],
                     "diagnostic_missing": detection["diagnostic_missing"], "errors": [detection["status"]]}
         source_type = detection["source_type"]
+        header_positions = tuple((index, header) for index, header in enumerate(headers) if header)
         dataset_id = dataset_identity(digest, source_type, selected, parser_version)
         imported_at = datetime.now(timezone.utc).isoformat(timespec="microseconds")
         logical_source_id = logical_source_identity(source_type, filename, selected)
@@ -721,30 +746,83 @@ def _stream_xlsx_dataset(data: bytes, filename: str, *, sheet: str | None, root:
         placement_pallet_cells: dict[str, set[str]] = defaultdict(set)
         cell_orders: dict[str, set[Any]] = defaultdict(set)
         business_key_count = 0
+        worksheet_row = 1
+        last_progress_at = import_started
+        last_progress_row = 0
+
+        def report_progress(stage: str, *, force: bool = False) -> None:
+            nonlocal last_progress_at, last_progress_row
+            if progress_callback is None:
+                return
+            now = time.perf_counter()
+            if not force and row_count - last_progress_row < IMPORT_PROGRESS_ROW_INTERVAL \
+                    and now - last_progress_at < IMPORT_PROGRESS_TIME_INTERVAL_SECONDS:
+                return
+            elapsed = now - import_started
+            event = {"processed_rows": row_count, "elapsed_seconds": elapsed,
+                "rows_per_second": row_count / elapsed if elapsed else 0.0, "stage": stage,
+                "total_rows": None, "filename": filename}
+            try:
+                progress_callback(event)
+            except Exception:
+                # Presentation failures must not corrupt or roll back a valid
+                # data import, especially after atomic publication.
+                pass
+            last_progress_at, last_progress_row = now, row_count
+
         try:
-            raw_writer = gzip.open(staging / "raw.jsonl.gz", "wt", encoding="utf-8")
-            index_writer = gzip.open(staging / "business_index.jsonl.gz", "wt", encoding="utf-8")
-            for source_row, values in enumerate(iterator, 2):
+            raw_writer = gzip.open(staging / "raw.jsonl.gz", "wt", encoding="utf-8",
+                                   compresslevel=FACTUAL_GZIP_COMPRESSLEVEL)
+            index_writer = gzip.open(staging / "business_index.jsonl.gz", "wt", encoding="utf-8",
+                                     compresslevel=FACTUAL_GZIP_COMPRESSLEVEL)
+            while True:
+                read_started = time.perf_counter()
+                try:
+                    values = next(iterator)
+                except StopIteration:
+                    stage_seconds["xlsx_read"] += time.perf_counter() - read_started
+                    break
+                worksheet_row += 1
+                stage_seconds["xlsx_read"] += time.perf_counter() - read_started
+                source_row = worksheet_row
                 if not any(value is not None for value in values):
                     continue
                 if fail_after_rows is not None and row_count >= fail_after_rows:
                     raise RuntimeError("injected_streaming_import_failure")
-                source_values = {header: value for header, value in zip(headers, values) if header}
+                started = time.perf_counter()
+                source_values = {header: values[index] for index, header in header_positions}
                 raw_values = {header: _json_value(value) for header, value in source_values.items()}
                 provenance = {"dataset_id": dataset_id, "source_file_name": filename, "content_hash": digest,
                     "source_type": source_type, "parser_version": parser_version, "sheet": selected,
                     "source_row": source_row, "source_index": source_row - 2, "imported_at": imported_at}
                 raw_record = {**provenance, "raw": raw_values}
+                stage_seconds["raw_prepare"] += time.perf_counter() - started
+                started = time.perf_counter()
                 raw_json = json.dumps(raw_values, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                stage_seconds["raw_serialization"] += time.perf_counter() - started
+                started = time.perf_counter()
                 raw_fp = hashlib.sha256(raw_json.encode()).hexdigest()
                 duplicate_raw += raw_fp in raw_hashes; raw_hashes.add(raw_fp)
-                raw_writer.write(json.dumps(raw_record, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
+                stage_seconds["raw_hash"] += time.perf_counter() - started
+                started = time.perf_counter()
+                raw_record_json = json.dumps(raw_record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                stage_seconds["raw_serialization"] += time.perf_counter() - started
+                started = time.perf_counter(); raw_writer.write(raw_record_json + "\n")
+                stage_seconds["raw_write"] += time.perf_counter() - started
+                started = time.perf_counter()
                 record = _canonical_record(source_values, detection["mapping"], provenance)
+                stage_seconds["canonical"] += time.perf_counter() - started
                 day = _day(record) or "undated"; days.add(day)
                 if day not in writers:
                     target = staging / "canonical" / f"date={day}.jsonl.gz"; target.parent.mkdir(parents=True, exist_ok=True)
-                    writers[day] = gzip.open(target, "wt", encoding="utf-8")
-                writers[day].write(json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
+                    writers[day] = gzip.open(target, "wt", encoding="utf-8",
+                                             compresslevel=FACTUAL_GZIP_COMPRESSLEVEL)
+                started = time.perf_counter()
+                canonical_json = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                stage_seconds["canonical_serialization"] += time.perf_counter() - started
+                started = time.perf_counter(); writers[day].write(canonical_json + "\n")
+                stage_seconds["canonical_write"] += time.perf_counter() - started
+                started = time.perf_counter()
                 sku = record.get("sku_key"); missing_sku += not bool(sku)
                 if sku: sku_keys.add(sku); daily[day]["sku_keys"].add(sku)
                 daily[day]["rows"] += 1
@@ -758,10 +836,17 @@ def _stream_xlsx_dataset(data: bytes, filename: str, *, sheet: str | None, root:
                     if qty_field == "quantity" and isinstance(qty, (int, float)) and qty > 0:
                         daily[day]["positive_quantity"] += qty
                         if sku: daily[day]["positive_sku_keys"].add(sku)
-                evidence = _business_evidence(record, source_type)
+                stage_seconds["index_maintenance"] += time.perf_counter() - started
+                started = time.perf_counter(); evidence = _business_evidence(record, source_type)
+                stage_seconds["business_evidence"] += time.perf_counter() - started
                 if evidence:
-                    index_writer.write(json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
+                    started = time.perf_counter()
+                    evidence_json = json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                    stage_seconds["business_serialization"] += time.perf_counter() - started
+                    started = time.perf_counter(); index_writer.write(evidence_json + "\n")
+                    stage_seconds["business_write"] += time.perf_counter() - started
                     business_key_count += 1
+                started = time.perf_counter()
                 if source_type == "historical_placement":
                     snap, cell, pallet = record.get("snapshot_at"), str(record.get("cell") or ""), str(record.get("source_pallet_ref") or "")
                     if sku and cell: placement_sku_cells[(snap, sku)].add(cell); placement_cell_sku[(snap, cell)].add(sku)
@@ -769,6 +854,8 @@ def _stream_xlsx_dataset(data: bytes, filename: str, *, sheet: str | None, root:
                     if pallet and cell: placement_pallet_cells[pallet].add(cell)
                     if cell and record.get("cell_picking_order") is not None: cell_orders[cell].add(record["cell_picking_order"])
                 row_count += 1
+                stage_seconds["index_maintenance"] += time.perf_counter() - started
+                report_progress("reading_and_normalizing")
         except Exception:
             for stream in (raw_writer, index_writer, *writers.values()):
                 if stream: stream.close()
@@ -779,6 +866,9 @@ def _stream_xlsx_dataset(data: bytes, filename: str, *, sheet: str | None, root:
                 if stream and not stream.closed: stream.close()
     finally:
         workbook.close()
+
+    report_progress("finalizing", force=True)
+    finalization_started = time.perf_counter()
 
     real_days = sorted(day for day in days if day != "undated")
     warnings = [name for value, name in ((missing_sku, "missing_sku"), (duplicate_raw, "duplicate_raw_rows"),
@@ -804,6 +894,13 @@ def _stream_xlsx_dataset(data: bytes, filename: str, *, sheet: str | None, root:
         "positive_sku_keys": sorted(values["positive_sku_keys"])} for day, values in daily.items()}
     index = {"sku_keys": sorted(sku_keys), "dates": sorted(days), "daily": index_daily,
              "business_key_count": business_key_count, "business_index_artifact": "business_index.jsonl.gz"}
+    stage_seconds["final_metadata_publication"] += time.perf_counter() - finalization_started
+    elapsed = time.perf_counter() - import_started
+    performance = {"rows": row_count, "elapsed_seconds": elapsed,
+        "rows_per_second": row_count / elapsed if elapsed else 0.0,
+        "stage_seconds": {name: round(seconds, 6) for name, seconds in sorted(stage_seconds.items())},
+        "gzip_compresslevel": FACTUAL_GZIP_COMPRESSLEVEL}
+    diagnostics["import_performance"] = performance
     artifact = root / dataset_id.removeprefix("dataset:")
     previous = [item for item in registry["datasets"] if item.get("active", True) and item.get("logical_source_id") == logical_source_id]
     metadata = {"dataset_id": dataset_id, "source_file_name": filename, "content_hash": digest,
@@ -822,16 +919,23 @@ def _stream_xlsx_dataset(data: bytes, filename: str, *, sheet: str | None, root:
     registry["datasets"].sort(key=lambda item: (item.get("imported_at", ""), item["dataset_id"]))
     registry["registry_version"] = 3
     _atomic_json(root / "registry.json", registry)
-    return {**metadata, "reused": False, "reparsed_for_parser_upgrade": obsolete_content_match}
+    elapsed = time.perf_counter() - import_started
+    performance["elapsed_seconds"] = elapsed
+    performance["rows_per_second"] = row_count / elapsed if elapsed else 0.0
+    report_progress("completed", force=True)
+    return {**metadata, "diagnostics": {**diagnostics, "import_performance": performance},
+            "reused": False, "reparsed_for_parser_upgrade": obsolete_content_match}
 
 
 def import_excel_dataset(data: bytes, filename: str, *, sheet: str | None = None, root: Path = DATA_ROOT,
                          geometry_cells: Iterable[str] | None = None, reimport: bool = False,
-                         parser_version: str = PARSER_VERSION, _fail_after_rows: int | None = None) -> dict[str, Any]:
+                         parser_version: str = PARSER_VERSION, _fail_after_rows: int | None = None,
+                         progress_callback: ImportProgressCallback | None = None) -> dict[str, Any]:
     """Hash first, then use bounded-memory XLSX import; retain legacy XLS compatibility."""
     if Path(filename).suffix.casefold() == ".xlsx" and not reimport:
         return _stream_xlsx_dataset(data, filename, sheet=sheet, root=root, geometry_cells=geometry_cells,
-                                    parser_version=parser_version, fail_after_rows=_fail_after_rows)
+                                    parser_version=parser_version, fail_after_rows=_fail_after_rows,
+                                    progress_callback=progress_callback)
     result = _import_excel_dataset_buffered(data, filename, sheet=sheet, root=root, geometry_cells=geometry_cells,
                                             reimport=reimport, parser_version=parser_version)
     if Path(filename).suffix.casefold() == ".xls" and len(data) > 20_000_000:
