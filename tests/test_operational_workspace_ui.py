@@ -1,9 +1,12 @@
+from datetime import date, datetime
+
 from warehouse_workspace_ui import (
     WORKSPACE_TABS, SUPPORTED_RULES, UNSUPPORTED_RULES, RULE_CARDS, MONTHLY_ROUTE_REQUIRED_SOURCES,
     WORKSPACE_PENDING_SECTION_KEY, apply_pending_workspace_navigation,
     build_warehouse_zone_summary, build_workspace_rule_config, normalize_rule_selection,
     build_data_source_cards, deep_lane_edit_issue, import_status_label,
     format_compact_number, format_monthly_readiness_blocker, format_monthly_readiness_check,
+    format_ui_date, format_ui_period,
     monthly_readiness_blocker_details, monthly_readiness_message, status_card_html,
 )
 import warehouse_workspace_ui as workspace
@@ -160,7 +163,39 @@ def test_data_upload_cards_cover_five_sources_using_metadata_only():
     assert outbound["file"] == "РО июль.xlsx"
     assert outbound["status"] == "✅ Готово"
     assert (outbound["documents"], outbound["rows"], outbound["sku"]) == (3, 12, 2)
+    assert outbound["period"] == "01.07.2026 — 01.07.2026"
+    assert outbound["dates"] == ["2026-07-01"]
     assert all(card["status"] == "⬜ Не загружено" for card in cards if card is not outbound)
+
+
+def test_ui_date_formatter_is_strict_safe_and_presentation_only():
+    iso_dates = ["2026-07-01", "2026-07-31"]
+
+    assert format_ui_date(iso_dates[0]) == "01.07.2026"
+    assert format_ui_date(iso_dates[1]) == "31.07.2026"
+    assert format_ui_period(*iso_dates) == "01.07.2026 — 31.07.2026"
+    assert format_ui_date(date(2026, 7, 1)) == "01.07.2026"
+    assert format_ui_date(datetime(2026, 7, 31, 14, 30)) == "31.07.2026"
+    assert format_ui_date(None) is None
+    assert format_ui_date("") == ""
+    assert format_ui_date("неизвестно") == "неизвестно"
+    assert format_ui_date("2026-02-30") == "2026-02-30"
+    assert iso_dates == ["2026-07-01", "2026-07-31"]
+
+
+def test_readiness_and_blocker_dates_use_russian_ui_format():
+    check = {"name": "placement_snapshot", "status": "fail", "details": "Период с 2026-07-01",
+             "missing_dates": ["2026-07-01"], "extra_dates": ["2026-08-01"]}
+    blocker = {"code": "missing_placement_snapshot", "dates": ["2026-07-01"]}
+
+    rendered_check = format_monthly_readiness_check(check)
+    rendered_blocker = format_monthly_readiness_blocker(blocker)
+    assert "Период с 01.07.2026" in rendered_check
+    assert "Отсутствующие даты: 01.07.2026" in rendered_check
+    assert "Лишние даты: 01.08.2026" in rendered_check
+    assert "Даты: 01.07.2026" in rendered_blocker
+    assert check["missing_dates"] == ["2026-07-01"]
+    assert blocker["dates"] == ["2026-07-01"]
 
 
 def test_design_system_status_cards_are_consistent_and_escape_content():
