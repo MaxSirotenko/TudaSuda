@@ -6,6 +6,8 @@ the explicit buttons in :mod:`warehouse_scenario_comparison_ui`.
 """
 from __future__ import annotations
 
+import json
+
 from collections import defaultdict
 from collections.abc import Mapping
 from html import escape
@@ -554,12 +556,22 @@ def render_monthly_fact_baseline(model: Mapping[str, Any] | None, session_state:
     gate_state = session_state.get("workspace_gate_state")
     if not gate_state:
         st.error("Не настроены авторитетные ворота."); return
-    if st.button("Рассчитать фактические данные за июль", key="monthly_fact_run"):
+    summary = session_state.get("monthly_fact_summary")
+    run_label = ("Продолжить расчёт" if summary and
+                 int(summary.get("days_completed", 0)) < int(summary.get("days_total", 0))
+                 else "Рассчитать фактические данные за июль")
+    if st.button(run_label, key="monthly_fact_run"):
         from warehouse_monthly_fact_replay import replay_monthly_fact
         bar, label = st.progress(0), st.empty()
+        session_state["monthly_fact_summary"] = {**(summary or {}), "days_total": 31,
+            "days_completed": int((summary or {}).get("days_completed", 0)), "status": "in_progress"}
         def progress(event: dict[str, Any]) -> None:
-            label.caption(f"День {event['day_index']} из {event['days_total']} · РО обработано: {event.get('orders_processed', 0)}")
+            action = "завершён" if event.get("phase") == "day_completed" else "проверяется"
+            label.caption(f"День {event['day_index']} из {event['days_total']} · {event['operational_day']} · {action} · РО обработано: {event.get('orders_processed', 0)}")
             bar.progress(event["day_index"] / event["days_total"])
+            if event.get("phase") in {"day_completed", "day_skipped"}:
+                session_state["monthly_fact_summary"]["days_completed"] = event["day_index"]
+                session_state["monthly_fact_summary"]["current_day"] = event["operational_day"]
         result = replay_monthly_fact(dict(model), dict(gate_state), registry=registry, progress_callback=progress)
         session_state["monthly_fact_summary"] = {k: v for k, v in result.items() if k != "daily_results"}
     summary = session_state.get("monthly_fact_summary")
@@ -569,16 +581,18 @@ def render_monthly_fact_baseline(model: Mapping[str, Any] | None, session_state:
               ("Фактический пробег, км", round((summary.get("strict_fact_picker_distance_m") or 0)/1000, 3)),
               ("Строгое покрытие", f"{100*(summary.get('route_order_coverage') or 0):.1f}%"))
     for column, (label, value) in zip(st.columns(6), values): column.metric(label, value)
-    artifact = Path(str(summary.get("artifact_path") or "")); files = sorted(artifact.glob("day=*.json")) if artifact.is_dir() else []
-    if files:
-        import json
-        daily = [json.loads(path.read_text(encoding="utf-8")) for path in files]
+    artifact = Path(str(summary.get("artifact_path") or ""))
+    manifest_path = artifact / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.is_file() else {}
+    day_entries = manifest.get("days", {})
+    if day_entries:
+        daily = [{"operational_day": day, **entry.get("aggregates", {})} for day, entry in sorted(day_entries.items())]
         st.dataframe(pd.DataFrame([{"Дата": d["operational_day"], "РО": d["orders_total"],
             "Запрошено коробов": d["requested_boxes"], "Собрано": d["picked_boxes"], "Дефицит": d["shortage_boxes"],
             "Фактический пробег, м": d["picker_distance_m"], "Строгий статус": d["status"],
             "Неоднозначные ячейки": d["source_location_ambiguity_count"]} for d in daily]), use_container_width=True, hide_index=True)
         selected_day = st.selectbox("День для детализации РО", [d["operational_day"] for d in daily])
-        chosen = next(d for d in daily if d["operational_day"] == selected_day)
+        chosen = json.loads((artifact / day_entries[selected_day]["artifact"]).read_text(encoding="utf-8"))
         identities = [o["order_identity"].get("document_number") or o["order_identity"].get("document_ref") for o in chosen["order_results"]]
         if identities:
             selected = st.selectbox("Расходный ордер", identities); order = chosen["order_results"][identities.index(selected)]
@@ -622,6 +636,12 @@ def render_monthly_placement_comparison(comparison: Mapping[str, Any] | None) ->
             "proposed_meters": "Предлагаемое м", "saved_meters": "Δ м", "saved_percent": "Δ %",
             "strict_coverage": "Покрытие данных", "warnings": "Предупреждения"}), use_container_width=True, hide_index=True)
     orders = comparison.get("order_comparisons") or []
+    artifact = Path(str(comparison.get("artifact_path") or ""))
+    if not orders and daily and artifact.is_dir():
+        detail_day = st.selectbox("День для детализации сравнения", [x["date"] for x in daily], key="monthly_comparison_day")
+        if st.button("Загрузить детализацию дня", key="monthly_comparison_load_day"):
+            from warehouse_monthly_placement_comparison import load_comparison_day
+            orders = load_comparison_day(artifact, detail_day).get("order_comparisons", [])
     if orders:
         labels = [str(x.get("order_identity", {}).get("document_number") or x.get("order_identity", {}).get("document_ref") or i)
                   for i, x in enumerate(orders)]
