@@ -8,6 +8,7 @@ from pathlib import Path
 import tracemalloc
 
 import pandas as pd
+import pytest
 
 from warehouse_factual_data import (
     AUTHORITATIVE_CONTRACTS, CONTRACT_ALIAS_STATUS, CONTRACTS, LEGACY_CONTRACT_ALIASES, PARSER_VERSION,
@@ -285,6 +286,34 @@ def test_authoritative_outbound_quantity_wins_and_source_quantity_is_raw_evidenc
     canonical = load_dataset_rows(result)[0]
     assert canonical["quantity"] == 3
     assert canonical["source_line_quantity_raw"] == 24
+
+
+def test_streaming_import_progress_is_monotonic_throttled_and_final(tmp_path, monkeypatch):
+    events = []
+    monkeypatch.setattr(factual, "IMPORT_PROGRESS_ROW_INTERVAL", 2)
+    monkeypatch.setattr(factual, "IMPORT_PROGRESS_TIME_INTERVAL_SECONDS", 60)
+    rows = [{**_outbound(number), "СсылкаРО": f"ref-{number}", "НомерСтроки": number}
+            for number in range(1, 7)]
+
+    result = import_excel_dataset(_xlsx(rows), "РО progress.xlsx", root=tmp_path,
+                                  progress_callback=events.append)
+
+    processed = [event["processed_rows"] for event in events]
+    assert processed == sorted(processed)
+    assert processed[-1] == result["rows"] == 6
+    assert len(events) <= 5
+    assert events[-1]["stage"] == "completed"
+    assert all({"elapsed_seconds", "rows_per_second", "stage", "total_rows"} <= event.keys()
+               for event in events)
+
+
+def test_streaming_import_failure_cleans_staging_and_does_not_publish(tmp_path):
+    data = _xlsx([{**_outbound(number), "СсылкаРО": f"ref-{number}", "НомерСтроки": number}
+                  for number in range(1, 5)])
+    with pytest.raises(RuntimeError, match="injected_streaming_import_failure"):
+        import_excel_dataset(data, "РО interrupted.xlsx", root=tmp_path, _fail_after_rows=2)
+    assert not (tmp_path / "registry.json").exists()
+    assert not list(tmp_path.glob(".staging-*"))
 
 
 def test_broad_outbound_aliases_are_not_authoritative():

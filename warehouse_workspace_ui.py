@@ -600,15 +600,33 @@ def render_factual_data_layer(model: Mapping[str, Any] | None) -> None:
     st.markdown("### Добавить файл")
     files = st.file_uploader("Выберите один или несколько Excel-файлов", type=["xlsx", "xls"], accept_multiple_files=True, key="factual_data_uploads")
     if files and st.button("Добавить выбранные файлы", type="primary", key="factual_data_import"):
-        with st.spinner("Распознаём и сохраняем файлы…"):
-            for uploaded in files:
-                try:
-                    result = import_excel_dataset(uploaded.getvalue(), uploaded.name)
-                except (OSError, ValueError) as exc:
-                    render_ui_message({"severity": "error", "title": "Файл не загружен", "reason": str(exc),
-                        "impact": "Данные из этого файла не участвуют в расчётах.", "action": "Проверьте формат Excel и повторите загрузку.", "target": "Загрузка данных"})
-                else:
-                    _render_import_result(result, uploaded.name)
+        progress_area = st.empty()
+        for file_index, uploaded in enumerate(files, 1):
+            def show_import_progress(event: Mapping[str, Any], *, _name=uploaded.name,
+                                     _index=file_index, _total=len(files)) -> None:
+                elapsed = int(float(event.get("elapsed_seconds") or 0))
+                stage = {"reading_and_normalizing": "чтение и нормализация", "finalizing": "завершение",
+                         "completed": "завершено"}.get(str(event.get("stage")), str(event.get("stage") or "импорт"))
+                progress_area.info(
+                    f"Файл {_index} из {_total} · {_name}\n\n"
+                    f"Обработано: {int(event.get('processed_rows') or 0):,} строк · "
+                    f"Скорость: {float(event.get('rows_per_second') or 0):,.0f} строк/с · "
+                    f"Прошло: {elapsed // 60:02d}:{elapsed % 60:02d} · Этап: {stage}".replace(",", " ")
+                )
+            try:
+                result = import_excel_dataset(uploaded.getvalue(), uploaded.name,
+                                              progress_callback=show_import_progress)
+            except (OSError, ValueError) as exc:
+                render_ui_message({"severity": "error", "title": "Файл не загружен", "reason": str(exc),
+                    "impact": "Данные из этого файла не участвуют в расчётах.", "action": "Проверьте формат Excel и повторите загрузку.", "target": "Загрузка данных"})
+            else:
+                performance = result.get("diagnostics", {}).get("import_performance", {})
+                if performance:
+                    st.success(f"Импорт завершён: {int(performance.get('rows') or 0):,} строк за "
+                               f"{float(performance.get('elapsed_seconds') or 0):.1f} сек · "
+                               f"{float(performance.get('rows_per_second') or 0):,.0f} строк/с".replace(",", " "))
+                _render_import_result(result, uploaded.name)
+        progress_area.empty()
 
     st.markdown("### Источники данных")
     for card in cards:
