@@ -359,5 +359,5 @@ def test_failed_placement_readiness_formatter_exposes_date_diagnostics():
     })
     assert "Ожидаемые даты: 32" in rendered
     assert "Обнаруженные даты: 32" in rendered
-    assert "Отсутствующие даты: 2026-07-01" in rendered
-    assert "Лишние даты: 2026-06-30" in rendered
+    assert "Отсутствующие даты: 01.07.2026" in rendered
+    assert "Лишние даты: 30.06.2026" in rendered

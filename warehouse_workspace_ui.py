@@ -7,9 +7,11 @@ the explicit buttons in :mod:`warehouse_scenario_comparison_ui`.
 from __future__ import annotations
 
 import json
+import re
 
 from collections import defaultdict
 from collections.abc import Mapping, MutableMapping
+from datetime import date, datetime
 from html import escape
 from pathlib import Path
 from typing import Any, Callable
@@ -62,6 +64,50 @@ STATUS_PRESENTATION = {
     "error": ("❌", "Требуется исправление"),
     "empty": ("⬜", "Не выполнено"),
 }
+
+_ISO_UI_DATE_RE = re.compile(r"(?<!\d)(\d{4}-\d{2}-\d{2})(?!\d)")
+
+
+def format_ui_date(value: Any) -> Any:
+    """Return a calendar date for display without altering its domain value."""
+    if isinstance(value, datetime):
+        return value.strftime("%d.%m.%Y")
+    if isinstance(value, date):
+        return value.strftime("%d.%m.%Y")
+    if not isinstance(value, str) or not value:
+        return value
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        return value
+    if parsed.strftime("%Y-%m-%d") != value:
+        return value
+    return parsed.strftime("%d.%m.%Y")
+
+
+def format_ui_period(date_from: Any, date_to: Any) -> str:
+    """Format a user-facing inclusive period while preserving both inputs."""
+    return f"{format_ui_date(date_from)} — {format_ui_date(date_to)}"
+
+
+def format_ui_dates_in_text(value: Any) -> Any:
+    """Format strict ISO calendar dates embedded in presentation text."""
+    if not isinstance(value, str):
+        return value
+    return _ISO_UI_DATE_RE.sub(lambda match: str(format_ui_date(match.group(1))), value)
+
+
+def format_ui_date_values(value: Any) -> Any:
+    """Build a presentation copy with ISO calendar dates formatted recursively."""
+    if isinstance(value, Mapping):
+        return {key: format_ui_date_values(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [format_ui_date_values(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(format_ui_date_values(item) for item in value)
+    if isinstance(value, (date, datetime)):
+        return format_ui_date(value)
+    return format_ui_dates_in_text(value)
 
 
 def format_compact_number(value: Any) -> str:
@@ -127,7 +173,7 @@ def build_data_source_cards(registry: Mapping[str, Any]) -> list[dict[str, Any]]
         daily = [counts for item in sources for counts in item.get("index", {}).get("daily", {}).values()]
         cards.append({"source_type": source_type, "title": title, "purpose": purpose, "sources": sources,
                       "file": ", ".join(str(item.get("source_file_name") or "—") for item in sources) or "—",
-                      "period": f"{dates[0]} — {dates[-1]}" if dates else "—", "dates": dates,
+                      "period": format_ui_period(dates[0], dates[-1]) if dates else "—", "dates": dates,
                       "rows": rows, "sku": sku, "documents": sum(int(x.get("documents", 0) or 0) for x in daily),
                       "cells": sum(int(x.get("cells", 0) or 0) for x in daily), "status": status})
     return cards
@@ -160,16 +206,16 @@ def build_weight_zone_readiness(receipts: list[Mapping[str, Any]] | None) -> dic
 def format_monthly_readiness_check(check: Mapping[str, Any]) -> str:
     """Format one structured readiness check for the non-technical UI."""
     icon = {"pass": "✅", "fail": "❌", "warning": "⚠️", "info": "ℹ️"}.get(str(check.get("status")), "ℹ️")
-    text = f"{icon} **{check.get('title', check.get('name', 'Проверка'))}**  \n{check.get('details', '')}"
+    text = f"{icon} **{check.get('title', check.get('name', 'Проверка'))}**  \n{format_ui_dates_in_text(check.get('details', ''))}"
     missing = check.get("missing_dates") or []
     if check.get("name") == "placement_snapshot":
         extra = check.get("extra_dates") or []
         text += (f"  \nОжидаемые даты: {check.get('expected_days', 0)}"
                  f"  \nОбнаруженные даты: {len(check.get('detected_dates', [])) or check.get('imported_days', 0)}"
-                 f"  \nОтсутствующие даты: {', '.join(map(str, missing)) or 'нет'}"
-                 f"  \nЛишние даты: {', '.join(map(str, extra)) or 'нет'}")
+                 f"  \nОтсутствующие даты: {', '.join(map(str, map(format_ui_date, missing))) or 'нет'}"
+                 f"  \nЛишние даты: {', '.join(map(str, map(format_ui_date, extra))) or 'нет'}")
     elif missing:
-        text += f"  \nНе хватает дат: {', '.join(map(str, missing))}"
+        text += f"  \nНе хватает дат: {', '.join(map(str, map(format_ui_date, missing)))}"
     if check.get("name") == "vgh_coverage" and check.get("missing_sku_count"):
         text += f"  \nНе хватает: {check['missing_sku_count']} SKU · покрытие {check.get('percentage', 0)}%"
     return text
@@ -230,7 +276,7 @@ def monthly_readiness_blocker_details(blocker: Mapping[str, Any]) -> dict[str, s
     facts: list[str] = []
     dates = blocker.get("dates") or []
     if dates:
-        facts.append(f"Даты: {', '.join(map(str, dates))}.")
+        facts.append(f"Даты: {', '.join(map(str, map(format_ui_date, dates)))}.")
     if code == "conflicting_factual_business_key":
         source = _FACTUAL_SOURCE_LABELS.get(str(blocker.get("source_type")), str(blocker.get("source_type") or "источник"))
         facts.append(f"Источник: {source}. Конфликтов: {int(blocker.get('count') or 0)}.")
@@ -247,7 +293,7 @@ def monthly_readiness_blocker_details(blocker: Mapping[str, Any]) -> dict[str, s
             facts.append(f"Примеры: {samples}.")
     message = str(blocker.get("message") or "").strip()
     if message and not facts:
-        facts.append(message)
+        facts.append(str(format_ui_dates_in_text(message)))
     if code not in READINESS_BLOCKER_PRESENTATION:
         facts.append(f"Технический код: `{code.replace('`', '´')}`.")
     return {"code": code, "title": title, "details": " ".join(facts), "action": action}
@@ -518,7 +564,7 @@ def _render_source_quality(card: Mapping[str, Any], readiness: Mapping[str, Any]
         st.caption(f"Срезов: {len(card['dates'])} · Период: {card['period']} · SKU: {card['sku']} · Ячеек: {card['cells']}")
         check = next((x for x in (readiness or {}).get("diagnostics", {}).get("checks", []) if x.get("name") == "placement_snapshot"), None)
         if check and check.get("missing_dates"):
-            st.caption("Пропущенные даты: " + ", ".join(check["missing_dates"]))
+            st.caption("Пропущенные даты: " + ", ".join(map(str, map(format_ui_date, check["missing_dates"]))))
     elif source_type == "vgh":
         coverage = (readiness or {}).get("coverage", {})
         demanded, covered = int(coverage.get("demanded_sku", 0)), int(coverage.get("vgh_covered_sku", card["sku"]))
@@ -642,7 +688,7 @@ def render_factual_data_layer(model: Mapping[str, Any] | None) -> None:
         if contract_diagnostics:
             if contract_diagnostics["requires_reimport"]:
                 st.error("Есть активные artifacts старой версии parser. Повторно импортируйте исходные Excel без новой выгрузки из 1С.")
-            st.json(contract_diagnostics)
+            st.json(format_ui_date_values(contract_diagnostics))
 
 def render_monthly_fact_baseline(model: Mapping[str, Any] | None, session_state: Mapping[str, Any]) -> None:
     """Run and inspect persisted July FACT partitions without предлагаемое размещение logic."""
@@ -658,7 +704,7 @@ def render_monthly_fact_baseline(model: Mapping[str, Any] | None, session_state:
         blocker = monthly_readiness_blocker_details(blockers[0]) if blockers else {}
         failed = next((check for check in readiness.get("diagnostics", {}).get("checks", [])
                        if check.get("status") == "fail"), {})
-        reason = blocker.get("title") or failed.get("details") or "Обязательная проверка данных не пройдена."
+        reason = blocker.get("title") or format_ui_dates_in_text(failed.get("details")) or "Обязательная проверка данных не пройдена."
         if blocker.get("details"):
             reason += f" {blocker['details']}"
         render_ui_message({
@@ -687,7 +733,7 @@ def render_monthly_fact_baseline(model: Mapping[str, Any] | None, session_state:
             "days_completed": int((summary or {}).get("days_completed", 0)), "status": "in_progress"}
         def progress(event: dict[str, Any]) -> None:
             action = "завершён" if event.get("phase") == "day_completed" else "проверяется"
-            label.caption(f"День {event['day_index']} из {event['days_total']} · {event['operational_day']} · {action} · РО обработано: {event.get('orders_processed', 0)}")
+            label.caption(f"День {event['day_index']} из {event['days_total']} · {format_ui_date(event['operational_day'])} · {action} · РО обработано: {event.get('orders_processed', 0)}")
             bar.progress(event["day_index"] / event["days_total"])
             if event.get("phase") in {"day_completed", "day_skipped"}:
                 session_state["monthly_fact_summary"]["days_completed"] = event["day_index"]
@@ -707,19 +753,20 @@ def render_monthly_fact_baseline(model: Mapping[str, Any] | None, session_state:
     day_entries = manifest.get("days", {})
     if day_entries:
         daily = [{"operational_day": day, **entry.get("aggregates", {})} for day, entry in sorted(day_entries.items())]
-        st.dataframe(pd.DataFrame([{"Дата": d["operational_day"], "РО": d["orders_total"],
+        st.dataframe(pd.DataFrame([{"Дата": format_ui_date(d["operational_day"]), "РО": d["orders_total"],
             "Запрошено коробов": d["requested_boxes"], "Собрано": d["picked_boxes"], "Дефицит": d["shortage_boxes"],
             "Фактический пробег, м": d["picker_distance_m"], "Строгий статус": d["status"],
             "Неоднозначные ячейки": d["source_location_ambiguity_count"]} for d in daily]), use_container_width=True, hide_index=True)
-        selected_day = st.selectbox("День для детализации РО", [d["operational_day"] for d in daily])
+        selected_day = st.selectbox("День для детализации РО", [d["operational_day"] for d in daily],
+                                    format_func=format_ui_date)
         chosen = json.loads((artifact / day_entries[selected_day]["artifact"]).read_text(encoding="utf-8"))
         identities = [o["order_identity"].get("document_number") or o["order_identity"].get("document_ref") for o in chosen["order_results"]]
         if identities:
             selected = st.selectbox("Расходный ордер", identities); order = chosen["order_results"][identities.index(selected)]
-            st.json({"order_identity": order["order_identity"], "picker_distance_m": order.get("picker_distance_m"),
+            st.json(format_ui_date_values({"order_identity": order["order_identity"], "picker_distance_m": order.get("picker_distance_m"),
                      "shortage_boxes": order["shortage_boxes"], "strict_comparable": order["strict_comparable"],
                      "route_legs": order["route_legs"], "factual_pick_stops": order["factual_pick_stops"],
-                     "source_location_ambiguity": order["source_location_ambiguous"], "blockers": order["blockers"]})
+                     "source_location_ambiguity": order["source_location_ambiguous"], "blockers": order["blockers"]}))
     st.caption("Приходы и инвентаризации не изменяют начальное размещение; неоднозначные ячейки не угадываются; паллета — техническая ссылка; каждый день начинается с состояния на 00:00; предлагаемое размещение и экономия не рассчитываются.")
 
 
@@ -752,13 +799,15 @@ def render_monthly_placement_comparison(comparison: Mapping[str, Any] | None) ->
                f"{100*float(comparison.get('fact_coverage', 0)):.1f}% / {100*float(comparison.get('proposed_coverage', 0)):.1f}%")
     daily = comparison.get("daily_results") or []
     if daily:
-        st.dataframe(pd.DataFrame(daily).rename(columns={"date": "Дата", "ro_count": "РО", "fact_meters": "Фактическое, м",
+        daily_ui = [{**item, "date": format_ui_date(item.get("date"))} for item in daily]
+        st.dataframe(pd.DataFrame(daily_ui).rename(columns={"date": "Дата", "ro_count": "РО", "fact_meters": "Фактическое, м",
             "proposed_meters": "Предлагаемое м", "saved_meters": "Δ м", "saved_percent": "Δ %",
             "strict_coverage": "Покрытие данных", "warnings": "Предупреждения"}), use_container_width=True, hide_index=True)
     orders = comparison.get("order_comparisons") or []
     artifact = Path(str(comparison.get("artifact_path") or ""))
     if not orders and daily and artifact.is_dir():
-        detail_day = st.selectbox("День для детализации сравнения", [x["date"] for x in daily], key="monthly_comparison_day")
+        detail_day = st.selectbox("День для детализации сравнения", [x["date"] for x in daily],
+                                  key="monthly_comparison_day", format_func=format_ui_date)
         if st.button("Загрузить детализацию дня", key="monthly_comparison_load_day"):
             from warehouse_monthly_placement_comparison import load_comparison_day
             orders = load_comparison_day(artifact, detail_day).get("order_comparisons", [])
@@ -767,24 +816,24 @@ def render_monthly_placement_comparison(comparison: Mapping[str, Any] | None) ->
                   for i, x in enumerate(orders)]
         selected = st.selectbox("Расходный ордер для детализации", labels, key="monthly_comparison_ro")
         order = orders[labels.index(selected)]
-        st.json({"Фактическое": {"distance": order.get("fact_meters"), "route": order.get("fact_route"),
+        st.json(format_ui_date_values({"Фактическое": {"distance": order.get("fact_meters"), "route": order.get("fact_route"),
                           "pick_stops": order.get("fact_pick_stops")},
                  "Предлагаемое": {"distance": order.get("proposed_meters"), "route": order.get("proposed_route"),
                               "pick_stops": order.get("proposed_pick_stops")},
-                 "changed_skus": order.get("changed_skus"), "warnings": order.get("warnings")})
+                 "changed_skus": order.get("changed_skus"), "warnings": order.get("warnings")}))
         graph = comparison.get("route_graph") or {}
         if graph:
             from warehouse_route_ui import build_route_overlay
-            st.json({"Маршрут фактического размещения": build_route_overlay({"route_legs": order.get("fact_route"),
+            st.json(format_ui_date_values({"Маршрут фактического размещения": build_route_overlay({"route_legs": order.get("fact_route"),
                 "pick_events": order.get("fact_pick_stops"), "picker_distance_m": order.get("fact_meters")}, graph, "current"),
                 "Маршрут предлагаемого размещения": build_route_overlay({"route_legs": order.get("proposed_route"),
-                "pick_events": order.get("proposed_pick_stops"), "picker_distance_m": order.get("proposed_meters")}, graph, "proposed")})
+                "pick_events": order.get("proposed_pick_stops"), "picker_distance_m": order.get("proposed_meters")}, graph, "proposed")}))
     if comparison.get("contribution_analysis"):
         st.markdown("**Измеренный вклад по SKU / зоне / ряду**")
-        st.dataframe(pd.DataFrame(comparison["contribution_analysis"]), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(format_ui_date_values(comparison["contribution_analysis"])), use_container_width=True, hide_index=True)
     if comparison.get("placement_changes"):
         st.markdown("**Изменённые SKU**")
-        st.dataframe(pd.DataFrame(comparison["placement_changes"]), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(format_ui_date_values(comparison["placement_changes"])), use_container_width=True, hide_index=True)
 
 
 def render_cached_analytics(session_state: Mapping[str, Any], model: Mapping[str, Any] | None = None) -> None:
@@ -798,7 +847,7 @@ def render_cached_analytics(session_state: Mapping[str, Any], model: Mapping[str
         st.warning("Результат пробега устарел — пересчитайте.")
     elif comparison.get("full_day_effect_valid") is not True:
         st.warning("Эффект полного дня недоступен")
-        st.write(" · ".join(comparison.get("blockers") or comparison.get("limitations") or ["Объём отбора в исходном и предлагаемом размещении различается."]))
+        st.write(format_ui_dates_in_text(" · ".join(comparison.get("blockers") or comparison.get("limitations") or ["Объём отбора в исходном и предлагаемом размещении различается."])))
     else:
         summary = authoritative_analytics_metrics(comparison) or {}
         keys = (("Исходное, м", "current_picker_distance_m"), ("Предлагаемое, м", "proposed_picker_distance_m"),
@@ -809,9 +858,9 @@ def render_cached_analytics(session_state: Mapping[str, Any], model: Mapping[str
         for column, (label, key) in zip(st.columns(len(keys)), keys): column.metric(label, summary.get(key, "—"))
     if comparison:
         orders = comparison.get("orders") or comparison.get("order_comparisons") or []
-        if orders: st.dataframe(pd.DataFrame(orders), use_container_width=True, hide_index=True)
+        if orders: st.dataframe(pd.DataFrame(format_ui_date_values(orders)), use_container_width=True, hide_index=True)
     st.subheader("Ограничения текущего расчёта")
     for text in LIMITATION_LABELS.values(): st.write(f"• {text}")
     with st.expander("Технические IDs и диагностика"):
-        st.json({"limitations": list(LIMITATION_LABELS), "comparison": comparison or {}})
+        st.json(format_ui_date_values({"limitations": list(LIMITATION_LABELS), "comparison": comparison or {}}))
     render_monthly_fact_baseline(model, session_state)
