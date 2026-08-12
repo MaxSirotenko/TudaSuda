@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Mapping, MutableMapping
 from html import escape
 from pathlib import Path
 from typing import Any, Callable
@@ -31,6 +31,7 @@ from warehouse_perf_diagnostics import ENABLED as PERF_ENABLED, measure, snapsho
 # The keys used by renderers and session data stay unchanged.  Only these
 # customer-facing navigation labels are business terms.
 WORKSPACE_TABS = ("Настройка склада", "Загрузка данных", "Правила размещения", "Сравнение вариантов", "Расчёт маршрутов", "Результаты")
+WORKSPACE_PENDING_SECTION_KEY = "workspace_pending_section"
 LEGACY_WORKSPACE_TABS = dict(zip(
     ("Склад", "Данные", "Условия модели", "Исходное / предлагаемое", "Пробег", "Аналитика"),
     WORKSPACE_TABS,
@@ -338,6 +339,13 @@ def _next_section(selected: str) -> str | None:
     return WORKSPACE_TABS[index + 1] if index + 1 < len(WORKSPACE_TABS) else None
 
 
+def apply_pending_workspace_navigation(session_state: MutableMapping[str, Any]) -> None:
+    """Apply a requested section before Streamlit creates its bound widget."""
+    target = session_state.pop(WORKSPACE_PENDING_SECTION_KEY, None)
+    if target in WORKSPACE_TABS:
+        session_state["workspace_section"] = target
+
+
 def render_next_action(selected: str, state: Mapping[str, Any]) -> None:
     """Always leave the user with an actionable, explained navigation choice."""
     target = _next_section(selected)
@@ -351,8 +359,9 @@ def render_next_action(selected: str, state: Mapping[str, Any]) -> None:
     else:
         st.write(target)
     if target and st.button(f"Перейти: {target}", key=f"workspace_next_{WORKSPACE_TABS.index(selected)}"):
-        st.session_state["workspace_section"] = target
-        st.rerun()
+        # The radio already exists in this run, so defer its bound state update
+        # until the button's natural rerun starts.
+        st.session_state[WORKSPACE_PENDING_SECTION_KEY] = target
 
 
 def normalize_rule_selection(values: Mapping[str, Any]) -> dict[str, bool]:
@@ -408,6 +417,7 @@ def render_operational_workspace(model: dict | None, *, warehouse_renderer: Call
     @media(max-width:900px){.block-container{padding-left:1rem;padding-right:1rem}.ui-status-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:560px){.ui-status-grid{grid-template-columns:1fr}}
     </style>""", unsafe_allow_html=True)
     with measure("workspace.root"):
+        apply_pending_workspace_navigation(st.session_state)
         workflow_state = state_from_session(model, st.session_state)
         render_workflow_stepper(model, st.session_state)
         legacy = st.session_state.get("workspace_section")
