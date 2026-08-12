@@ -1,5 +1,6 @@
 from warehouse_workspace_ui import (
     WORKSPACE_TABS, SUPPORTED_RULES, UNSUPPORTED_RULES, RULE_CARDS, MONTHLY_ROUTE_REQUIRED_SOURCES,
+    WORKSPACE_PENDING_SECTION_KEY, apply_pending_workspace_navigation,
     build_warehouse_zone_summary, build_workspace_rule_config, normalize_rule_selection,
     build_data_source_cards, deep_lane_edit_issue, import_status_label,
     format_compact_number, format_monthly_readiness_blocker, format_monthly_readiness_check,
@@ -14,15 +15,21 @@ def test_six_business_workspace_tabs_are_fixed():
 
 
 class _WorkspaceStreamlit:
-    def __init__(self, selected):
+    def __init__(self, selected, click=False):
         self.session_state = {"workspace_section": selected}
+        self.click = click
+        self.widget_created = False
 
     def markdown(self, *args, **kwargs): pass
-    def radio(self, _label, _options, **kwargs): return self.session_state["workspace_section"]
+    def radio(self, _label, _options, **kwargs):
+        self.widget_created = True
+        return self.session_state["workspace_section"]
     def write(self, *_args, **_kwargs): pass
     def warning(self, *_args, **_kwargs): pass
     def success(self, *_args, **_kwargs): pass
-    def button(self, *_args, **_kwargs): return False
+    def button(self, *_args, **_kwargs):
+        clicked, self.click = self.click, False
+        return clicked
 
 
 def test_only_selected_workspace_section_executes(monkeypatch):
@@ -38,6 +45,54 @@ def test_only_selected_workspace_section_executes(monkeypatch):
     calls.clear()
     workspace.render_operational_workspace(None, **renderers)
     assert calls == ["analytics_renderer"]
+
+
+def test_next_action_defers_widget_bound_state_until_next_rerun(monkeypatch):
+    fake = _WorkspaceStreamlit("Загрузка данных", click=True)
+    monkeypatch.setattr(workspace, "st", fake)
+    renderers = {key: (lambda _model: None) for key in (
+        "warehouse_renderer", "data_renderer", "rules_renderer", "comparison_renderer",
+        "distance_renderer", "analytics_renderer")}
+
+    workspace.render_operational_workspace(None, **renderers)
+
+    assert fake.widget_created
+    assert fake.session_state["workspace_section"] == "Загрузка данных"
+    assert fake.session_state[WORKSPACE_PENDING_SECTION_KEY] == "Правила размещения"
+
+    apply_pending_workspace_navigation(fake.session_state)
+    assert fake.session_state["workspace_section"] == "Правила размещения"
+    assert WORKSPACE_PENDING_SECTION_KEY not in fake.session_state
+
+
+def test_pending_navigation_is_applied_before_radio_and_only_once(monkeypatch):
+    fake = _WorkspaceStreamlit("Загрузка данных")
+    fake.session_state[WORKSPACE_PENDING_SECTION_KEY] = "Правила размещения"
+    monkeypatch.setattr(workspace, "st", fake)
+    selected = []
+    original_radio = fake.radio
+
+    def recording_radio(*args, **kwargs):
+        selected.append(fake.session_state["workspace_section"])
+        return original_radio(*args, **kwargs)
+
+    fake.radio = recording_radio
+    renderers = {key: (lambda _model: None) for key in (
+        "warehouse_renderer", "data_renderer", "rules_renderer", "comparison_renderer",
+        "distance_renderer", "analytics_renderer")}
+
+    workspace.render_operational_workspace(None, **renderers)
+    workspace.render_operational_workspace(None, **renderers)
+
+    assert selected == ["Правила размещения", "Правила размещения"]
+
+
+def test_unknown_pending_navigation_is_ignored_and_manual_selection_survives():
+    state = {"workspace_section": "Результаты", WORKSPACE_PENDING_SECTION_KEY: "Неизвестный раздел"}
+
+    apply_pending_workspace_navigation(state)
+
+    assert state == {"workspace_section": "Результаты"}
 
 
 def test_only_supported_rules_are_active_and_dependency_is_deterministic():
@@ -159,4 +214,3 @@ def test_unknown_readiness_blocker_is_never_hidden():
 
     assert "Неизвестная блокировка готовности" in rendered
     assert "`new_blocker`" in rendered
-
