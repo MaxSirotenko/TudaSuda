@@ -156,7 +156,7 @@ def build_weight_zone_readiness(receipts: list[Mapping[str, Any]] | None) -> dic
 
 def format_monthly_readiness_check(check: Mapping[str, Any]) -> str:
     """Format one structured readiness check for the non-technical UI."""
-    icon = {"pass": "✅", "fail": "❌", "info": "ℹ️"}.get(str(check.get("status")), "ℹ️")
+    icon = {"pass": "✅", "fail": "❌", "warning": "⚠️", "info": "ℹ️"}.get(str(check.get("status")), "ℹ️")
     text = f"{icon} **{check.get('title', check.get('name', 'Проверка'))}**  \n{check.get('details', '')}"
     missing = check.get("missing_dates") or []
     if check.get("name") == "placement_snapshot":
@@ -170,6 +170,23 @@ def format_monthly_readiness_check(check: Mapping[str, Any]) -> str:
     if check.get("name") == "vgh_coverage" and check.get("missing_sku_count"):
         text += f"  \nНе хватает: {check['missing_sku_count']} SKU · покрытие {check.get('percentage', 0)}%"
     return text
+
+
+MONTHLY_ROUTE_REQUIRED_SOURCES = {"historical_placement", "outbound", "receipts"}
+
+
+def monthly_readiness_message(readiness: Mapping[str, Any]) -> dict[str, str]:
+    """Build the readiness banner without treating optional VGH as a route input."""
+    if readiness.get("monthly_replay_ready") and readiness.get("vgh_ready") is False:
+        return {"severity": "warning", "title": "Данные июля готовы с ограничениями",
+            "reason": "ВГХ отсутствует, неполное или содержит конфликтующие записи.",
+            "impact": "Можно считать маршруты, ABC, частоту и расстояния. Нельзя считать достоверными весовые правила, тяжёлое/лёгкое и зависящие от ВГХ рекомендации.",
+            "action": "Можно перейти к расчёту маршрутов; для функций, зависящих от ВГХ, загрузите полные непротиворечивые данные.",
+            "target": "Расчёт маршрутов"}
+    return {"severity": "success", "title": "Данные июля готовы",
+        "reason": "Все обязательные проверки пройдены.",
+        "impact": "Можно перейти к настройке правил размещения.",
+        "action": "Перейдите к правилам размещения.", "target": "Правила размещения"}
 
 
 LIMITATION_LABELS = {
@@ -420,7 +437,7 @@ def _render_source_quality(card: Mapping[str, Any], readiness: Mapping[str, Any]
 def render_factual_data_layer(model: Mapping[str, Any] | None) -> None:
     """Render a guided metadata-only upload screen; expensive checks stay explicit."""
     st.subheader("Загрузка данных")
-    st.caption("Добавьте пять источников, проверьте качество и переходите к правилам размещения.")
+    st.caption("Добавьте исходные данные, проверьте качество и переходите к правилам размещения.")
     registry = load_registry()
     cards = build_data_source_cards(registry)
     cached_readiness = st.session_state.get("monthly_data_readiness")
@@ -431,7 +448,7 @@ def render_factual_data_layer(model: Mapping[str, Any] | None) -> None:
         "explanation": card["period"] if card["sources"] else "Файл ещё не загружен.",
         "status": "error" if card["status"].startswith("❌") else "warning" if card["status"].startswith("⚠️") else "success" if card["sources"] else "empty",
     } for card in cards])
-    mandatory_ready = all(card["sources"] for card in cards if card["source_type"] in {"historical_placement", "outbound", "receipts", "vgh"})
+    mandatory_ready = all(card["sources"] for card in cards if card["source_type"] in MONTHLY_ROUTE_REQUIRED_SOURCES)
     (st.success if mandatory_ready else st.warning)("Основные данные загружены" if mandatory_ready else "Не хватает обязательных данных")
 
     st.markdown("### Добавить файл")
@@ -447,7 +464,7 @@ def render_factual_data_layer(model: Mapping[str, Any] | None) -> None:
                 else:
                     _render_import_result(result, uploaded.name)
 
-    st.markdown("### Нужные источники")
+    st.markdown("### Источники данных")
     for card in cards:
         with st.container(border=True):
             st.markdown(f"#### {card['title']}")
@@ -492,8 +509,10 @@ def render_factual_data_layer(model: Mapping[str, Any] | None) -> None:
         st.session_state["monthly_data_readiness"] = cached_readiness
     if cached_readiness:
         if cached_readiness.get("monthly_replay_ready"):
-            render_ui_message({"severity": "success", "title": "Данные июля готовы", "reason": "Все обязательные проверки пройдены.", "impact": "Можно перейти к настройке правил размещения.", "action": "Перейдите к правилам размещения.", "target": "Правила размещения"})
+            render_ui_message(monthly_readiness_message(cached_readiness))
             st.markdown("### Следующий шаг: «Перейти к правилам размещения»")
+            for check in cached_readiness.get("diagnostics", {}).get("checks", []):
+                if check.get("status") == "warning": st.markdown(format_monthly_readiness_check(check))
         else:
             blockers = cached_readiness.get("hard_blockers", [])
             render_ui_message({"severity": "error", "title": "Требуется исправление", "reason": f"Обнаружено проблем: {len(blockers)}.", "impact": "Переход к корректному расчёту пока недоступен.", "action": "Исправьте перечисленные проблемы и повторите проверку.", "target": "Загрузка данных"})
