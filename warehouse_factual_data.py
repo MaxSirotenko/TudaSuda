@@ -1040,8 +1040,10 @@ def build_monthly_data_readiness(registry: Mapping[str, Any], model: Mapping[str
     if overlaps: blockers.append({"code": "multiple_active_placement_sources_for_snapshot", "dates": overlaps})
     analyses = {source: _source_conflicts(registry, source) for source in ("outbound", "receipts", "inventory", "vgh")}
     for source, analysis in analyses.items():
-        if analysis["conflicts"]: blockers.append({"code": "conflicting_factual_business_key", "source_type": source,
-                                                   "count": len(analysis["conflicts"]), "preview": analysis["conflicts"][:10]})
+        if analysis["conflicts"]:
+            issue = {"code": "conflicting_factual_business_key", "source_type": source,
+                     "count": len(analysis["conflicts"]), "preview": analysis["conflicts"][:10]}
+            (warnings if source == "vgh" else blockers).append(issue)
     outbound_rows = []
     for day in required_days[:-1]:
         view = load_effective_rows("outbound", day, registry=registry, root=root, strict=False)
@@ -1049,7 +1051,9 @@ def build_monthly_data_readiness(registry: Mapping[str, Any], model: Mapping[str
     demanded = {row.get("sku_key") for row in outbound_rows if row.get("sku_key")}
     vgh_keys = {sku for dataset in active_datasets(registry, "vgh") for sku in dataset.get("index", {}).get("sku_keys", [])}
     missing_vgh = sorted(demanded - vgh_keys)
-    if missing_vgh: blockers.append({"code": "missing_vgh_for_demanded_sku", "count": len(missing_vgh), "preview": missing_vgh[:10]})
+    if missing_vgh:
+        warnings.append({"code": "missing_vgh_for_demanded_sku", "count": len(missing_vgh),
+                         "preview": missing_vgh[:10]})
     if not outbound_rows: blockers.append({"code": "outbound_not_available"})
     receipt_dates = {day for dataset in active_datasets(registry, "receipts") for day in dataset.get("index", {}).get("dates", [])}
     if receipts_required and not (set(required_days[:-1]) & receipt_dates): blockers.append({"code": "receipts_not_available"})
@@ -1103,7 +1107,7 @@ def build_monthly_data_readiness(registry: Mapping[str, Any], model: Mapping[str
         {"name": "receipts", "status": "pass" if receipts_ready else "fail", "title": "Приходы",
          "available": bool(period_days & receipt_dates), "rows": receipt_rows, "documents": receipt_documents,
          "details": f"{receipt_rows} строк · {receipt_documents} документов" if period_days & receipt_dates else "отсутствуют"},
-        {"name": "vgh_coverage", "status": "pass" if vgh_ready else "fail", "title": "ВГХ",
+        {"name": "vgh_coverage", "status": "pass" if vgh_ready else "warning", "title": "ВГХ",
          "covered_sku": covered_sku, "total_required_sku": required_sku,
          "percentage": round(100 * covered_sku / required_sku, 1) if required_sku else 100.0,
          "missing_sku_count": len(missing_vgh), "details": f"{covered_sku} / {required_sku} SKU"},

@@ -25,6 +25,23 @@ def _outbound(qty=1, ref="ref", line=1, day="2026-07-15"):
             "Номенклатура": "N", "Характеристика": "C", "РасчетноеОтгруженоКоробок": qty}
 
 
+def _ready_route_inputs(tmp_path, outbound_rows=None):
+    placements = [{"ДатаСреза": (date(2026, 7, 1) + timedelta(days=i)).isoformat(), "Паллета": f"P{i}",
+        "Номенклатура": "N", "Характеристика": "C", "КоличествоОстатокТовара": 1,
+        "Ячейка": "A-01", "ПорядокСборки": 1, "КоличествоОстатокПоложения": 1} for i in range(32)]
+    import_excel_dataset(_xlsx(placements), "размещение июль.xlsx", root=tmp_path)
+    import_excel_dataset(_xlsx(outbound_rows or [_outbound()]), "РО июль.xlsx", root=tmp_path)
+    import_excel_dataset(_xlsx([{"Ссылка": "r", "Номер": "R", "Дата": "2026-07-15", "Склад": "A",
+        "НомерСтроки": 1, "Номенклатура": "N", "Характеристика": "C", "КоличествоКоробок": 1}]),
+        "ПО июль.xlsx", root=tmp_path)
+    return {"model_id": "M", "cells": [{"cell_key": "1|1|1", "source_cell": "A-01"}]}
+
+
+def _vgh(sku="N", characteristic="C", layers=1):
+    return {"Номенклатура": sku, "Характеристика": characteristic,
+            "КоличествоКоробовВОдномСлоеНаПаллете": 1, "КоличествоСлоевНаПаллете": layers}
+
+
 def test_effective_duplicate_collapses_with_complete_provenance(tmp_path):
     a = import_excel_dataset(_xlsx([_outbound()]), "РО июль.xlsx", root=tmp_path)
     duplicate = _outbound(); duplicate["НомерРО"] = "alternate provenance-only number"
@@ -114,6 +131,58 @@ def test_complete_july_monthly_readiness_contract(tmp_path):
     result = build_monthly_data_readiness(load_registry(tmp_path), model, "2026-07-01", "2026-07-31", root=tmp_path)
     assert result["monthly_replay_ready"] is True
     assert result["coverage"]["placement_checkpoints"] == 32
+
+
+def test_missing_vgh_warns_without_blocking_monthly_routes(tmp_path):
+    model = _ready_route_inputs(tmp_path)
+    result = build_monthly_data_readiness(load_registry(tmp_path), model, "2026-07-01", "2026-07-31", root=tmp_path)
+    checks = {check["name"]: check for check in result["diagnostics"]["checks"]}
+
+    assert result["coverage"]["placement_checkpoints"] == 32
+    assert result["monthly_replay_ready"] is True
+    assert result["vgh_ready"] is False
+    assert "missing_vgh_for_demanded_sku" not in {item["code"] for item in result["hard_blockers"]}
+    warning = next(item for item in result["warnings"] if item["code"] == "missing_vgh_for_demanded_sku")
+    assert warning["count"] == 1 and len(warning["preview"]) == 1
+    assert checks["vgh_coverage"]["status"] == "warning"
+
+
+def test_partial_vgh_retains_coverage_diagnostics_without_blocking(tmp_path):
+    model = _ready_route_inputs(tmp_path, [_outbound(), _outbound(ref="second", line=2) | {"Номенклатура": "N2"}])
+    import_excel_dataset(_xlsx([_vgh()]), "ВГХ.xlsx", root=tmp_path)
+    result = build_monthly_data_readiness(load_registry(tmp_path), model, "2026-07-01", "2026-07-31", root=tmp_path)
+    check = next(item for item in result["diagnostics"]["checks"] if item["name"] == "vgh_coverage")
+
+    assert result["monthly_replay_ready"] is True
+    assert result["vgh_ready"] is False
+    assert check["missing_sku_count"] == 1
+    assert check["percentage"] == 50.0
+
+
+def test_conflicting_vgh_warns_and_remains_non_authoritative(tmp_path):
+    model = _ready_route_inputs(tmp_path)
+    import_excel_dataset(_xlsx([_vgh(layers=1)]), "ВГХ первая.xlsx", root=tmp_path)
+    import_excel_dataset(_xlsx([_vgh(layers=2)]), "ВГХ вторая.xlsx", root=tmp_path)
+    registry = load_registry(tmp_path)
+    result = build_monthly_data_readiness(registry, model, "2026-07-01", "2026-07-31", root=tmp_path)
+
+    assert result["monthly_replay_ready"] is True
+    assert result["vgh_ready"] is False
+    warning = next(item for item in result["warnings"] if item["code"] == "conflicting_factual_business_key")
+    assert warning["source_type"] == "vgh" and warning["count"] == 1
+    with pytest.raises(ValueError, match="conflicting_factual_business_key"):
+        load_effective_rows("vgh", registry=registry, root=tmp_path)
+
+
+def test_complete_vgh_has_no_vgh_warnings(tmp_path):
+    model = _ready_route_inputs(tmp_path)
+    import_excel_dataset(_xlsx([_vgh()]), "ВГХ.xlsx", root=tmp_path)
+    result = build_monthly_data_readiness(load_registry(tmp_path), model, "2026-07-01", "2026-07-31", root=tmp_path)
+
+    assert result["monthly_replay_ready"] is True
+    assert result["vgh_ready"] is True
+    assert not [item for item in result["warnings"] if item.get("source_type") == "vgh"
+                or item["code"] == "missing_vgh_for_demanded_sku"]
 
 
 def test_mixed_excel_placement_dates_preserve_all_july_snapshots(tmp_path):

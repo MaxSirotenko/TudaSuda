@@ -1,8 +1,8 @@
 from warehouse_workspace_ui import (
-    WORKSPACE_TABS, SUPPORTED_RULES, UNSUPPORTED_RULES, RULE_CARDS,
+    WORKSPACE_TABS, SUPPORTED_RULES, UNSUPPORTED_RULES, RULE_CARDS, MONTHLY_ROUTE_REQUIRED_SOURCES,
     build_warehouse_zone_summary, build_workspace_rule_config, normalize_rule_selection,
     build_data_source_cards, deep_lane_edit_issue, import_status_label,
-    format_compact_number, status_card_html,
+    format_compact_number, format_monthly_readiness_check, monthly_readiness_message, status_card_html,
 )
 import warehouse_workspace_ui as workspace
 
@@ -119,3 +119,16 @@ def test_unknown_status_uses_neutral_not_completed_presentation():
     card = status_card_html("Проверка качества", "Нет данных", "Запустите проверку", "unknown")
     assert "⬜" in card and "Не выполнено" in card
     assert "ui-status-card empty" in card
+
+
+def test_incomplete_vgh_is_a_visible_warning_but_routes_remain_available():
+    message = monthly_readiness_message({"monthly_replay_ready": True, "vgh_ready": False})
+    rendered = format_monthly_readiness_check({"name": "vgh_coverage", "status": "warning", "title": "ВГХ",
+        "details": "658 / 924 SKU", "missing_sku_count": 266, "percentage": 71.2})
+
+    assert message["severity"] == "warning"
+    assert message["title"] == "Данные июля готовы с ограничениями"
+    assert "Можно считать маршруты, ABC, частоту и расстояния" in message["impact"]
+    assert "тяжёлое/лёгкое" in message["impact"]
+    assert rendered.startswith("⚠️ **ВГХ**")
+    assert "vgh" not in MONTHLY_ROUTE_REQUIRED_SOURCES
