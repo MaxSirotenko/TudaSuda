@@ -2,7 +2,8 @@ from warehouse_workspace_ui import (
     WORKSPACE_TABS, SUPPORTED_RULES, UNSUPPORTED_RULES, RULE_CARDS, MONTHLY_ROUTE_REQUIRED_SOURCES,
     build_warehouse_zone_summary, build_workspace_rule_config, normalize_rule_selection,
     build_data_source_cards, deep_lane_edit_issue, import_status_label,
-    format_compact_number, format_monthly_readiness_check, monthly_readiness_message, status_card_html,
+    format_compact_number, format_monthly_readiness_blocker, format_monthly_readiness_check,
+    monthly_readiness_blocker_details, monthly_readiness_message, status_card_html,
 )
 import warehouse_workspace_ui as workspace
 
@@ -132,3 +133,30 @@ def test_incomplete_vgh_is_a_visible_warning_but_routes_remain_available():
     assert "тяжёлое/лёгкое" in message["impact"]
     assert rendered.startswith("⚠️ **ВГХ**")
     assert "vgh" not in MONTHLY_ROUTE_REQUIRED_SOURCES
+
+
+def test_historical_cell_blocker_shows_unique_addresses_and_day_repetitions():
+    blocker = {
+        "code": "historical_cell_unresolved",
+        "demand_relevant_cells": 137,
+        "unique_source_cells": 10,
+        "source_cell_preview": ["152-32", "152-34"],
+    }
+
+    details = monthly_readiness_blocker_details(blocker)
+    rendered = format_monthly_readiness_blocker(blocker)
+
+    assert details["title"] == "Исторические ячейки не сопоставлены с моделью склада"
+    assert "Уникальных адресов: 10" in rendered
+    assert "Повторений адресов по дням: 137" in rendered
+    assert "`152-32`" in rendered
+    assert "\nЧто сделать:" in rendered
+    assert "\\n" not in rendered
+
+
+def test_unknown_readiness_blocker_is_never_hidden():
+    rendered = format_monthly_readiness_blocker({"code": "new_blocker"})
+
+    assert "Неизвестная блокировка готовности" in rendered
+    assert "`new_blocker`" in rendered
+
