@@ -133,6 +133,41 @@ def test_complete_july_monthly_readiness_contract(tmp_path):
     assert result["coverage"]["placement_checkpoints"] == 32
 
 
+def test_monthly_readiness_builds_demand_without_effective_outbound_reads(tmp_path, monkeypatch):
+    import warehouse_factual_data as factual
+
+    model = _ready_route_inputs(tmp_path)
+    original = factual.load_effective_rows
+
+    def reject_outbound(source_type, *args, **kwargs):
+        if source_type == "outbound":
+            raise AssertionError("readiness must use the compact outbound index")
+        return original(source_type, *args, **kwargs)
+
+    monkeypatch.setattr(factual, "load_effective_rows", reject_outbound)
+    result = build_monthly_data_readiness(load_registry(tmp_path), model,
+                                          "2026-07-01", "2026-07-31", root=tmp_path)
+
+    assert result["monthly_replay_ready"] is True
+    assert result["coverage"]["demanded_sku"] == 1
+    outbound = next(check for check in result["diagnostics"]["checks"] if check["name"] == "outbound")
+    assert outbound["available"] is True and outbound["rows"] == 1
+
+
+def test_monthly_readiness_outbound_conflict_is_exact_hard_blocker(tmp_path):
+    model = _ready_route_inputs(tmp_path)
+    import_excel_dataset(_xlsx([_outbound(2)]), "РО продолжение.xlsx", root=tmp_path)
+
+    result = build_monthly_data_readiness(load_registry(tmp_path), model,
+                                          "2026-07-01", "2026-07-31", root=tmp_path)
+
+    blocker = next(item for item in result["hard_blockers"]
+                   if item["code"] == "conflicting_factual_business_key")
+    assert blocker["source_type"] == "outbound" and blocker["count"] == 1
+    assert len(blocker["preview"]) == 1 and len(blocker["preview"][0]["occurrences"]) == 2
+    assert result["monthly_replay_ready"] is False
+
+
 def test_missing_vgh_warns_without_blocking_monthly_routes(tmp_path):
     model = _ready_route_inputs(tmp_path)
     result = build_monthly_data_readiness(load_registry(tmp_path), model, "2026-07-01", "2026-07-31", root=tmp_path)
