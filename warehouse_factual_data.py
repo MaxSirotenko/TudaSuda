@@ -12,6 +12,7 @@ import hashlib
 import json
 import math
 import os
+import sqlite3
 import tempfile
 import shutil
 from collections import Counter, defaultdict
@@ -430,12 +431,21 @@ def _write_jsonl(path: Path, rows: Iterable[Mapping[str, Any]]) -> None:
             stream.write(json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
 
 
-def _read_jsonl(path: Path) -> list[dict[str, Any]]:
-    if not path.exists(): return []
+def _iter_jsonl(path: Path) -> Iterable[dict[str, Any]]:
+    """Yield a gzip JSONL artifact without retaining its decoded rows."""
+    if not path.exists():
+        return
     record_artifact_read(path.stat().st_size)
     with measure("factual.artifact_read"):
         with gzip.open(path, "rt", encoding="utf-8") as stream:
-            return [json.loads(line) for line in stream if line.strip()]
+            for line in stream:
+                if line.strip():
+                    yield json.loads(line)
+
+
+def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+    """Retain the legacy materialized-reader contract for its existing callers."""
+    return list(_iter_jsonl(path))
 
 
 def load_registry(root: Path = DATA_ROOT) -> dict[str, Any]:
@@ -889,6 +899,74 @@ def _source_conflicts(registry: Mapping[str, Any], source_type: str, day: str | 
     return {"duplicates": duplicates, "conflicts": conflicts, "groups": groups}
 
 
+@profiled("factual.readiness_compact_conflicts")
+def _readiness_source_conflicts(registry: Mapping[str, Any], source_type: str,
+                                *, preview_limit: int = 10, occurrence_limit: int = 10) -> dict[str, Any]:
+    """Find exact source conflicts using disk storage and bounded Python memory."""
+    fd, database_name = tempfile.mkstemp(prefix=f"factual-{source_type}-", suffix=".sqlite3")
+    os.close(fd)
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(database_name)
+        connection.execute("PRAGMA journal_mode=OFF")
+        connection.execute("PRAGMA synchronous=OFF")
+        connection.execute("CREATE TABLE evidence (business_key TEXT, fingerprint TEXT, evidence TEXT)")
+        batch: list[tuple[str, str, str]] = []
+
+        def add(evidence: Mapping[str, Any]) -> None:
+            batch.append((str(evidence["business_key"]), str(evidence["payload_fingerprint"]),
+                          json.dumps(evidence, ensure_ascii=False, separators=(",", ":"), default=str)))
+            if len(batch) >= 1000:
+                connection.executemany("INSERT INTO evidence VALUES (?, ?, ?)", batch)
+                batch.clear()
+
+        for dataset in active_datasets(registry, source_type):
+            artifact = Path(str(dataset["artifact"]))
+            business_index = artifact / "business_index.jsonl.gz"
+            if business_index.exists():
+                with measure(f"factual.readiness_business_index_scan.{source_type}"):
+                    for evidence in _iter_jsonl(business_index):
+                        add(evidence)
+            else:
+                # Legacy artifacts are deliberately visited one partition at a time.
+                for day in dataset.get("partitions", dataset.get("index", {}).get("dates", [])):
+                    partition = artifact / "canonical" / f"date={day}.jsonl.gz"
+                    for row in _iter_jsonl(partition):
+                        evidence = _business_evidence(row, source_type)
+                        if evidence is not None:
+                            add(evidence)
+        if batch:
+            connection.executemany("INSERT INTO evidence VALUES (?, ?, ?)", batch)
+        connection.execute("CREATE INDEX evidence_key_fp ON evidence (business_key, fingerprint)")
+        connection.commit()
+        conflict_count = connection.execute(
+            "SELECT COUNT(*) FROM (SELECT business_key FROM evidence GROUP BY business_key HAVING COUNT(DISTINCT fingerprint) > 1)"
+        ).fetchone()[0]
+        duplicate_count = connection.execute(
+            "SELECT COUNT(*) FROM (SELECT business_key FROM evidence GROUP BY business_key "
+            "HAVING COUNT(DISTINCT fingerprint) = 1 AND COUNT(*) > 1)"
+        ).fetchone()[0]
+        keys = [row[0] for row in connection.execute(
+            "SELECT business_key FROM evidence GROUP BY business_key "
+            "HAVING COUNT(DISTINCT fingerprint) > 1 ORDER BY business_key LIMIT ?", (preview_limit,))]
+        preview = []
+        for key in keys:
+            occurrences = [json.loads(row[0]) for row in connection.execute(
+                "SELECT evidence FROM evidence WHERE business_key = ? ORDER BY fingerprint, rowid LIMIT ?",
+                (key, occurrence_limit))]
+            preview.append({"code": "conflicting_factual_business_key", "source_type": source_type,
+                            "business_key": json.loads(key), "occurrences": occurrences})
+        return {"source_type": source_type, "conflict_count": conflict_count,
+                "duplicate_count": duplicate_count, "preview": preview}
+    finally:
+        if connection is not None:
+            connection.close()
+        try:
+            os.unlink(database_name)
+        except FileNotFoundError:
+            pass
+
+
 @profiled("factual.load_effective_rows")
 def load_effective_rows(source_type: str, day: str | None = None, *, registry: Mapping[str, Any] | None = None,
                         root: Path = DATA_ROOT, strict: bool = True) -> dict[str, Any]:
@@ -1038,41 +1116,59 @@ def build_monthly_data_readiness(registry: Mapping[str, Any], model: Mapping[str
     extra_placement_dates = sorted(set(imported_placement_dates) - set(required_days))
     if missing: blockers.append({"code": "missing_placement_snapshot", "dates": missing})
     if overlaps: blockers.append({"code": "multiple_active_placement_sources_for_snapshot", "dates": overlaps})
-    analyses = {source: _source_conflicts(registry, source) for source in ("outbound", "receipts", "inventory", "vgh")}
+    analyses = {source: _readiness_source_conflicts(registry, source)
+                for source in ("outbound", "receipts", "inventory", "vgh")}
     for source, analysis in analyses.items():
-        if analysis["conflicts"]:
+        if analysis["conflict_count"]:
             issue = {"code": "conflicting_factual_business_key", "source_type": source,
-                     "count": len(analysis["conflicts"]), "preview": analysis["conflicts"][:10]}
+                     "count": analysis["conflict_count"], "preview": analysis["preview"]}
             (warnings if source == "vgh" else blockers).append(issue)
-    outbound_rows = []
-    for day in required_days[:-1]:
-        view = load_effective_rows("outbound", day, registry=registry, root=root, strict=False)
-        outbound_rows.extend(positive_outbound(view["rows"]))
-    demanded = {row.get("sku_key") for row in outbound_rows if row.get("sku_key")}
+    demanded_sku_by_day: dict[str, set[str]] = {day: set() for day in required_days[:-1]}
+    positive_demand = False
+    with measure("factual.readiness_demand_index"):
+        for dataset in active_datasets(registry, "outbound"):
+            daily = dataset.get("index", {}).get("daily", {})
+            has_compact_demand_index = any("positive_sku_keys" in counts for counts in daily.values())
+            for day in required_days[:-1]:
+                counts = daily.get(day, {})
+                sku_keys = counts.get("positive_sku_keys", []) if has_compact_demand_index else None
+                if sku_keys is None:
+                    # Parser-vintage fallback: stream only this day's partition.
+                    sku_keys = set()
+                    partition = Path(str(dataset["artifact"])) / "canonical" / f"date={day}.jsonl.gz"
+                    for row in _iter_jsonl(partition):
+                        if (isinstance(row.get("quantity"), (int, float)) and row["quantity"] > 0
+                                and row.get("sku_key")):
+                            sku_keys.add(row["sku_key"])
+                    positive_demand |= bool(sku_keys)
+                else:
+                    positive_demand |= bool(sku_keys) or float(counts.get("positive_quantity", 0) or 0) > 0
+                demanded_sku_by_day[day].update(str(sku) for sku in sku_keys if sku)
+    demanded = set().union(*demanded_sku_by_day.values()) if demanded_sku_by_day else set()
     vgh_keys = {sku for dataset in active_datasets(registry, "vgh") for sku in dataset.get("index", {}).get("sku_keys", [])}
     missing_vgh = sorted(demanded - vgh_keys)
     if missing_vgh:
         warnings.append({"code": "missing_vgh_for_demanded_sku", "count": len(missing_vgh),
                          "preview": missing_vgh[:10]})
-    if not outbound_rows: blockers.append({"code": "outbound_not_available"})
+    if not positive_demand: blockers.append({"code": "outbound_not_available"})
     receipt_dates = {day for dataset in active_datasets(registry, "receipts") for day in dataset.get("index", {}).get("dates", [])}
     if receipts_required and not (set(required_days[:-1]) & receipt_dates): blockers.append({"code": "receipts_not_available"})
     route_checks = []
     usable = set(usable_cell_keys or [str(c.get("cell_key")) for c in model.get("cells", []) if c.get("cell_key")])
-    if not overlaps:
-        for day in required_days[:-1]:
-            placement = load_effective_placement(day, model, registry=registry, root=root, strict=False)
-            day_demand = {r.get("sku_key") for r in outbound_rows if _day(r) == day}
-            route_checks.append(build_fact_route_readiness(placement["rows"], day_demand, usable))
+    with measure("factual.readiness_daily_cell_resolution"):
+        if not overlaps:
+            for day in required_days[:-1]:
+                placement = load_effective_placement(day, model, registry=registry, root=root, strict=False)
+                route_checks.append(build_fact_route_readiness(placement["rows"], demanded_sku_by_day[day], usable))
     unresolved_demand = sum(x["demand_relevant_cell_coverage"]["total"] - x["demand_relevant_cell_coverage"]["resolved"] for x in route_checks)
     if unresolved_demand: blockers.append({"code": "historical_cell_unresolved", "demand_relevant_cells": unresolved_demand})
     active_signature = _fingerprint(sorted(d["dataset_id"] for d in active_datasets(registry)))
     mapping_signature = _fingerprint(load_cell_mappings(root))
-    source_conflict_count = sum(len(x["conflicts"]) for x in analyses.values()) + len(overlaps)
+    source_conflict_count = sum(x["conflict_count"] for x in analyses.values()) + len(overlaps)
     placement_ready = not missing and not overlaps
-    outbound_ready = bool(outbound_rows) and not analyses["outbound"]["conflicts"]
-    receipts_ready = (not receipts_required or bool(set(required_days[:-1]) & receipt_dates)) and not analyses["receipts"]["conflicts"]
-    vgh_ready = not missing_vgh and not analyses["vgh"]["conflicts"]
+    outbound_ready = positive_demand and not analyses["outbound"]["conflict_count"]
+    receipts_ready = (not receipts_required or bool(set(required_days[:-1]) & receipt_dates)) and not analyses["receipts"]["conflict_count"]
+    vgh_ready = not missing_vgh and not analyses["vgh"]["conflict_count"]
     cell_ready = not unresolved_demand and bool(route_checks)
     registry_ready = not registry_blockers
     period_days = set(required_days[:-1])
@@ -1102,8 +1198,8 @@ def build_monthly_data_readiness(registry: Mapping[str, Any], model: Mapping[str
          "expected_dates": required_days, "detected_dates": imported_placement_dates,
          "details": f"{len(required_days) - len(missing)} / {len(required_days)} дней"},
         {"name": "outbound", "status": "pass" if outbound_ready else "fail", "title": "Расходные ордера",
-         "available": bool(outbound_rows), "rows": outbound_count, "documents": outbound_documents,
-         "details": f"{outbound_count} строк · {outbound_documents} документов" if outbound_rows else "отсутствуют"},
+         "available": positive_demand, "rows": outbound_count, "documents": outbound_documents,
+         "details": f"{outbound_count} строк · {outbound_documents} документов" if positive_demand else "отсутствуют"},
         {"name": "receipts", "status": "pass" if receipts_ready else "fail", "title": "Приходы",
          "available": bool(period_days & receipt_dates), "rows": receipt_rows, "documents": receipt_documents,
          "details": f"{receipt_rows} строк · {receipt_documents} документов" if period_days & receipt_dates else "отсутствуют"},

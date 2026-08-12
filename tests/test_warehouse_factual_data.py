@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from datetime import datetime
 from io import BytesIO
+import gzip
+import json
+from pathlib import Path
+import tracemalloc
 
 import pandas as pd
 
@@ -20,6 +24,61 @@ def test_date_summary_is_index_only(monkeypatch):
     monkeypatch.setattr(factual, "load_dataset_rows", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("partition read")))
     summary = date_summary(registry, "2026-07-15")
     assert summary["outbound"] == {"documents": 2, "lines": 3, "positive_demand": 7.0}
+
+
+def test_compact_conflicts_stream_business_index_with_bounded_preview(tmp_path, monkeypatch):
+    artifact = tmp_path / "dataset"
+    artifact.mkdir()
+    path = artifact / "business_index.jsonl.gz"
+    with gzip.open(path, "wt", encoding="utf-8") as stream:
+        for number in range(100_000):
+            key = number // 2
+            fingerprint = f"fp-{key}" if key >= 10 else f"conflict-{number % 2}"
+            stream.write(json.dumps({"business_key": json.dumps([f"ref-{key}", 1]),
+                "payload_fingerprint": fingerprint, "day": "2026-07-15",
+                "dataset_id": "dataset", "source_row": number + 2}) + "\n")
+    registry = {"datasets": [{"active": True, "source_type": "outbound",
+                               "dataset_id": "dataset", "artifact": str(artifact)}]}
+    original = factual._read_jsonl
+
+    def reject_materialized_index(read_path):
+        if Path(read_path).name == "business_index.jsonl.gz":
+            raise AssertionError("business index must be streamed")
+        return original(read_path)
+
+    monkeypatch.setattr(factual, "_read_jsonl", reject_materialized_index)
+    tracemalloc.start()
+    analysis = factual._readiness_source_conflicts(registry, "outbound")
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    assert analysis["conflict_count"] == 10
+    assert analysis["duplicate_count"] == 49_990
+    assert len(analysis["preview"]) == 10
+    assert all(len(item["occurrences"]) <= 10 for item in analysis["preview"])
+    assert "groups" not in analysis
+    assert peak < 100 * 1024 * 1024
+
+
+def test_compact_conflicts_reads_legacy_partitions_sequentially(tmp_path, monkeypatch):
+    artifact = tmp_path / "legacy"
+    canonical = artifact / "canonical"
+    canonical.mkdir(parents=True)
+    rows = [{"document_ref": "ref", "line_number": 1, "occurred_at": f"{day}T00:00:00",
+             "warehouse": "A", "sku_key": "sku", "quantity": quantity,
+             "dataset_id": "legacy", "source_row": index}
+            for index, (day, quantity) in enumerate((("2026-07-01", 1), ("2026-07-02", 2)), 2)]
+    for row in rows:
+        factual._write_jsonl(canonical / f"date={row['occurred_at'][:10]}.jsonl.gz", [row])
+    dataset = {"active": True, "source_type": "outbound", "dataset_id": "legacy",
+               "artifact": str(artifact), "partitions": ["2026-07-01", "2026-07-02"]}
+    monkeypatch.setattr(factual, "load_dataset_rows",
+                        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("full dataset load")))
+
+    analysis = factual._readiness_source_conflicts({"datasets": [dataset]}, "outbound")
+
+    assert analysis["conflict_count"] == 1
+    assert analysis["preview"][0]["business_key"] == ["ref", 1]
 
 
 def _xlsx(rows):
