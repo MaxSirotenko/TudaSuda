@@ -323,6 +323,20 @@ def test_blocked_monthly_readiness_exposes_structured_reasons(tmp_path):
     assert checks["inventory"]["available"] is False
 
 
+def test_old_parser_artifact_is_excluded_and_requires_reimport(tmp_path):
+    import_excel_dataset(_xlsx([_outbound()]), "РО июль.xlsx", root=tmp_path,
+                         parser_version="factual-july-v4")
+    result = build_monthly_data_readiness(load_registry(tmp_path),
+        {"model_id": "M", "cells": []}, "2026-07-01", "2026-07-31", root=tmp_path,
+        receipts_required=False)
+
+    blocker = next(item for item in result["hard_blockers"] if item["code"] == "parser_reimport_required")
+    assert blocker["datasets"][0]["source_filename"] == "РО июль.xlsx"
+    assert result["outbound_ready"] is False
+    check = next(item for item in result["diagnostics"]["checks"] if item["name"] == "parser_compatibility")
+    assert check["status"] == "fail"
+
+
 def test_monthly_readiness_ui_formatter_is_human_readable():
     from warehouse_workspace_ui import format_monthly_readiness_check
 
