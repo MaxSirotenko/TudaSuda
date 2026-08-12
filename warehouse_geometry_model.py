@@ -393,6 +393,8 @@ def build_geometry_model(
                 "initial_weight_zone": initial_weight_zone,
                 "physical_slots": physical_slots,
             }
+            cell["cell_key"] = cell_key(cell)
+            cell["source_cell"] = _source_cell_identity(cell)
             cells.append(cell)
             row_cells.append(cell)
         numeric_cells = [int(float(c["cell_number"])) for c in row_cells if re.fullmatch(r"\d+(?:\.0)?", c["cell_number"])]
@@ -531,6 +533,7 @@ def load_geometry_model() -> dict[str, Any] | None:
     if "base_cells" not in data:
         data["base_cells"] = [dict(cell) for cell in data.get("cells", [])]
     data.setdefault("cross_aisles", [])
+    _ensure_cell_identity_fields(data)
     overrides = load_manual_overrides()
     if overrides and overrides.get("source_model_id") == data.get("model_id"):
         data = apply_manual_overrides(data, overrides)
@@ -539,6 +542,25 @@ def load_geometry_model() -> dict[str, Any] | None:
 
 def cell_key(cell: dict[str, Any]) -> str:
     return f"{_display_value(cell.get('row_number'))}|{_display_value(cell.get('cell_number'))}|{_display_value(cell.get('tier'))}"
+
+
+def _source_cell_identity(cell: dict[str, Any]) -> str:
+    row_number = _display_value(cell.get("row_number"))
+    cell_number = _display_value(cell.get("cell_number"))
+    if not row_number or not cell_number:
+        return ""
+    return f"{row_number}-{cell_number}"
+
+
+def _ensure_cell_identity_fields(model: dict[str, Any]) -> None:
+    for collection_name in ("cells", "base_cells"):
+        for cell in model.get(collection_name, []):
+            if not isinstance(cell, dict):
+                continue
+            if not cell.get("cell_key"):
+                cell["cell_key"] = cell_key(cell)
+            if not cell.get("source_cell"):
+                cell["source_cell"] = _source_cell_identity(cell)
 
 
 def _now_iso() -> str:
