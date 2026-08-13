@@ -130,3 +130,7 @@ This change introduces one small persistence utility and a render-settings bound
 | `warehouse_workflow_ui_state.py` | 93 | — | warehouse_workspace_ui | — | — | Y | — | Y | — |
 | `warehouse_workspace_ui.py` | 884 | warehouse_placement_zones, warehouse_scenario_comparison_ui, warehouse_ui_messages, warehouse_workflow_ui_state, warehouse_factual_data | virtual_warehouse_app | Y | Y | Y | Y | mixed | Y |
 | `warehouse_zone_boundaries.py` | 292 | warehouse_placement_zones | virtual_warehouse_app | — | — | Y | — | Y | — |
+
+## PR #189 continuation outcome
+
+The first stage only extracted persistence/render-settings. The continuation replaced hard-coded read claims with scoped production-reader instrumentation, introduced a real warm application orchestration scenario, extracted map helpers and geometry render orchestration, split factual artifact I/O behind the compatibility façade, and lazily loads the outbound experiment screen. Final LOC is 3,020 for the app (3,101 before) and 1,428 for the factual façade (1,440 before); the new modules are responsibility-specific rather than a replacement monolith. Routing and optimizer were measured before deciding not to change their semantics.

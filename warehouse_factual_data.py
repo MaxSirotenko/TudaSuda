@@ -25,7 +25,13 @@ from pathlib import Path
 from typing import Any, Callable
 
 import pandas as pd
-from warehouse_perf_diagnostics import measure, profiled, record_artifact_read
+from warehouse_perf_diagnostics import measure, profiled, record_file_read
+from warehouse_factual_artifacts import (
+    atomic_json as _artifact_atomic_json,
+    iter_jsonl as _artifact_iter_jsonl,
+    read_jsonl as _artifact_read_jsonl,
+    write_jsonl as _artifact_write_jsonl,
+)
 
 from warehouse_business_identity import build_canonical_sku_identity, find_canonical_identity_collisions
 
@@ -470,38 +476,20 @@ def _known_july_placement_check(filename: str, rows: list[dict[str, Any]]) -> di
 
 
 def _atomic_json(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, name = tempfile.mkstemp(dir=path.parent, prefix=path.name, suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            json.dump(value, stream, ensure_ascii=False, sort_keys=True, indent=2)
-        os.replace(name, path)
-    finally:
-        if os.path.exists(name): os.unlink(name)
+    _artifact_atomic_json(path, value)
 
 
 def _write_jsonl(path: Path, rows: Iterable[Mapping[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with gzip.open(path, "wt", encoding="utf-8", compresslevel=FACTUAL_GZIP_COMPRESSLEVEL) as stream:
-        for row in rows:
-            stream.write(json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
+    _artifact_write_jsonl(path, rows, compresslevel=FACTUAL_GZIP_COMPRESSLEVEL)
 
 
 def _iter_jsonl(path: Path) -> Iterable[dict[str, Any]]:
-    """Yield a gzip JSONL artifact without retaining its decoded rows."""
-    if not path.exists():
-        return
-    record_artifact_read(path.stat().st_size)
-    with measure("factual.artifact_read"):
-        with gzip.open(path, "rt", encoding="utf-8") as stream:
-            for line in stream:
-                if line.strip():
-                    yield json.loads(line)
+    yield from _artifact_iter_jsonl(path)
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     """Retain the legacy materialized-reader contract for its existing callers."""
-    return list(_iter_jsonl(path))
+    return _artifact_read_jsonl(path)
 
 
 def load_registry(root: Path = DATA_ROOT) -> dict[str, Any]:
@@ -510,6 +498,7 @@ def load_registry(root: Path = DATA_ROOT) -> dict[str, Any]:
     try:
         with measure("factual.load_registry"):
             state = json.loads(path.read_text(encoding="utf-8"))
+            record_file_read("factual_registry", path.stat().st_size)
     except (OSError, json.JSONDecodeError):
         return {"registry_version": 1, "datasets": [], "warning": "registry_unreadable"}
     if not isinstance(state.get("datasets"), list):

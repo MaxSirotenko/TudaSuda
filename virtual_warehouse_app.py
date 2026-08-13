@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import copy
-import hashlib
 import json
 import subprocess
 from dataclasses import asdict
@@ -15,8 +14,6 @@ import streamlit.components.v1 as components
 from streamlit.runtime.scriptrunner import get_script_run_ctx
 
 from queries_1c import load_query_catalog
-from warehouse_outbound_experiment_ui import render_outbound_experiment
-
 from warehouse_performance import (
     clear_performance_history,
     finish_performance_run,
@@ -164,6 +161,27 @@ from warehouse_render_settings import (
     load_render_settings as load_render_settings_from_disk,
     save_render_settings as save_render_settings_to_disk,
 )
+from warehouse_geometry_render_service import render_geometry_layers
+from warehouse_map_helpers import (
+    cell_label as _cell_label,
+    short_cell_value as _short_cell_value,
+    source_label as _source_label,
+    validate_manual_cell as _validate_manual_cell_service,
+)
+from warehouse_import_cache import (
+    file_hash, normalize_cell_table_cached, normalize_inventory_table_cached,
+    normalize_receipt_table_cached, read_cell_table_cached, read_inventory_table_cached,
+    read_receipt_table_cached,
+)
+
+
+def render_outbound_experiment(model: dict) -> None:
+    """Lazy screen boundary: scenario/optimizer imports are not startup work."""
+    from warehouse_outbound_experiment_ui import render_outbound_experiment as render
+
+    render(model)
+
+
 st.set_page_config(page_title="Симулятор сборки", layout="wide")
 
 APP_BUILD_LABEL = "virtual-excel-only-2026-07-04"
@@ -306,23 +324,6 @@ def render_git_release_badge() -> None:
     st.sidebar.caption(f"Git commit: {info['commit_hash']} · {info['commit_date']}")
 
 
-def file_hash(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-
-
-@st.cache_data(show_spinner=False)
-def read_cell_table_cached(file_bytes: bytes, content_hash: str, sheet_name: str, header_rows: int) -> pd.DataFrame:
-    return read_cell_table(file_bytes, sheet_name, header_rows=header_rows)
-
-
-@st.cache_data(show_spinner=False)
-def normalize_cell_table_cached(table_payload: str, mapping_payload: str) -> tuple[pd.DataFrame, list[dict]]:
-    df = pd.read_json(table_payload, orient="split")
-    mapping = json.loads(mapping_payload)
-    return normalize_cell_table(df, mapping)
-
-
 def get_geometry_render_revision_token(model: dict) -> tuple:
     """Return the stable, small key for every persisted input rendered on the map."""
     return get_revision_token(resolve_model_id(model), GEOMETRY_RENDER_DOMAINS)
@@ -394,31 +395,6 @@ def invalidate_geometry_render_cache() -> None:
     build_geometry_html_cached.clear()
     build_geometry_static_layer_cached.clear()
     build_geometry_dynamic_layer_cached.clear()
-
-
-@st.cache_data(show_spinner=False)
-def read_inventory_table_cached(file_bytes: bytes, content_hash: str, sheet_name: str, header_rows: int) -> pd.DataFrame:
-    return read_inventory_table(file_bytes, sheet_name, header_rows=header_rows)
-
-
-@st.cache_data(show_spinner=False)
-def normalize_inventory_table_cached(table_payload: str, mapping_payload: str) -> tuple[pd.DataFrame, list[dict]]:
-    df = pd.read_json(table_payload, orient="split")
-    mapping = json.loads(mapping_payload)
-    return normalize_inventory_table(df, mapping)
-
-
-@st.cache_data(show_spinner=False)
-def read_receipt_table_cached(file_bytes: bytes, content_hash: str, sheet_name: str, header_rows: int) -> pd.DataFrame:
-    return read_receipt_table(file_bytes, sheet_name, header_rows=header_rows)
-
-
-@st.cache_data(show_spinner=False)
-def normalize_receipt_table_cached(table_payload: str, mapping_payload: str) -> tuple[pd.DataFrame, dict, list[dict]]:
-    df = pd.read_json(table_payload, orient="split")
-    mapping = json.loads(mapping_payload)
-    return normalize_receipt_table(df, mapping)
-
 
 
 def write_json_atomic(path: Path, payload: dict) -> None:
@@ -502,53 +478,8 @@ def render_map_settings_editor() -> dict:
     return settings
 
 
-def _is_numeric_text(value: str) -> bool:
-    try:
-        float(str(value).strip())
-        return str(value).strip() != ""
-    except ValueError:
-        return False
-
-
-def _cell_label(cell: dict) -> str:
-    code = cell.get("code") or "без кода"
-    return f"ряд {cell.get('row_number')} · ячейка {cell.get('cell_number')} · ярус {cell.get('tier')} · {code}"
-
-
-def _short_cell_value(cell: dict | None) -> str:
-    if not cell:
-        return "—"
-    return f"ряд {cell.get('row_number')}, ячейка {cell.get('cell_number')}, ярус {cell.get('tier')}, код {cell.get('code') or '—'}"
-
-
-def _source_label(value: str | None) -> str:
-    return {
-        "excel": "Excel",
-        "manual_add": "добавлена вручную",
-        "manual_update": "изменена вручную",
-    }.get(str(value or "excel"), str(value or "Excel"))
-
-
 def _validate_manual_cell(model: dict, new_cell: dict, original_key: str | None = None) -> list[str]:
-    errors: list[str] = []
-    if not str(new_cell.get("row_number", "")).strip():
-        errors.append("Ряд не может быть пустым.")
-    if not str(new_cell.get("cell_number", "")).strip():
-        errors.append("Номер ячейки не может быть пустым.")
-    if not str(new_cell.get("tier", "")).strip():
-        errors.append("Ярус не может быть пустым.")
-    if new_cell.get("row_number") and not _is_numeric_text(str(new_cell.get("row_number"))):
-        errors.append("Ряд должен быть числом.")
-    if new_cell.get("cell_number") and not _is_numeric_text(str(new_cell.get("cell_number"))):
-        errors.append("Номер ячейки должен быть числом.")
-    if new_cell.get("tier") and not _is_numeric_text(str(new_cell.get("tier"))):
-        errors.append("Ярус должен быть числом.")
-    new_key = cell_key(new_cell)
-    for cell in model.get("cells", []):
-        if cell_key(cell) == new_key and new_key != original_key:
-            errors.append("Ячейка с такой комбинацией ряд + номер ячейки + ярус уже существует.")
-            break
-    return errors
+    return _validate_manual_cell_service(model, new_cell, original_key, key_builder=cell_key)
 
 
 def _save_model_after_manual_change(model: dict, overrides: dict) -> dict:
@@ -3014,51 +2945,41 @@ def render_geometry_map_view(model: dict) -> None:
     label_settings["selected_cell_key"] = st.session_state.get("map_selected_cell_key", "")
     label_settings["selected_row_number"] = ""
     render_started = perf_counter()
-    model_id = resolve_model_id(model)
-    with measure_step("geometry_render_token", {"domains": list(GEOMETRY_RENDER_DOMAINS)}):
-        revision_state = load_revision_state(model_id)
-        static_token = None if revision_state.get("warning") else get_geometry_static_revision_token(model)
-        dynamic_token = None if revision_state.get("warning") else get_geometry_dynamic_revision_token(model)
-    static_metadata = {"revision_token": static_token, "scale": scale, "detailed": detailed, "cache_version": GEOMETRY_STATIC_CACHE_VERSION}
     render_placement_state = placement_state if not placement_warning else {}
-    with measure_step("build_geometry_static_layer", static_metadata):
-        if static_token is None:
-            st.warning(
-                f"Кеш карты отключён для этого рендера: {revision_state['warning']}"
-            )
-            static_layer = build_geometry_static_layer(model, scale, detailed, label_settings)
-        else:
-            static_layer = build_geometry_static_layer_cached(model, static_token, label_settings, scale, detailed, GEOMETRY_STATIC_CACHE_VERSION)
-    dynamic_metadata = {
-        "revision_token": dynamic_token, "dynamic_cells_count": 0,
-        "placements_count": len(render_placement_state.get("placements", [])),
-        "interesting_cell_keys_count": 0, "builder_mode": "direct_state",
-        "full_model_enrichment": "нет", "full_model_deepcopy": "нет",
-        "cache_version": GEOMETRY_DYNAMIC_CACHE_VERSION,
-    }
-    with measure_step("build_geometry_dynamic_layer", dynamic_metadata):
-        if dynamic_token is None:
-            dynamic_payload = build_geometry_dynamic_layer_direct(model, render_placement_state, label_settings)
-        else:
-            dynamic_payload = build_geometry_dynamic_layer_cached(
-                model, render_placement_state, dynamic_token, label_settings, GEOMETRY_DYNAMIC_CACHE_VERSION,
-            )
-        dynamic_metadata["dynamic_cells_count"] = len(dynamic_payload)
-        dynamic_metadata["interesting_cell_keys_count"] = len(dynamic_payload)
-    dynamic_size = len(safe_json_dumps(dynamic_payload).encode("utf-8"))
-    compose_metadata = {"static_size_bytes": len(static_layer.encode("utf-8")), "dynamic_size_bytes": dynamic_size, "final_size_bytes": 0}
-    with measure_step("compose_geometry_layers", compose_metadata):
-        html = compose_geometry_layers(static_layer, dynamic_payload)
-        compose_metadata["final_size_bytes"] = len(html.encode("utf-8"))
+    # Named callback keeps the corrupt-revision fallback explicit at the UI
+    # boundary while the orchestration itself remains Streamlit-free.
+    def build_static_uncached(model, scale, detailed, settings):
+        return build_geometry_static_layer(model, scale, detailed, settings)
+
+    def build_dynamic_uncached(model, state, settings):
+        return build_geometry_dynamic_layer_direct(model, state, settings)
+
+    rendered = render_geometry_layers(
+        model, render_placement_state, label_settings, model_id=resolve_model_id(model),
+        revision_state_loader=load_revision_state,
+        static_token_loader=get_geometry_static_revision_token,
+        dynamic_token_loader=get_geometry_dynamic_revision_token,
+        static_builder=build_static_uncached,
+        static_cached_builder=build_geometry_static_layer_cached,
+        dynamic_builder=build_dynamic_uncached,
+        dynamic_cached_builder=build_geometry_dynamic_layer_cached,
+        composer=compose_geometry_layers, serializer=safe_json_dumps,
+        scale=scale, detailed=detailed, static_version=GEOMETRY_STATIC_CACHE_VERSION,
+        dynamic_version=GEOMETRY_DYNAMIC_CACHE_VERSION,
+    )
+    static_token = rendered["static_token"]
+    if static_token is None and rendered["warning"]:
+        st.warning(f"Кеш карты отключён для этого рендера: {rendered['warning']}")
     st.session_state["geometry_layer_diagnostics"] = {
-        "static_size_bytes": len(static_layer.encode("utf-8")), "dynamic_size_bytes": dynamic_size,
-        "final_size_bytes": len(html.encode("utf-8")), "dynamic_cells_count": len(dynamic_payload),
-        "static_token": static_token, "dynamic_token": dynamic_token,
-        "builder_mode": "direct_state", "placements_count": len(render_placement_state.get("placements", [])),
-        "interesting_cell_keys_count": len(dynamic_payload),
+        **{key: rendered[key] for key in ("static_size_bytes", "dynamic_size_bytes", "final_size_bytes", "dynamic_cells_count", "static_token", "dynamic_token")},
+        "builder_mode": "direct_state",
+        "placements_count": len(render_placement_state.get("placements", [])),
+        "interesting_cell_keys_count": rendered["dynamic_cells_count"],
         "full_model_enrichment": "нет", "full_model_deepcopy": "нет",
-        "static_cache_version": GEOMETRY_STATIC_CACHE_VERSION, "dynamic_cache_version": GEOMETRY_DYNAMIC_CACHE_VERSION,
+        "static_cache_version": GEOMETRY_STATIC_CACHE_VERSION,
+        "dynamic_cache_version": GEOMETRY_DYNAMIC_CACHE_VERSION,
     }
+    html = rendered["html"]
     components.html(html, height=980, scrolling=True)
     st.caption(f"Рендер карты: {perf_counter() - render_started:.2f} сек. Модель: data/last_import/warehouse_model.json")
 

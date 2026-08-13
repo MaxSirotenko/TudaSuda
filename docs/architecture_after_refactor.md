@@ -1,35 +1,34 @@
-# Architecture after the stability refactor
+# Architecture after PR #189
 
-## Where to make a change
+## Concrete boundaries
 
-| Concern | Primary module/boundary |
+| Change area | Module to edit |
 |---|---|
 | entrypoint/page composition | `app.py`, `virtual_warehouse_app.py` |
-| operational screens | `warehouse_workspace_ui.py`, other `warehouse_*_ui.py` |
-| geometry model | `warehouse_geometry_model.py` |
-| static/dynamic rendering | `warehouse_geometry_render_layers.py`; app owns Streamlit decorators only |
-| render settings persistence | `warehouse_render_settings.py` |
-| factual contracts/import/registry | compatibility surface `warehouse_factual_data.py` |
-| receipts/outbound/inventory | corresponding `warehouse_receipts.py`, `warehouse_outbound_orders.py`, `warehouse_inventory_placement.py` |
-| event/state simulation | `warehouse_event_*`, `warehouse_simulation_*` |
-| monthly FACT/checkpoints | `warehouse_monthly_fact_replay.py` |
-| placement optimization | `warehouse_proposed_placement_optimizer.py` |
-| physical routing | `warehouse_physical_graph.py` and replay adapters |
-| atomic JSON/file signatures/JSONL | `warehouse_persistence.py` |
-| revision counters | `warehouse_revisions.py` |
-| Streamlit state read-through cache | `warehouse_state_cache.py` |
-| timing/diagnostics/benchmarks | existing `warehouse_performance.py`, `warehouse_perf_diagnostics.py`, `warehouse_performance_benchmark.py` |
+| testable warm rerun orchestration | `warehouse_application_rerun.py` |
+| revision-aware geometry composition | `warehouse_geometry_render_service.py` |
+| static/dynamic rendering algorithms | `warehouse_geometry_render_layers.py` |
+| pure map labels/manual-cell validation | `warehouse_map_helpers.py` |
+| render-settings persistence | `warehouse_render_settings.py` |
+| atomic JSON, signatures, generic JSONL | `warehouse_persistence.py` |
+| factual gzip artifact I/O/publication | `warehouse_factual_artifacts.py` |
+| factual contracts/import/registry/readiness façade | `warehouse_factual_data.py` |
+| revisions and Streamlit read-through cache | `warehouse_revisions.py`, `warehouse_state_cache.py` |
+| graph/routing and optimizer | `warehouse_physical_graph.py`, `warehouse_proposed_placement_optimizer.py` |
+| performance | existing `warehouse_performance*`, `warehouse_perf_diagnostics.py` and benchmark scripts |
 
-## Boundaries
+`virtual_warehouse_app.py` is reduced from the audited 3,101 to 3,020 LOC. Two responsibility clusters left it: pure map validation/labels and the measured static/dynamic revision/render orchestration. Render settings and generic persistence had already moved in the first PR stage. The outbound experiment screen is a single explicit lazy boundary, keeping scenario/optimizer dependencies out of ordinary startup. Compatibility function names used by existing tests/callers remain.
 
-UI owns buttons, progress, messages and session state. Domain functions receive inputs and return results. `warehouse_state_cache` is explicitly a UI infrastructure adapter: core loaders remain Streamlit-free. Persistence primitives provide mechanics only; validation and schema compatibility remain in domain modules.
+`warehouse_factual_data.py` remains the public compatibility façade and is reduced from 1,440 to 1,428 LOC. Gzip JSONL iteration/materialization, artifact writing and atomic publication now live in `warehouse_factual_artifacts.py`; source detection, contracts, business keys, normalization and readiness semantics did not move or change.
 
-Writes use an adjacent uniquely named temporary, flush/fsync, close it, then `os.replace`; this preserves the previous valid artifact on serialization/publication failure and remains Windows-compatible. Missing JSON may have an explicit default, while malformed JSON is not silently converted to empty data. JSONL iteration is lazy and optionally gzip-backed.
+## Persistence and error rules
 
-## Cache/revision rules
+Atomic JSON uses a unique adjacent temporary, flush/fsync, closes it, then `os.replace` (Windows-safe). Failed serialization/publication preserves the old artifact. Missing JSON may use an explicit default; malformed JSON is not silently treated as empty. Factual JSONL is lazy and gzip-backed. Domain modules still own schema validation.
 
-Static geometry depends on geometry + render-settings revisions. Dynamic map state also depends on placements and outbound. Persisted state caches add model identity and `(exists, mtime_ns, size)` signature. Successful mutations save before bumping affected revisions. External edits are detected by signatures; damaged revision metadata forces direct reads. Caches are bounded where state fan-out can grow. Persisted factual/monthly artifacts are not copied into session state.
+## Cache and revision rules
+
+Static geometry depends on geometry + render-settings revisions. Dynamic geometry also depends on placements and outbound. State cache keys add model identity and `(exists, mtime_ns,size)`. Mutations save before bumping affected domains; signature changes catch external edits. Corrupt revision metadata bypasses cached builders. Existing contract tests cover selective placement/inventory, receipts, outbound, geometry/render settings, model isolation, signature changes, and unchanged-cache hits.
 
 ## Compatibility
 
-No artifact schema, parser version, Data Contract, SKU identity, routing policy, or business constraint changed. Existing `data/last_import` JSON, factual v5, and monthly-fact-v2 artifacts remain readable. Public app helper names remain compatibility wrappers while persistence implementation moved behind focused modules.
+There are no persisted schema migrations. `factual-july-v5`, SKU identity, `РасчетноеОтгруженоКоробок`, exact historical-cell resolution, readiness/VGH semantics, CURRENT/FACT, PROPOSED constraints, routing distances and monthly-fact-v2 remain unchanged. `queries_1c` was not touched.

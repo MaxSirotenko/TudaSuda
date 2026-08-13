@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections import Counter, deque
 from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import wraps
 import os
 import sys
@@ -25,6 +26,31 @@ _events: deque[dict] = deque(maxlen=200)
 _counts: Counter[str] = Counter()
 _artifact_reads = 0
 _artifact_bytes = 0
+_io_probe: ContextVar[Counter[str] | None] = ContextVar("warehouse_io_probe", default=None)
+
+
+@contextmanager
+def capture_io_reads() -> Iterator[Counter[str]]:
+    """Count explicitly instrumented production reads in the current context.
+
+    This deliberately avoids monkeypatching global filesystem APIs.  Reader
+    boundaries call :func:`record_file_read` or :func:`record_artifact_read`, so
+    benchmark results reflect actual calls and tests can exercise the counter.
+    """
+    counts: Counter[str] = Counter()
+    token = _io_probe.set(counts)
+    try:
+        yield counts
+    finally:
+        _io_probe.reset(token)
+
+
+def record_file_read(kind: str = "file", byte_count: int = 0) -> None:
+    probe = _io_probe.get()
+    if probe is not None:
+        probe["file_reads"] += 1
+        probe["file_bytes"] += max(0, int(byte_count))
+        probe[f"reader:{kind}"] += 1
 
 
 def get_process_rss_bytes() -> int | None:
@@ -82,6 +108,11 @@ def record_artifact_read(byte_count: int) -> None:
     if ENABLED:
         _artifact_reads += 1
         _artifact_bytes += max(0, int(byte_count))
+    probe = _io_probe.get()
+    if probe is not None:
+        probe["artifact_reads"] += 1
+        probe["artifact_bytes"] += max(0, int(byte_count))
+        record_file_read("artifact", byte_count)
 
 
 def _to_megabytes(value: int | None) -> float | None:

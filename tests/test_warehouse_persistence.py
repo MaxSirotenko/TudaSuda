@@ -4,6 +4,7 @@ import pytest
 
 import warehouse_persistence as persistence
 import warehouse_render_settings as render_settings
+from warehouse_perf_diagnostics import capture_io_reads, record_artifact_read
 
 
 def test_atomic_json_failure_preserves_previous_artifact(tmp_path):
@@ -50,3 +51,14 @@ def test_read_json_only_defaults_missing_files(tmp_path):
     broken.write_text("{", encoding="utf-8")
     with pytest.raises(json.JSONDecodeError):
         persistence.read_json(broken, default={})
+
+
+def test_read_probe_counts_real_file_and_artifact_reads(tmp_path):
+    path = tmp_path / "state.json"
+    persistence.atomic_write_json(path, {"ok": True})
+    with capture_io_reads() as counts:
+        assert persistence.read_json(path) == {"ok": True}
+        record_artifact_read(path.stat().st_size)
+    assert counts["file_reads"] == 2
+    assert counts["artifact_reads"] == 1
+    assert counts["reader:json"] == 1
