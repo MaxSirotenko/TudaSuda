@@ -605,7 +605,7 @@ def render_factual_data_layer(model: Mapping[str, Any] | None) -> None:
             def show_import_progress(event: Mapping[str, Any], *, _name=uploaded.name,
                                      _index=file_index, _total=len(files)) -> None:
                 elapsed = int(float(event.get("elapsed_seconds") or 0))
-                stage = {"reading_and_normalizing": "чтение и нормализация", "finalizing": "завершение",
+                stage = {"starting": "подготовка", "reading_and_normalizing": "обработка данных", "finalizing": "завершение",
                          "completed": "завершено"}.get(str(event.get("stage")), str(event.get("stage") or "импорт"))
                 progress_area.info(
                     f"Файл {_index} из {_total} · {_name}\n\n"
@@ -622,9 +622,9 @@ def render_factual_data_layer(model: Mapping[str, Any] | None) -> None:
             else:
                 performance = result.get("diagnostics", {}).get("import_performance", {})
                 if performance:
-                    st.success(f"Импорт завершён: {int(performance.get('rows') or 0):,} строк за "
+                    st.success(f"Импортировано {int(performance.get('rows') or 0):,} строк за "
                                f"{float(performance.get('elapsed_seconds') or 0):.1f} сек · "
-                               f"{float(performance.get('rows_per_second') or 0):,.0f} строк/с".replace(",", " "))
+                               f"Средняя скорость: {float(performance.get('rows_per_second') or 0):,.0f} строк/с".replace(",", " "))
                 _render_import_result(result, uploaded.name)
         progress_area.empty()
 

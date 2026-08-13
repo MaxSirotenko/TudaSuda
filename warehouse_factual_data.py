@@ -716,6 +716,12 @@ def _stream_xlsx_dataset(data: bytes, filename: str, *, sheet: str | None, root:
             raise ValueError("sheet_not_found")
         worksheet = workbook[selected]
         iterator = worksheet.iter_rows(values_only=True)
+        # ``max_row`` comes from the worksheet dimensions already read by
+        # openpyxl.  It is only a progress hint (some producers overstate the
+        # used range), but unlike counting rows it does not require a second
+        # pass through a large XLSX.
+        dimension_rows = worksheet.max_row
+        total_rows = max(0, dimension_rows - 1) if isinstance(dimension_rows, int) else None
         read_started = time.perf_counter()
         headers = [str(value).strip() if value is not None else "" for value in next(iterator, ())]
         stage_seconds["xlsx_read"] += time.perf_counter() - read_started
@@ -761,7 +767,7 @@ def _stream_xlsx_dataset(data: bytes, filename: str, *, sheet: str | None, root:
             elapsed = now - import_started
             event = {"processed_rows": row_count, "elapsed_seconds": elapsed,
                 "rows_per_second": row_count / elapsed if elapsed else 0.0, "stage": stage,
-                "total_rows": None, "filename": filename}
+                "total_rows": total_rows, "filename": filename}
             try:
                 progress_callback(event)
             except Exception:
@@ -770,6 +776,7 @@ def _stream_xlsx_dataset(data: bytes, filename: str, *, sheet: str | None, root:
                 pass
             last_progress_at, last_progress_row = now, row_count
 
+        report_progress("starting", force=True)
         try:
             raw_writer = gzip.open(staging / "raw.jsonl.gz", "wt", encoding="utf-8",
                                    compresslevel=FACTUAL_GZIP_COMPRESSLEVEL)
