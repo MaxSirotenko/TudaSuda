@@ -416,16 +416,14 @@ def run_benchmark(mode: str = "current-or-synthetic", cells: int = 16_000,
         scenarios["no_change_rerender"] = dict(scenarios["render_no_change"])
         baseline = counts.copy()
         with _persisted_synthetic_state(model, placement_state):
-            persisted_static_token = revisions.get_revision_token(model_id, app.GEOMETRY_STATIC_DOMAINS)
-            persisted_dynamic_token = revisions.get_revision_token(model_id, app.GEOMETRY_DYNAMIC_DOMAINS)
             with _count_expensive_domain_calls() as domain_calls, capture_io_reads() as application_reads:
                 def production_warm_rerun():
                     persisted_state, warning = state_cache.load_placement_state_cached(model)
                     rendered = render_geometry_layers(
                         model, {} if warning else persisted_state, settings, model_id=model_id,
                         revision_state_loader=revisions.load_revision_state,
-                        static_token_loader=lambda _model: persisted_static_token,
-                        dynamic_token_loader=lambda _model: persisted_dynamic_token,
+                        static_revision_domains=app.GEOMETRY_STATIC_DOMAINS,
+                        dynamic_revision_domains=app.GEOMETRY_DYNAMIC_DOMAINS,
                         static_builder=app.build_geometry_static_layer,
                         static_cached_builder=app.build_geometry_static_layer_cached,
                         dynamic_builder=app.build_geometry_dynamic_layer_direct,

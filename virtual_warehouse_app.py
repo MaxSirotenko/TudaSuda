@@ -2957,8 +2957,8 @@ def render_geometry_map_view(model: dict) -> None:
     rendered = render_geometry_layers(
         model, render_placement_state, label_settings, model_id=resolve_model_id(model),
         revision_state_loader=load_revision_state,
-        static_token_loader=get_geometry_static_revision_token,
-        dynamic_token_loader=get_geometry_dynamic_revision_token,
+        static_revision_domains=GEOMETRY_STATIC_DOMAINS,
+        dynamic_revision_domains=GEOMETRY_DYNAMIC_DOMAINS,
         static_builder=build_static_uncached,
         static_cached_builder=build_geometry_static_layer_cached,
         dynamic_builder=build_dynamic_uncached,

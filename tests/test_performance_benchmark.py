@@ -65,6 +65,12 @@ def test_small_run_is_serializable_sanitized_and_cache_scenarios_pass(monkeypatc
     assert result["scenarios"]["placement_only_change"]["dynamic_builder_calls"] == 1
     assert result["scenarios"]["geometry_change"]["static_builder_calls"] == 1
     assert result["scenarios"]["geometry_change"]["dynamic_builder_calls"] == 1
+    warm_noop = result["scenarios"]["application_warm_noop"]
+    # One revision read for the state-cache key and one shared revision read for
+    # both render tokens on each measured production rerun.
+    assert warm_noop["file_reads"] == warm_noop["iterations"] * 2
+    assert warm_noop["static_rebuilds"] == 0
+    assert warm_noop["dynamic_rebuilds"] == 0
     encoded = json.dumps(result)
     assert all(secret not in encoded.lower() for secret in ("synthetic item", "bench-0|", "source_file_hash", '"placements": ['))
     assert result["persisted_state_unchanged"]

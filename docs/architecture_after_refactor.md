@@ -26,7 +26,7 @@ Atomic JSON uses a unique adjacent temporary, flush/fsync, closes it, then `os.r
 
 ## Cache and revision rules
 
-Static geometry depends on geometry + render-settings revisions. Dynamic geometry also depends on placements and outbound. State cache keys add model identity and `(exists, mtime_ns,size)`. Mutations save before bumping affected domains; signature changes catch external edits. Corrupt revision metadata bypasses cached builders. Existing contract tests cover selective placement/inventory, receipts, outbound, geometry/render settings, model isolation, signature changes, and unchanged-cache hits.
+Static geometry depends on geometry + render-settings revisions. Dynamic geometry also depends on placements and outbound. The render service reads revision state once and derives both tokens from that same in-memory state; the state cache performs its separate revision read for its own key. State cache keys add model identity and `(exists, mtime_ns,size)`. Mutations save before bumping affected domains; signature changes catch external edits. Corrupt revision metadata bypasses cached builders. Existing contract tests cover selective placement/inventory, receipts, outbound, geometry/render settings, model isolation, signature changes, and unchanged-cache hits.
 
 ## Compatibility
 

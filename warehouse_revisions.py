@@ -110,9 +110,18 @@ def get_revision(model_id: str | None, domain: str) -> int:
 
 
 def get_revision_token(model_id: str | None, domains: Iterable[str]) -> tuple:
-    checked = _domains(domains)
     state = load_revision_state(model_id)
-    return (state["model_id"], *(state["revisions"][domain] for domain in checked))
+    return revision_token_from_state(state, domains)
+
+
+def revision_token_from_state(state: Mapping, domains: Iterable[str]) -> tuple:
+    """Build a cache token from one already-loaded revision state, without I/O."""
+    checked = _domains(domains)
+    revisions = state.get("revisions") if isinstance(state.get("revisions"), Mapping) else {}
+    return (
+        resolve_model_id(state.get("model_id")),
+        *(_counter(revisions.get(domain)) for domain in checked),
+    )
 
 
 def _write_unlocked(state: dict) -> None:
