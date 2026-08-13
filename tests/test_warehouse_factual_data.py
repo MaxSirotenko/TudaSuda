@@ -300,8 +300,11 @@ def test_streaming_import_progress_is_monotonic_throttled_and_final(tmp_path, mo
 
     processed = [event["processed_rows"] for event in events]
     assert processed == sorted(processed)
+    assert events[0]["stage"] == "starting"
+    assert events[0]["processed_rows"] == 0
+    assert events[0]["total_rows"] == 6
     assert processed[-1] == result["rows"] == 6
-    assert len(events) <= 5
+    assert len(events) <= 6
     assert events[-1]["stage"] == "completed"
     assert all({"elapsed_seconds", "rows_per_second", "stage", "total_rows"} <= event.keys()
                for event in events)

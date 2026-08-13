@@ -7,13 +7,17 @@ import json
 import sys
 import tempfile
 import time
-import resource
 from pathlib import Path
 
 from openpyxl import Workbook
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from warehouse_factual_data import import_excel_dataset  # noqa: E402
+
+try:
+    import resource
+except ImportError:  # Windows: keep the benchmark usable, just omit RSS.
+    resource = None
 
 HEADERS = ("СсылкаРО", "НомерРО", "ДатаРО", "Склад", "НомерСтроки", "Номенклатура",
            "Характеристика", "Количество", "РасчетноеОтгруженоКоробок")
@@ -39,7 +43,7 @@ def benchmark(rows: int) -> dict[str, object]:
         started = time.perf_counter()
         result = import_excel_dataset(data, workbook_path.name, root=root / "artifacts")
         elapsed = time.perf_counter() - started
-        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024 if resource else None
         artifact = Path(result["artifact"])
         canonical_size = sum(path.stat().st_size for path in (artifact / "canonical").glob("*.gz"))
         return {"rows": rows, "xlsx_bytes": len(data), "elapsed_seconds": round(elapsed, 3),
