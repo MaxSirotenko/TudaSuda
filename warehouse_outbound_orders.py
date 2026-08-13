@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+from warehouse_persistence import read_json
 from warehouse_business_identity import canonical_sku_key
 
 
@@ -244,7 +245,7 @@ def _load_json(path: Path, default: Any) -> Any:
     if not path.exists():
         return copy.deepcopy(default)
     try:
-        return json.loads(path.read_text(encoding="utf-8-sig"))
+        return read_json(path)
     except (json.JSONDecodeError, OSError):
         return copy.deepcopy(default)
 

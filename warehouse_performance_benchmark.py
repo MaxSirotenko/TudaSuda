@@ -29,7 +29,12 @@ import warehouse_geometry_model as geometry_model
 import warehouse_inventory_placement as placement
 import warehouse_revisions as revisions
 import warehouse_state_cache as state_cache
+import warehouse_factual_data as factual_data
+import warehouse_physical_graph as physical_graph
+from warehouse_perf_diagnostics import capture_io_reads
 from warehouse_geometry_render_layers import compose_geometry_layers, safe_json_dumps
+from warehouse_geometry_render_service import render_geometry_layers
+from warehouse_persistence import atomic_write_json
 
 SCHEMA_VERSION = 1
 DEFAULT_OUTPUT_DIR = Path("data/performance_benchmarks")
@@ -194,6 +199,52 @@ def _count_app_calls() -> Iterator[dict[str, int]]:
             setattr(app, name, original)
 
 
+@contextmanager
+def _count_expensive_domain_calls() -> Iterator[dict[str, int]]:
+    targets = (
+        (physical_graph, "build_physical_warehouse_graph", "physical_graph_rebuilds"),
+        (factual_data, "build_monthly_data_readiness", "factual_readiness_calls"),
+        (factual_data, "load_effective_rows", "factual_effective_view_calls"),
+    )
+    originals, counts = [], {label: 0 for _, _, label in targets}
+    for module, name, label in targets:
+        original = getattr(module, name)
+        originals.append((module, name, original))
+        def wrapper(*args, __original=original, __label=label, **kwargs):
+            counts[__label] += 1
+            return __original(*args, **kwargs)
+        setattr(module, name, wrapper)
+    try:
+        yield counts
+    finally:
+        for module, name, original in originals:
+            setattr(module, name, original)
+
+
+@contextmanager
+def _persisted_synthetic_state(model: dict[str, Any], state: dict[str, Any]) -> Iterator[None]:
+    """Expose synthetic state through the real persisted/cache boundaries."""
+    original_placement_path = placement.PLACEMENTS_PATH
+    original_revision_path = revisions.REVISION_PATH
+    with tempfile.TemporaryDirectory(prefix="warehouse-warm-rerun-") as directory:
+        root = Path(directory)
+        placement.PLACEMENTS_PATH = root / "placements.json"
+        revisions.REVISION_PATH = root / "data_revisions.json"
+        persisted = copy.deepcopy(state)
+        persisted["model_id"] = model.get("model_id")
+        atomic_write_json(placement.PLACEMENTS_PATH, persisted)
+        revisions.initialize_revision_state(revisions.resolve_model_id(model))
+        state_cache._load_placement_state_cached.clear()
+        # Prime the production read-through cache outside the measured warm run.
+        state_cache.load_placement_state_cached(model)
+        try:
+            yield
+        finally:
+            state_cache._load_placement_state_cached.clear()
+            placement.PLACEMENTS_PATH = original_placement_path
+            revisions.REVISION_PATH = original_revision_path
+
+
 def _import_scenario() -> dict[str, Any]:
     started = time.perf_counter_ns()
     process = subprocess.run([sys.executable, "-c", "import virtual_warehouse_app"], capture_output=True)
@@ -349,11 +400,53 @@ def run_benchmark(mode: str = "current-or-synthetic", cells: int = 16_000,
             "dynamic_to_static_ratio": dynamic_bytes / static_bytes if static_bytes else 0,
             "final_to_dynamic_ratio": final_bytes / dynamic_bytes if dynamic_bytes else 0}
         baseline = counts.copy()
-        compose_geometry_layers(app.build_geometry_static_layer_cached(model, static_token, settings, 18., True, app.GEOMETRY_STATIC_CACHE_VERSION),
-                                app.build_geometry_dynamic_layer_cached(model, placement_state, dynamic_token, settings, app.GEOMETRY_DYNAMIC_CACHE_VERSION))
-        scenarios["no_change_rerender"] = {"status": "ok", "additional_static_builder_calls": counts["build_geometry_static_layer"] - baseline["build_geometry_static_layer"],
+        with capture_io_reads() as render_reads:
+            no_op_html, no_op_ms, no_op_peak = _timed(lambda: compose_geometry_layers(
+                app.build_geometry_static_layer_cached(model, static_token, settings, 18., True, app.GEOMETRY_STATIC_CACHE_VERSION),
+                app.build_geometry_dynamic_layer_cached(model, placement_state, dynamic_token, settings, app.GEOMETRY_DYNAMIC_CACHE_VERSION)), True)
+        scenarios["render_no_change"] = {"status": "ok", "wall_time_ms": no_op_ms,
+            "python_tracemalloc_peak_bytes": no_op_peak, "generated_payload_bytes": len(no_op_html.encode()),
+            "artifact_reads": render_reads["artifact_reads"], "file_reads": render_reads["file_reads"],
+            "additional_static_builder_calls": counts["build_geometry_static_layer"] - baseline["build_geometry_static_layer"],
             "additional_dynamic_builder_calls": counts["build_geometry_dynamic_layer_direct"] - baseline["build_geometry_dynamic_layer_direct"],
-            "additional_snapshot_reads": counts["load_pre_placement_snapshot"] - baseline["load_pre_placement_snapshot"], "additional_direct_placement_disk_reads": 0}
+            "additional_snapshot_reads": counts["load_pre_placement_snapshot"] - baseline["load_pre_placement_snapshot"],
+            "additional_direct_placement_disk_reads": render_reads["reader:json"],
+            "heavy_function_calls": sum(counts[name] - baseline[name] for name in baseline)}
+        # Compatibility name retained for report consumers written before PR #189.
+        scenarios["no_change_rerender"] = dict(scenarios["render_no_change"])
+        baseline = counts.copy()
+        with _persisted_synthetic_state(model, placement_state):
+            with _count_expensive_domain_calls() as domain_calls, capture_io_reads() as application_reads:
+                def production_warm_rerun():
+                    persisted_state, warning = state_cache.load_placement_state_cached(model)
+                    rendered = render_geometry_layers(
+                        model, {} if warning else persisted_state, settings, model_id=model_id,
+                        revision_state_loader=revisions.load_revision_state,
+                        static_revision_domains=app.GEOMETRY_STATIC_DOMAINS,
+                        dynamic_revision_domains=app.GEOMETRY_DYNAMIC_DOMAINS,
+                        static_builder=app.build_geometry_static_layer,
+                        static_cached_builder=app.build_geometry_static_layer_cached,
+                        dynamic_builder=app.build_geometry_dynamic_layer_direct,
+                        dynamic_cached_builder=app.build_geometry_dynamic_layer_cached,
+                        composer=compose_geometry_layers, serializer=safe_json_dumps,
+                        scale=18.0, detailed=True,
+                        static_version=app.GEOMETRY_STATIC_CACHE_VERSION,
+                        dynamic_version=app.GEOMETRY_DYNAMIC_CACHE_VERSION,
+                    )
+                    return {"generated_payload_bytes": rendered["final_size_bytes"],
+                            "dynamic_cells": rendered["dynamic_cells_count"], "state_loader_calls": 1}
+                application_times, application_peaks = [], []
+                for _ in range(max(1, warm_iterations)):
+                    application_result, elapsed, peak = _timed(production_warm_rerun, True)
+                    application_times.append(elapsed); application_peaks.append(peak)
+        scenarios["application_warm_noop"] = _summary(application_times) | {
+            "python_tracemalloc_peak_bytes": max(application_peaks), **application_result,
+            "file_reads": application_reads["file_reads"],
+            "artifact_reads": application_reads["artifact_reads"],
+            "static_rebuilds": counts["build_geometry_static_layer"] - baseline["build_geometry_static_layer"],
+            "dynamic_rebuilds": counts["build_geometry_dynamic_layer_direct"] - baseline["build_geometry_dynamic_layer_direct"],
+            **domain_calls,
+        }
         baseline = counts.copy(); changed_dynamic = dynamic_token + ("benchmark-placement-change",)
         compose_geometry_layers(app.build_geometry_static_layer_cached(model, static_token, settings, 18., True, app.GEOMETRY_STATIC_CACHE_VERSION),
                                 app.build_geometry_dynamic_layer_cached(model, placement_state, changed_dynamic, settings, app.GEOMETRY_DYNAMIC_CACHE_VERSION))
