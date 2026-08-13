@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+from warehouse_persistence import read_json
 from warehouse_business_identity import canonical_sku_key
 from warehouse_placement_zones import (
     UNASSIGNED_ZONE,
@@ -537,7 +538,7 @@ def load_receipts_state(model: dict[str, Any] | None = None) -> tuple[dict[str, 
     if not RECEIPTS_PATH.exists():
         return empty_receipts_state(model), None
     try:
-        state = json.loads(RECEIPTS_PATH.read_text(encoding="utf-8-sig"))
+        state = read_json(RECEIPTS_PATH)
     except json.JSONDecodeError:
         return empty_receipts_state(model), "Файл receipts.json повреждён и не был загружен."
     state.setdefault("receipts", [])

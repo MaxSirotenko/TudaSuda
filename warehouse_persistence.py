@@ -11,6 +11,7 @@ import gzip
 import json
 import os
 import tempfile
+import stat
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -50,6 +51,11 @@ def atomic_write_json(
     A failed serialization/publication leaves the previous artifact untouched.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
+    destination_mode: int | None = None
+    try:
+        destination_mode = stat.S_IMODE(path.stat().st_mode)
+    except FileNotFoundError:
+        pass
     descriptor, temporary_name = tempfile.mkstemp(
         dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
     )
@@ -59,7 +65,27 @@ def atomic_write_json(
             json.dump(value, stream, ensure_ascii=ensure_ascii, separators=separators)
             stream.flush()
             os.fsync(stream.fileno())
+        if destination_mode is not None:
+            try:
+                os.chmod(temporary, destination_mode)
+            except (NotImplementedError, OSError):
+                # Permission preservation is best-effort on platforms/filesystems
+                # without POSIX-compatible chmod semantics (notably Windows).
+                if os.name == "posix":
+                    raise
         os.replace(temporary, path)
+        if os.name == "posix":
+            # File fsync does not make the directory entry durable.  Filesystems
+            # that cannot open/fsync directories are allowed to decline safely.
+            directory_fd: int | None = None
+            try:
+                directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+                os.fsync(directory_fd)
+            except (NotImplementedError, OSError):
+                pass
+            finally:
+                if directory_fd is not None:
+                    os.close(directory_fd)
     except BaseException:
         # fdopen owns the descriptor once entered.  If it failed before that,
         # closing an already-closed descriptor is harmlessly ignored.

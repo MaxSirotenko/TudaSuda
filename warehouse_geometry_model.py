@@ -12,6 +12,7 @@ from time import perf_counter
 from typing import Any
 
 import pandas as pd
+from warehouse_persistence import read_json
 from warehouse_deep_lane import deep_lane_access_contract_id, deep_lane_access_diagnostics
 
 from warehouse_placement_zones import validate_placement_zone
@@ -527,7 +528,7 @@ def save_geometry_model(model: dict[str, Any]) -> None:
 def load_geometry_model() -> dict[str, Any] | None:
     if not GEOMETRY_MODEL_PATH.exists():
         return None
-    data = json.loads(GEOMETRY_MODEL_PATH.read_text(encoding="utf-8-sig"))
+    data = read_json(GEOMETRY_MODEL_PATH)
     if data.get("model_type") != "excel_rows_cells_aisles_geometry":
         return None
     if "base_cells" not in data:
@@ -571,7 +572,7 @@ def load_manual_overrides() -> dict[str, Any] | None:
     if not MANUAL_OVERRIDES_PATH.exists():
         return None
     try:
-        return json.loads(MANUAL_OVERRIDES_PATH.read_text(encoding="utf-8-sig"))
+        return read_json(MANUAL_OVERRIDES_PATH)
     except json.JSONDecodeError:
         return None
 

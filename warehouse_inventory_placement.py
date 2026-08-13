@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+from warehouse_persistence import read_json
 
 from warehouse_placement_diagnostics import placement_reason_text
 from warehouse_business_identity import canonical_sku_key
@@ -232,7 +233,7 @@ def load_placement_state(model: dict[str, Any]) -> tuple[dict[str, Any], str | N
     if not PLACEMENTS_PATH.exists():
         return empty_placement_state(model), None
     try:
-        state = json.loads(PLACEMENTS_PATH.read_text(encoding="utf-8-sig"))
+        state = read_json(PLACEMENTS_PATH)
     except json.JSONDecodeError:
         return empty_placement_state(model), "Файл placements.json повреждён и не был загружен."
     if state.get("model_id") != model.get("model_id"):

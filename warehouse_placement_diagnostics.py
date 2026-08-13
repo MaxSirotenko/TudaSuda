@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from warehouse_persistence import read_json
+
 PLACEMENT_DIAGNOSTICS_PATH = Path("data/last_import/placement_diagnostics.json")
 
 ZONE_LABELS_RU = {
@@ -138,7 +140,7 @@ def load_pre_placement_snapshot(model: dict[str, Any] | None = None) -> tuple[di
     if not PLACEMENT_DIAGNOSTICS_PATH.exists():
         return None, "Снимок состояния до размещения отсутствует. Для старых расчётов значения 'до' показаны как «Нет данных»."
     try:
-        snapshot = json.loads(PLACEMENT_DIAGNOSTICS_PATH.read_text(encoding="utf-8-sig"))
+        snapshot = read_json(PLACEMENT_DIAGNOSTICS_PATH)
     except json.JSONDecodeError:
         return None, "Файл placement_diagnostics.json повреждён. Значения 'до' недоступны."
     if model and snapshot.get("model_id") not in {None, model.get("model_id")}:

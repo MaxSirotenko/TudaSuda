@@ -31,9 +31,10 @@ import warehouse_revisions as revisions
 import warehouse_state_cache as state_cache
 import warehouse_factual_data as factual_data
 import warehouse_physical_graph as physical_graph
-from warehouse_application_rerun import execute_warm_map_rerun
 from warehouse_perf_diagnostics import capture_io_reads
 from warehouse_geometry_render_layers import compose_geometry_layers, safe_json_dumps
+from warehouse_geometry_render_service import render_geometry_layers
+from warehouse_persistence import atomic_write_json
 
 SCHEMA_VERSION = 1
 DEFAULT_OUTPUT_DIR = Path("data/performance_benchmarks")
@@ -220,6 +221,30 @@ def _count_expensive_domain_calls() -> Iterator[dict[str, int]]:
             setattr(module, name, original)
 
 
+@contextmanager
+def _persisted_synthetic_state(model: dict[str, Any], state: dict[str, Any]) -> Iterator[None]:
+    """Expose synthetic state through the real persisted/cache boundaries."""
+    original_placement_path = placement.PLACEMENTS_PATH
+    original_revision_path = revisions.REVISION_PATH
+    with tempfile.TemporaryDirectory(prefix="warehouse-warm-rerun-") as directory:
+        root = Path(directory)
+        placement.PLACEMENTS_PATH = root / "placements.json"
+        revisions.REVISION_PATH = root / "data_revisions.json"
+        persisted = copy.deepcopy(state)
+        persisted["model_id"] = model.get("model_id")
+        atomic_write_json(placement.PLACEMENTS_PATH, persisted)
+        revisions.initialize_revision_state(revisions.resolve_model_id(model))
+        state_cache._load_placement_state_cached.clear()
+        # Prime the production read-through cache outside the measured warm run.
+        state_cache.load_placement_state_cached(model)
+        try:
+            yield
+        finally:
+            state_cache._load_placement_state_cached.clear()
+            placement.PLACEMENTS_PATH = original_placement_path
+            revisions.REVISION_PATH = original_revision_path
+
+
 def _import_scenario() -> dict[str, Any]:
     started = time.perf_counter_ns()
     process = subprocess.run([sys.executable, "-c", "import virtual_warehouse_app"], capture_output=True)
@@ -390,21 +415,34 @@ def run_benchmark(mode: str = "current-or-synthetic", cells: int = 16_000,
         # Compatibility name retained for report consumers written before PR #189.
         scenarios["no_change_rerender"] = dict(scenarios["render_no_change"])
         baseline = counts.copy()
-        with _count_expensive_domain_calls() as domain_calls, capture_io_reads() as application_reads:
-            application_result, application_ms, application_peak = _timed(lambda: execute_warm_map_rerun(
-                    model=model, placement_state=placement_state, settings=settings,
-                    static_token=static_token, dynamic_token=dynamic_token,
-                    static_loader=app.build_geometry_static_layer_cached,
-                    dynamic_loader=app.build_geometry_dynamic_layer_cached,
-                    composer=compose_geometry_layers,
-                    static_version=app.GEOMETRY_STATIC_CACHE_VERSION,
-                    dynamic_version=app.GEOMETRY_DYNAMIC_CACHE_VERSION,
-                    state_loader=(state_cache.load_placement_state_cached if source_mode == "current" else
-                                  lambda _model: (placement_state, None)),
-                ), True)
-        scenarios["application_warm_noop"] = {
-            "status": "ok", "wall_time_ms": application_ms,
-            "python_tracemalloc_peak_bytes": application_peak, **application_result,
+        with _persisted_synthetic_state(model, placement_state):
+            persisted_static_token = revisions.get_revision_token(model_id, app.GEOMETRY_STATIC_DOMAINS)
+            persisted_dynamic_token = revisions.get_revision_token(model_id, app.GEOMETRY_DYNAMIC_DOMAINS)
+            with _count_expensive_domain_calls() as domain_calls, capture_io_reads() as application_reads:
+                def production_warm_rerun():
+                    persisted_state, warning = state_cache.load_placement_state_cached(model)
+                    rendered = render_geometry_layers(
+                        model, {} if warning else persisted_state, settings, model_id=model_id,
+                        revision_state_loader=revisions.load_revision_state,
+                        static_token_loader=lambda _model: persisted_static_token,
+                        dynamic_token_loader=lambda _model: persisted_dynamic_token,
+                        static_builder=app.build_geometry_static_layer,
+                        static_cached_builder=app.build_geometry_static_layer_cached,
+                        dynamic_builder=app.build_geometry_dynamic_layer_direct,
+                        dynamic_cached_builder=app.build_geometry_dynamic_layer_cached,
+                        composer=compose_geometry_layers, serializer=safe_json_dumps,
+                        scale=18.0, detailed=True,
+                        static_version=app.GEOMETRY_STATIC_CACHE_VERSION,
+                        dynamic_version=app.GEOMETRY_DYNAMIC_CACHE_VERSION,
+                    )
+                    return {"generated_payload_bytes": rendered["final_size_bytes"],
+                            "dynamic_cells": rendered["dynamic_cells_count"], "state_loader_calls": 1}
+                application_times, application_peaks = [], []
+                for _ in range(max(1, warm_iterations)):
+                    application_result, elapsed, peak = _timed(production_warm_rerun, True)
+                    application_times.append(elapsed); application_peaks.append(peak)
+        scenarios["application_warm_noop"] = _summary(application_times) | {
+            "python_tracemalloc_peak_bytes": max(application_peaks), **application_result,
             "file_reads": application_reads["file_reads"],
             "artifact_reads": application_reads["artifact_reads"],
             "static_rebuilds": counts["build_geometry_static_layer"] - baseline["build_geometry_static_layer"],

@@ -5,7 +5,6 @@
 | Change area | Module to edit |
 |---|---|
 | entrypoint/page composition | `app.py`, `virtual_warehouse_app.py` |
-| testable warm rerun orchestration | `warehouse_application_rerun.py` |
 | revision-aware geometry composition | `warehouse_geometry_render_service.py` |
 | static/dynamic rendering algorithms | `warehouse_geometry_render_layers.py` |
 | pure map labels/manual-cell validation | `warehouse_map_helpers.py` |
@@ -17,7 +16,7 @@
 | graph/routing and optimizer | `warehouse_physical_graph.py`, `warehouse_proposed_placement_optimizer.py` |
 | performance | existing `warehouse_performance*`, `warehouse_perf_diagnostics.py` and benchmark scripts |
 
-`virtual_warehouse_app.py` is reduced from the audited 3,101 to 3,020 LOC. Two responsibility clusters left it: pure map validation/labels and the measured static/dynamic revision/render orchestration. Render settings and generic persistence had already moved in the first PR stage. The outbound experiment screen is a single explicit lazy boundary, keeping scenario/optimizer dependencies out of ordinary startup. Compatibility function names used by existing tests/callers remain.
+The benchmark and application both call `warehouse_geometry_render_service.render_geometry_layers`; there is no benchmark-only orchestration. `virtual_warehouse_app.py` is reduced from the audited 3,101 to 3,020 LOC. Two responsibility clusters left it: pure map validation/labels and the measured static/dynamic revision/render orchestration. Render settings and generic persistence had already moved in the first PR stage. The outbound experiment screen is a single explicit lazy boundary, keeping scenario/optimizer dependencies out of ordinary startup. Compatibility function names used by existing tests/callers remain.
 
 `warehouse_factual_data.py` remains the public compatibility façade and is reduced from 1,440 to 1,428 LOC. Gzip JSONL iteration/materialization, artifact writing and atomic publication now live in `warehouse_factual_artifacts.py`; source detection, contracts, business keys, normalization and readiness semantics did not move or change.
 

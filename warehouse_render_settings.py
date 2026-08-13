@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import json
 from pathlib import Path
 from typing import Any
 
@@ -30,7 +31,10 @@ def save_render_settings(settings: dict[str, Any], path: Path = RENDER_SETTINGS_
     """Merge and atomically save settings, retaining forward-compatible keys."""
     try:
         existing = read_json(path, default={})
-    except (OSError, UnicodeError, ValueError):
+    except json.JSONDecodeError:
+        # Historical policy permits resetting a malformed presentation-only
+        # settings file.  I/O and decoding failures must propagate instead:
+        # overwriting then could discard forward-compatible keys.
         existing = {}
     payload = dict(existing) if isinstance(existing, dict) else {}
     colors = dict(payload.get("colors", {})) if isinstance(payload.get("colors"), dict) else {}
