@@ -159,6 +159,11 @@ from warehouse_state_cache import (
     load_placement_state_cached,
     load_receipts_state_cached,
 )
+from warehouse_persistence import atomic_write_json
+from warehouse_render_settings import (
+    load_render_settings as load_render_settings_from_disk,
+    save_render_settings as save_render_settings_to_disk,
+)
 st.set_page_config(page_title="Симулятор сборки", layout="wide")
 
 APP_BUILD_LABEL = "virtual-excel-only-2026-07-04"
@@ -417,40 +422,23 @@ def normalize_receipt_table_cached(table_payload: str, mapping_payload: str) -> 
 
 
 def write_json_atomic(path: Path, payload: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp_path.replace(path)
+    """Compatibility wrapper for callers; new code uses warehouse_persistence."""
+    atomic_write_json(path, payload, separators=None)
 
 
 def load_render_settings() -> dict:
     settings = dict(DEFAULT_RENDER_LABEL_SETTINGS)
     settings["colors"] = dict(DEFAULT_RENDER_COLOR_SETTINGS)
-    if RENDER_SETTINGS_PATH.exists():
-        try:
-            payload = json.loads(RENDER_SETTINGS_PATH.read_text(encoding="utf-8-sig"))
-            settings.update({key: payload.get(key, value) for key, value in DEFAULT_RENDER_LABEL_SETTINGS.items()})
-            colors = dict(DEFAULT_RENDER_COLOR_SETTINGS)
-            colors.update(payload.get("colors", {}))
-            settings["colors"] = colors
-        except json.JSONDecodeError:
-            pass
-    return settings
+    return load_render_settings_from_disk(settings, RENDER_SETTINGS_PATH)
 
 
 def save_render_settings(settings: dict) -> None:
-    payload = {}
-    if RENDER_SETTINGS_PATH.exists():
-        try:
-            payload = json.loads(RENDER_SETTINGS_PATH.read_text(encoding="utf-8-sig"))
-        except json.JSONDecodeError:
-            payload = {}
-    payload.update({key: settings.get(key, value) for key, value in DEFAULT_RENDER_LABEL_SETTINGS.items()})
-    existing_colors = payload.get("colors", {}) if isinstance(payload.get("colors"), dict) else {}
-    colors = dict(existing_colors)
-    colors.update({key: settings.get("colors", {}).get(key, value) for key, value in DEFAULT_RENDER_COLOR_SETTINGS.items()})
-    payload["colors"] = colors
-    write_json_atomic(RENDER_SETTINGS_PATH, payload)
+    payload = {key: settings.get(key, value) for key, value in DEFAULT_RENDER_LABEL_SETTINGS.items()}
+    payload["colors"] = {
+        key: settings.get("colors", {}).get(key, value)
+        for key, value in DEFAULT_RENDER_COLOR_SETTINGS.items()
+    }
+    save_render_settings_to_disk(payload, RENDER_SETTINGS_PATH)
 
 
 def render_label_settings_editor(settings: dict) -> dict:

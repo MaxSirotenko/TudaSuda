@@ -11,6 +11,7 @@ import warehouse_inventory_placement as placement
 import warehouse_outbound_orders as outbound
 import warehouse_receipts as receipts
 import warehouse_revisions as revisions
+from warehouse_persistence import file_signature
 
 
 CACHE_MAX_ENTRIES = 16
@@ -21,11 +22,7 @@ T = TypeVar("T")
 
 def get_file_signature(path: Path) -> tuple[bool, int, int]:
     """Return a small content-change proxy without opening *path*."""
-    try:
-        stat = path.stat()
-    except FileNotFoundError:
-        return MISSING_FILE_SIGNATURE
-    return (True, stat.st_mtime_ns, stat.st_size)
+    return file_signature(path)
 
 
 def _model_identity(model: dict[str, Any] | object | None) -> tuple[str, str]:

@@ -349,11 +349,17 @@ def run_benchmark(mode: str = "current-or-synthetic", cells: int = 16_000,
             "dynamic_to_static_ratio": dynamic_bytes / static_bytes if static_bytes else 0,
             "final_to_dynamic_ratio": final_bytes / dynamic_bytes if dynamic_bytes else 0}
         baseline = counts.copy()
-        compose_geometry_layers(app.build_geometry_static_layer_cached(model, static_token, settings, 18., True, app.GEOMETRY_STATIC_CACHE_VERSION),
-                                app.build_geometry_dynamic_layer_cached(model, placement_state, dynamic_token, settings, app.GEOMETRY_DYNAMIC_CACHE_VERSION))
-        scenarios["no_change_rerender"] = {"status": "ok", "additional_static_builder_calls": counts["build_geometry_static_layer"] - baseline["build_geometry_static_layer"],
+        no_op_html, no_op_ms, no_op_peak = _timed(lambda: compose_geometry_layers(
+            app.build_geometry_static_layer_cached(model, static_token, settings, 18., True, app.GEOMETRY_STATIC_CACHE_VERSION),
+            app.build_geometry_dynamic_layer_cached(model, placement_state, dynamic_token, settings, app.GEOMETRY_DYNAMIC_CACHE_VERSION)), True)
+        scenarios["no_change_rerender"] = {"status": "ok", "wall_time_ms": no_op_ms,
+            "python_tracemalloc_peak_bytes": no_op_peak, "generated_payload_bytes": len(no_op_html.encode()),
+            "artifact_reads": 0, "file_reads": 0,
+            "additional_static_builder_calls": counts["build_geometry_static_layer"] - baseline["build_geometry_static_layer"],
             "additional_dynamic_builder_calls": counts["build_geometry_dynamic_layer_direct"] - baseline["build_geometry_dynamic_layer_direct"],
-            "additional_snapshot_reads": counts["load_pre_placement_snapshot"] - baseline["load_pre_placement_snapshot"], "additional_direct_placement_disk_reads": 0}
+            "additional_snapshot_reads": counts["load_pre_placement_snapshot"] - baseline["load_pre_placement_snapshot"],
+            "additional_direct_placement_disk_reads": 0,
+            "heavy_function_calls": sum(counts[name] - baseline[name] for name in baseline)}
         baseline = counts.copy(); changed_dynamic = dynamic_token + ("benchmark-placement-change",)
         compose_geometry_layers(app.build_geometry_static_layer_cached(model, static_token, settings, 18., True, app.GEOMETRY_STATIC_CACHE_VERSION),
                                 app.build_geometry_dynamic_layer_cached(model, placement_state, changed_dynamic, settings, app.GEOMETRY_DYNAMIC_CACHE_VERSION))

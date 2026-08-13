@@ -7,11 +7,13 @@ explicit initialization or by a successful revision bump.
 from __future__ import annotations
 
 import json
-import os
+import os  # compatibility: callers/tests historically instrument revisions.os.replace
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Mapping
+
+from warehouse_persistence import atomic_write_json, read_json
 
 SCHEMA_VERSION = 1
 REVISION_PATH = Path("data/last_import/data_revisions.json")
@@ -89,7 +91,7 @@ def _load_unlocked(model_id: str | None) -> dict:
     if not REVISION_PATH.exists():
         return default_revision_state(model_id)
     try:
-        payload = json.loads(REVISION_PATH.read_text(encoding="utf-8-sig"))
+        payload = read_json(REVISION_PATH)
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         state = default_revision_state(model_id)
         state["warning"] = f"Не удалось прочитать файл ревизий: {exc}"
@@ -114,22 +116,8 @@ def get_revision_token(model_id: str | None, domains: Iterable[str]) -> tuple:
 
 
 def _write_unlocked(state: dict) -> None:
-    REVISION_PATH.parent.mkdir(parents=True, exist_ok=True)
-    temporary = REVISION_PATH.with_name(
-        f".{REVISION_PATH.name}.{os.getpid()}.{threading.get_ident()}.tmp"
-    )
     persisted = {key: value for key, value in state.items() if key != "warning"}
-    try:
-        with temporary.open("w", encoding="utf-8") as stream:
-            json.dump(persisted, stream, ensure_ascii=False, separators=(",", ":"))
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, REVISION_PATH)
-    finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+    atomic_write_json(REVISION_PATH, persisted)
 
 
 def initialize_revision_state(model_id: str | None) -> dict:
@@ -138,7 +126,7 @@ def initialize_revision_state(model_id: str | None) -> dict:
         state = _load_unlocked(model_id)
         if REVISION_PATH.exists() and not state.get("warning"):
             try:
-                stored = json.loads(REVISION_PATH.read_text(encoding="utf-8-sig"))
+                stored = read_json(REVISION_PATH)
             except (OSError, UnicodeError, json.JSONDecodeError):
                 stored = {}
             if resolve_model_id(stored.get("model_id")) == resolve_model_id(model_id):
