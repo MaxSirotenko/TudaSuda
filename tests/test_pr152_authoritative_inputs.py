@@ -76,13 +76,12 @@ def test_receipt_normalization_uses_v2_key():
     assert rows.iloc[0]["sku_key"] == canonical_sku_key({"nomenclature": "A", "characteristic": "x"})
 
 
-@pytest.mark.parametrize(("weight", "zone"), [(0.003, "small_and_bulky"), (0.250, "small_and_bulky"),
-    (0.251, "bulky"), (0.999, "bulky"), (1.000, "fragile"), (2.500, "fragile"),
-    (2.501, "light"), (3.500, "light"), (3.501, "unassigned"), (5.0, "unassigned"),
-    (15.0, "unassigned")])
-def test_only_confirmed_weight_boundaries_resolve(weight: float, zone: str):
+@pytest.mark.parametrize("weight", [0.003, 0.250, 0.251, 0.999, 1.000, 2.500,
+                                     2.501, 3.500, 3.501, 5.0, 15.0])
+def test_legacy_hardcoded_boundaries_are_not_authoritative(weight: float):
     rows, _ = calculate_receipt_zones([_receipt(weight)], {})
-    assert rows[0]["calculated_zone"] == zone
+    assert rows[0]["calculated_zone"] == "unassigned"
+    assert rows[0]["zone_calculation_reason"] == "weight_rules_not_configured"
 
 
 def test_zone_adapter_recanonicalizes_legacy_metadata_supports_all_zones_and_rejects_conflict():

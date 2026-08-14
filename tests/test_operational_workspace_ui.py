@@ -161,7 +161,9 @@ def test_data_upload_cards_cover_five_sources_using_metadata_only():
         "historical_placement", "outbound", "receipts", "inventory", "vgh"]
     outbound = next(card for card in cards if card["source_type"] == "outbound")
     assert outbound["file"] == "РО июль.xlsx"
-    assert outbound["status"] == "✅ Готово"
+    assert outbound["status"] == "✅ Загружено"
+    assert outbound["load_status"] == "loaded"
+    assert (outbound["warning_count"], outbound["error_count"]) == (0, 0)
     assert (outbound["documents"], outbound["rows"], outbound["sku"]) == (3, 12, 2)
     assert outbound["period"] == "01.07.2026 — 01.07.2026"
     assert outbound["dates"] == ["2026-07-01"]

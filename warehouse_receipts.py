@@ -11,6 +11,7 @@ from typing import Any
 import pandas as pd
 from warehouse_persistence import read_json
 from warehouse_business_identity import canonical_sku_key
+from warehouse_weight_rules import classify_weight
 from warehouse_placement_zones import (
     UNASSIGNED_ZONE,
     is_assignable_placement_zone,
@@ -163,6 +164,7 @@ def zone_classification_settings_hash(settings: dict[str, Any]) -> str:
         "weight_column": _display_value(settings.get("weight_column")),
         "fragile_column": _display_value(settings.get("fragile_column")),
         "source_zone_column": _display_value(settings.get("source_zone_column")),
+        "weight_bands": settings.get("weight_bands") or {},
     }
     return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
@@ -190,20 +192,55 @@ def format_receipt_column_option(value: Any) -> str:
     return OPTIONAL_COLUMN_LABEL if value is None else str(value)
 
 
-def _calculated_zone_for(weight: float | None) -> tuple[str, str]:
-    if weight is None:
-        return UNASSIGNED_ZONE, "Вес отсутствует или некорректен"
-    # Confirmed business ranges. Decimal boundaries are intentionally literal;
-    # values in the unconfirmed gaps remain unresolved rather than guessed.
-    if 0.003 <= weight <= 0.250:
-        return "small_and_bulky", "Подтверждённый диапазон веса 0.003–0.250 кг"
-    if 0.251 <= weight <= 0.999:
-        return "bulky", "Подтверждённый диапазон веса 0.251–0.999 кг"
-    if 1.000 <= weight <= 2.500:
-        return "fragile", "Подтверждённый диапазон веса 1.000–2.500 кг"
-    if 2.501 <= weight <= 3.500:
-        return "light", "Подтверждённый диапазон веса 2.501–3.500 кг"
-    return UNASSIGNED_ZONE, "Вес вне подтверждённых диапазонов"
+def build_vgh_weight_index(vgh_rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Build an O(M) canonical-SKU index without resolving contradictory evidence."""
+    grouped: dict[str, dict[str, Any]] = {}
+    for row in vgh_rows:
+        key = canonical_sku_key(row)
+        if not key:
+            continue
+        bucket = grouped.setdefault(key, {"seen": 0, "valid": set(), "invalid": 0})
+        bucket["seen"] += 1
+        raw = row.get("weight")
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not pd.notna(raw) or raw <= 0:
+            bucket["invalid"] += 1
+        else:
+            bucket["valid"].add(float(raw))
+    result = {}
+    for key, evidence in grouped.items():
+        values = sorted(evidence["valid"])
+        if len(values) > 1:
+            status, weight = "conflicting_weight", None
+        elif len(values) == 1:
+            status, weight = "resolved", values[0]
+        else:
+            status, weight = ("invalid_weight" if evidence["invalid"] else "missing_weight"), None
+        result[key] = {"sku_key": key, "weight": weight, "weight_status": status,
+                       "weight_source": "vgh", "diagnostics": {"values": values, "rows": evidence["seen"]}}
+    return result
+
+
+def enrich_receipts_with_vgh(receipts: list[dict[str, Any]], vgh_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    index = build_vgh_weight_index(vgh_rows)
+    enriched = []
+    for source in receipts:
+        row = dict(source)
+        key = make_sku_key(row)
+        vgh = index.get(key)
+        manual = row.get("source_weight") if row.get("weight_parse_status") == "ok" else None
+        if vgh is None:
+            status, weight, source_name = "missing_vgh", manual, "receipt_manual" if manual is not None else "vgh"
+        elif vgh["weight_status"] == "resolved":
+            status, weight, source_name = "resolved", vgh["weight"], "vgh"
+        else:
+            status, weight, source_name = vgh["weight_status"], None, "vgh"
+        diagnostics = []
+        if vgh and vgh["weight_status"] == "resolved" and manual is not None and float(manual) != vgh["weight"]:
+            diagnostics.append("manual_weight_differs_from_vgh")
+        row.update({"sku_key": key, "resolved_weight": weight, "weight_status": status,
+                    "weight_source": source_name, "weight_diagnostics": diagnostics})
+        enriched.append(row)
+    return enriched
 
 
 def _median(values: list[float]) -> float:
@@ -223,8 +260,9 @@ def _weight_conflict(values: list[float]) -> tuple[bool, float | None]:
     return any(abs(value - median) > tolerance for value in values), median
 
 
-def calculate_receipt_zones(receipts: list[dict[str, Any]], settings: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    rows = [dict(item) for item in receipts]
+def calculate_receipt_zones(receipts: list[dict[str, Any]], settings: dict[str, Any],
+                            vgh_rows: list[dict[str, Any]] | None = None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    rows = enrich_receipts_with_vgh(receipts, vgh_rows) if vgh_rows is not None else [dict(item) for item in receipts]
     by_sku: dict[str, dict[str, Any]] = {}
     for item in rows:
         sku_key = make_sku_key(item)
@@ -232,7 +270,7 @@ def calculate_receipt_zones(receipts: list[dict[str, Any]], settings: dict[str, 
         item["receipt_line_id"] = _display_value(item.get("receipt_line_id")) or make_receipt_line_id(item)
         if not sku_key:
             continue
-        weight = _safe_float(item.get("source_weight"), None) if item.get("weight_parse_status") == "ok" else None
+        weight = item.get("resolved_weight") if vgh_rows is not None else (_safe_float(item.get("source_weight"), None) if item.get("weight_parse_status") == "ok" else None)
         explicit = normalize_placement_zone(item.get("source_zone"))
         bucket = by_sku.setdefault(sku_key, {"weights": [], "explicit_zones": set(), "receipts": set(), "rows": 0, "qty_pallets": 0.0})
         if weight is not None and weight > 0:
@@ -258,7 +296,8 @@ def calculate_receipt_zones(receipts: list[dict[str, Any]], settings: dict[str, 
             conflicts.add(sku_key)
             zone, reason = UNASSIGNED_ZONE, "Конфликт веса SKU"
         else:
-            zone, reason = _calculated_zone_for(median_weight)
+            weight_class, reason = classify_weight(median_weight, settings.get("weight_bands"))
+            zone = weight_class or UNASSIGNED_ZONE
         status = "ok" if is_assignable_placement_zone(zone) else "unresolved"
         sku_result[sku_key] = (zone, reason, status)
     mismatches = 0
@@ -271,6 +310,7 @@ def calculate_receipt_zones(receipts: list[dict[str, Any]], settings: dict[str, 
             mismatches += 1
         item["calculated_zone"] = zone
         item["weight_class"] = zone
+        item["special_attributes"] = (["fragile"] if item.get("fragile_flag") else [])
         item["zone_calculation_reason"] = reason
         item["zone_calculation_status"] = status if source_zone in {UNASSIGNED_ZONE, zone, None} else "mismatch"
     sku_zones = {sku_key: result[0] for sku_key, result in sku_result.items()}
@@ -284,8 +324,9 @@ def calculate_receipt_zones(receipts: list[dict[str, Any]], settings: dict[str, 
         "SKU без подтверждённой зоны": sum(1 for value in sku_zones.values() if value == UNASSIGNED_ZONE),
         "Лёгких SKU": sum(1 for value in sku_zones.values() if value == "light"),
         "Средних SKU": sum(1 for value in sku_zones.values() if value == "medium"),
+        "Средне-лёгких SKU": sum(1 for value in sku_zones.values() if value == "medium_light"),
         "Тяжёлых SKU": sum(1 for value in sku_zones.values() if value == "heavy"),
-        "Хрупких SKU": sum(1 for value in sku_zones.values() if value == "fragile"),
+        "Хрупких SKU": len({item["sku_key"] for item in rows if item.get("fragile_flag")}),
         "SKU без рассчитанной категории": sum(1 for value in sku_zones.values() if value == UNASSIGNED_ZONE),
         "Конфликтов данных": len(conflicts),
         "SKU в нескольких приходах": len(multi_receipt_sku),
@@ -295,6 +336,10 @@ def calculate_receipt_zones(receipts: list[dict[str, Any]], settings: dict[str, 
         "conflicts": sorted(conflicts),
         "multi_receipt_sku": multi_receipt_sku,
         "settings_hash": zone_classification_settings_hash(settings),
+        "Вес найден": len({item["sku_key"] for item in rows if item.get("weight_status", "resolved" if item.get("weight_parse_status") == "ok" else "") == "resolved"}),
+        "Нет VGH": len({item["sku_key"] for item in rows if item.get("weight_status") == "missing_vgh"}),
+        "Вес пустой/некорректный": len({item["sku_key"] for item in rows if item.get("weight_status") in {"missing_weight", "invalid_weight"}}),
+        "Конфликт веса": len({item["sku_key"] for item in rows if item.get("weight_status") == "conflicting_weight"}),
     }
     return rows, diagnostics
 
