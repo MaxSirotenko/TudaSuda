@@ -108,6 +108,10 @@ from warehouse_receipts import (
     save_receipts_state,
     zone_classification_settings_hash,
 )
+from warehouse_factual_data import load_effective_rows, load_registry
+from warehouse_weight_rules import (
+    WEIGHT_CLASSES, WEIGHT_CLASS_LABELS, load_weight_rules, save_weight_rules,
+)
 from warehouse_row_settings import (
     apply_row_settings_transaction,
     changed_row_numbers,
@@ -1029,11 +1033,18 @@ def _zone_calculation_dataframe(receipts: list[dict]) -> pd.DataFrame:
             "SKU": receipt.get("sku_code", ""),
             "Номенклатура": receipt.get("sku_name", ""),
             "Характеристика": receipt.get("characteristic_name", ""),
-            "Вес": receipt.get("source_weight", ""),
+            "Вес": receipt.get("resolved_weight", receipt.get("source_weight", "")),
+            "Источник веса": {"vgh": "ВГХ", "receipt_manual": "Колонка прихода"}.get(
+                receipt.get("weight_source"), "Не определён"),
+            "Статус веса": {"resolved": "Вес найден", "missing_vgh": "SKU отсутствует в ВГХ",
+                "missing_weight": "Вес в ВГХ не заполнен", "invalid_weight": "Вес в ВГХ некорректен",
+                "conflicting_weight": "В ВГХ противоречащие значения"}.get(
+                    receipt.get("weight_status"), receipt.get("weight_parse_status", "")),
             "Исходное значение веса": receipt.get("source_weight_raw", ""),
             "Статус преобразования веса": receipt.get("weight_parse_status", ""),
             "Причина ошибки веса": receipt.get("weight_parse_reason", ""),
             "Признак хрупкости": "Да" if receipt.get("fragile_flag") else "Нет",
+            "Специальные признаки": ", ".join(receipt.get("special_attributes", [])) or "Не заданы",
             "Исходная зона из 1С": receipt.get("source_zone", ""),
             "Рассчитанная зона": RECEIPT_WEIGHT_CLASS_LABELS.get(receipt.get("calculated_zone", "unclassified"), receipt.get("calculated_zone", "")),
             "Количество паллет": receipt.get("qty_pallets", ""),
@@ -1188,17 +1199,41 @@ def render_receipts_section(model: dict) -> None:
         else:
             st.dataframe(_receipt_dataframe(receipts), use_container_width=True)
             st.subheader("Правила определения зоны товара")
-            st.caption("Диапазоны зафиксированы бизнес-контрактом; веса вне подтверждённых диапазонов остаются без зоны.")
+            st.caption("Основной источник веса — активный factual ВГХ. Колонка прихода используется только как legacy fallback и для диагностики.")
             stored_zone_settings = {**default_zone_classification_settings(), **state.get("zone_classification_settings", {})}
+            rules = load_weight_rules()
             st.caption(
-                "Колонка веса: "
-                f"{stored_zone_settings.get('weight_column') or 'не выбрана'} · "
+                "Источник веса: ВГХ · ручная колонка прихода: "
+                f"{stored_zone_settings.get('weight_column') or 'не выбрана (необязательно)'} · "
                 "признак хрупкости: "
                 f"{stored_zone_settings.get('fragile_column') or 'не выбран'} · "
                 "исходная зона 1С: "
                 f"{stored_zone_settings.get('source_zone_column') or 'не выбрана'}"
             )
             current_zone_settings = dict(stored_zone_settings)
+            st.markdown("#### Диапазоны весовых категорий")
+            if not rules.get("bands"):
+                st.info("Диапазоны весовых категорий пока не настроены.")
+            band_inputs = {}
+            for name in WEIGHT_CLASSES:
+                band = rules.get("bands", {}).get(name, {})
+                left, right = st.columns(2)
+                minimum = left.number_input(f"{WEIGHT_CLASS_LABELS[name]}: от, кг", min_value=0.0,
+                    value=float(band.get("min", 0.0)), key=f"weight_band_{name}_min")
+                open_max = name == "heavy" and right.checkbox("Без верхней границы", value=band.get("max") is None,
+                    key="weight_band_heavy_open")
+                maximum = None if open_max else right.number_input(f"{WEIGHT_CLASS_LABELS[name]}: до, кг", min_value=0.0,
+                    value=float(band.get("max", 0.0) or 0.0), key=f"weight_band_{name}_max")
+                band_inputs[name] = {"min": minimum, "max": maximum}
+            if st.button("Сохранить диапазоны веса", key="save_weight_bands"):
+                try:
+                    rules = save_weight_rules(band_inputs, model_id=resolve_model_id(model))
+                except ValueError as exc:
+                    st.error(str(exc))
+                else:
+                    st.success("Диапазоны веса сохранены. Классификация будет пересчитана по новой ревизии.")
+                    st.rerun()
+            current_zone_settings["weight_bands"] = rules.get("bands", {})
             current_settings_hash = zone_classification_settings_hash(current_zone_settings)
             saved_settings_hash = stored_zone_settings.get("settings_hash") or state.get("zone_classification_diagnostics", {}).get("settings_hash")
             if saved_settings_hash and saved_settings_hash != current_settings_hash:
@@ -1207,7 +1242,9 @@ def render_receipts_section(model: dict) -> None:
                 state, state_warning = load_receipts_state(model)
                 if state_warning:
                     st.warning(state_warning)
-                updated_receipts, zone_diag = calculate_receipt_zones(state.get("receipts", []), current_zone_settings)
+                vgh_view = load_effective_rows("vgh", registry=load_registry(), strict=False)
+                updated_receipts, zone_diag = calculate_receipt_zones(
+                    state.get("receipts", []), current_zone_settings, vgh_view.get("rows", []))
                 current_zone_settings["settings_hash"] = zone_diag.get("settings_hash", current_settings_hash)
                 current_zone_settings["calculated_at"] = pd.Timestamp.now(tz="UTC").isoformat()
                 state["receipts"] = updated_receipts
@@ -1217,7 +1254,7 @@ def render_receipts_section(model: dict) -> None:
                 save_receipts_state(state)
                 if not update_data_revisions(model, ["receipts"], "calculate_receipt_zones"):
                     return
-                st.success("Зоны товаров рассчитаны. Размещение будет использовать только рассчитанную зону, а исходная зона 1С останется для сравнения.")
+                st.success("Вес обогащён из ВГХ и весовые категории рассчитаны для доступных SKU.")
                 st.rerun()
             _render_zone_classification_result(state)
             receipts = state.get("receipts", [])
@@ -1229,8 +1266,10 @@ def render_receipts_section(model: dict) -> None:
             z3.metric("Тяжёлое", zone_summary.get("heavy", 0))
             z4.metric("Среднее/лёгкое", zone_summary.get("medium", 0) + zone_summary.get("light", 0))
             z5.metric("Хрупкое", zone_summary.get("fragile", 0))
-            if classified == 0:
-                st.error("Зоны товаров ещё не рассчитаны или все SKU без категории. Настройте правила и нажмите «Рассчитать зоны товаров». Исходная зона 1С используется только для сравнения.")
+            if classified == 0 and not rules.get("bands"):
+                st.info(f"Вес найден для {zone_diagnostics.get('Вес найден', 0)} SKU, но диапазоны весовых категорий ещё не настроены.")
+            elif classified == 0:
+                st.warning("Весовые категории не рассчитаны: проверьте покрытие ВГХ и настроенные диапазоны.")
             elif zone_summary.get("unclassified", 0):
                 st.warning("У части строк прихода нет рассчитанной зоны. Эти строки не будут размещены автоматически и получат причину missing_calculated_zone.")
             st.caption("Чтобы добавить приход поверх текущего остатка, нажмите «Добавить приход на текущий склад». Операция не очищает фактический переходящий остаток.")

@@ -68,11 +68,12 @@ def test_explicit_zone_resolves_without_weight_and_missing_evidence_is_unassigne
     assert unresolved[0]["qty_pallets"] == 3
 
 
-def test_supported_weight_resolves_without_source_zone() -> None:
+def test_manual_weight_needs_configured_business_bands() -> None:
     receipt = {"sku_name": "A", "characteristic_name": "x", "qty_pallets": 2,
                "source_weight": 0.5, "source_weight_raw": "0,5", "weight_parse_status": "ok"}
     rows, _ = calculate_receipt_zones([receipt], {})
-    assert rows[0]["calculated_zone"] == "bulky"
+    assert rows[0]["calculated_zone"] == "unassigned"
+    assert rows[0]["zone_calculation_reason"] == "weight_rules_not_configured"
 
 
 def test_invalid_and_mixed_weights_retain_every_receipt_without_fabricating_zero() -> None:
@@ -91,7 +92,7 @@ def test_invalid_and_mixed_weights_retain_every_receipt_without_fabricating_zero
     assert any('Вес "bad" не удалось распознать' in message["message"] for message in messages)
 
     classified, _ = calculate_receipt_zones(rows.to_dict("records"), {})
-    assert [row["calculated_zone"] for row in classified] == ["unassigned", "unassigned", "fragile"]
+    assert [row["calculated_zone"] for row in classified] == ["unassigned"] * 3
 
 
 def test_weight_zone_readiness_reports_partial_coverage_only() -> None:

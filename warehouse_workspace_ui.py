@@ -169,14 +169,24 @@ def build_data_source_cards(registry: Mapping[str, Any]) -> list[dict[str, Any]]
         dates = sorted({day for item in sources for day in item.get("index", {}).get("dates", item.get("partitions", [])) if day != "undated"})
         warnings = sum(len(item.get("warnings", [])) for item in sources)
         errors = sum(len(item.get("errors", [])) for item in sources)
-        status = "❌ Требуется исправление" if errors else "⚠️ Готово с ограничениями" if warnings else "✅ Готово" if sources else "⬜ Не загружено"
+        load_status = "error" if errors else "loaded" if sources else "empty"
+        status = "❌ Ошибка загрузки" if errors else "✅ Загружено" if sources else "⬜ Не загружено"
         daily = [counts for item in sources for counts in item.get("index", {}).get("daily", {}).values()]
         cards.append({"source_type": source_type, "title": title, "purpose": purpose, "sources": sources,
                       "file": ", ".join(str(item.get("source_file_name") or "—") for item in sources) or "—",
                       "period": format_ui_period(dates[0], dates[-1]) if dates else "—", "dates": dates,
                       "rows": rows, "sku": sku, "documents": sum(int(x.get("documents", 0) or 0) for x in daily),
-                      "cells": sum(int(x.get("cells", 0) or 0) for x in daily), "status": status})
+                      "cells": sum(int(x.get("cells", 0) or 0) for x in daily), "status": status,
+                      "load_status": load_status, "warning_count": warnings, "error_count": errors})
     return cards
+
+
+def structured_warning(*, title: str, cause: str, impact: str,
+                       can_continue: bool, action: str, details: Any = None) -> dict[str, Any]:
+    """Reuse the workspace message vocabulary for a non-blocking limitation."""
+    return {"severity": "warning", "title": title, "cause": cause, "reason": cause,
+            "impact": impact, "can_continue": can_continue, "action": action,
+            "details": details or []}
 
 
 def build_weight_zone_readiness(receipts: list[Mapping[str, Any]] | None) -> dict[str, Any]:
@@ -592,7 +602,7 @@ def render_factual_data_layer(model: Mapping[str, Any] | None) -> None:
     render_status_grid([{
         "title": card["title"], "value": format_compact_number(card["rows"]) + " строк" if card["sources"] else "Нет данных",
         "explanation": card["period"] if card["sources"] else "Файл ещё не загружен.",
-        "status": "error" if card["status"].startswith("❌") else "warning" if card["status"].startswith("⚠️") else "success" if card["sources"] else "empty",
+        "status": "error" if card["load_status"] == "error" else "success" if card["sources"] else "empty",
     } for card in cards])
     mandatory_ready = all(card["sources"] for card in cards if card["source_type"] in MONTHLY_ROUTE_REQUIRED_SOURCES)
     (st.success if mandatory_ready else st.warning)("Основные данные загружены" if mandatory_ready else "Не хватает обязательных данных")
@@ -636,6 +646,8 @@ def render_factual_data_layer(model: Mapping[str, Any] | None) -> None:
             st.markdown(f"""**Основное:** {format_compact_number(card['rows'])} строк · {format_compact_number(card['sku'])} SKU · период {card['period']}
 
 **Статус:** {card['status']}""")
+            if card["warning_count"]:
+                st.markdown(f"⚠️ {card['warning_count']} ограничений качества данных")
             _render_source_quality(card, cached_readiness)
             with st.expander("Дополнительные сведения", expanded=False):
                 st.write(f"Файл: {card['file']}")

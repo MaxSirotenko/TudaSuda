@@ -24,6 +24,7 @@ REVISION_DOMAINS = (
     "inventory",
     "outbound",
     "render_settings",
+    "weight_rules",
 )
 
 _LOCK = threading.RLock()
