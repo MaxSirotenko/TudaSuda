@@ -97,6 +97,11 @@ def test_invalid_optional_outbound_pick_order_diagnostic_survives_historical_res
         registry=_registry("outbound", "historical_placement"))
     assert result["authoritative"] and result["rows"][0]["pick_order"] == 17
     assert result["rows"][0]["pick_order_validation_reason"] == "optional_source_pick_order_invalid"
+    demand = build_outbound_pick_demands(result["rows"])
+    assert demand["readiness"]["route_sequence_authoritative"] is True
+    assert demand["orders"][0]["demands"][0]["pick_order"] == 17
+    assert demand["diagnostics"]["source_evidence_warning_counts"] == {
+        "optional_source_pick_order_invalid": 1}
 
 
 def test_missing_or_conflicting_historical_order_blocks_route(monkeypatch):

@@ -80,6 +80,7 @@ def build_outbound_pick_demands(order_rows: list[dict[str, Any]]) -> dict[str, A
         "merged_duplicate_lines": 0,
         "route_sequence_authoritative": True,
         "route_sequence_reason_counts": {},
+        "source_evidence_warning_counts": {},
         "skipped_missing_order": 0,
         "skipped_missing_sku": 0,
         "skipped_invalid_quantity": 0,
@@ -130,10 +131,16 @@ def build_outbound_pick_demands(order_rows: list[dict[str, Any]]) -> dict[str, A
         pick_order = _integer_evidence(row.get("pick_order"))
         line_number = _integer_evidence(row.get("line_number"))
         sequence_reason = _text(row.get("pick_order_validation_reason"))
+        historical_route_authority = (row.get("route_sequence_authoritative") is True
+                                      and _text(row.get("route_sequence_source")) == "historical_cell_picking_order")
         # The factual outbound contract intentionally makes source pick order
         # optional. Route replay derives visit order from authoritative stock
-        # locations/warehouse graph; only supplied invalid evidence blocks it.
-        if sequence_reason or row.get("route_sequence_authoritative") is False:
+        # locations/warehouse graph. Invalid optional source evidence remains a
+        # warning after successful historical resolution, not a route blocker.
+        if sequence_reason == "optional_source_pick_order_invalid" and historical_route_authority:
+            warnings = diagnostics["source_evidence_warning_counts"]
+            warnings[sequence_reason] = warnings.get(sequence_reason, 0) + 1
+        elif sequence_reason or row.get("route_sequence_authoritative") is False:
             reason = sequence_reason or ("pick_order_missing" if pick_order is None else "pick_order_not_authoritative")
             diagnostics["route_sequence_authoritative"] = False
             counts = diagnostics["route_sequence_reason_counts"]
