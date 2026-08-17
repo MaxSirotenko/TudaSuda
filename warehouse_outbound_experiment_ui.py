@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import date, timedelta
 from typing import Any, Mapping
 
 import pandas as pd
@@ -237,15 +238,16 @@ def render_outbound_experiment(model: dict[str, Any]) -> None:
     from warehouse_factual_data import ensure_compact_scope_indexes, load_registry
     from warehouse_factual_scenario_inputs import (
         available_operational_dates as factual_dates, available_warehouses as factual_warehouses,
-        build_factual_weight_classifications, build_start_state, load_inventory_for_day,
-        load_outbound_for_day, load_receipts_for_day,
+        build_scenario_weight_classifications, build_start_state, load_inventory_for_day,
+        load_outbound_history, load_receipts_for_day, load_routed_outbound_for_day,
     )
 
     st.subheader("Авторитетный CURRENT vs PROPOSED")
     st.caption("V1: начальный остаток → расходные ордера; приход внутри дня не моделируется. END — только независимая валидация.")
     st.caption("Дневной приход — не используется в V1 benchmark; END snapshot — необязательно, только валидация.")
     st.caption("Инвентаризация / независимый контроль количества — необязательно.")
-    registry = ensure_compact_scope_indexes(load_registry())
+    with st.spinner("Однократная подготовка индекса складов factual outbound…"):
+        registry = ensure_compact_scope_indexes(load_registry(), source_types=("outbound",))
     warehouses = factual_warehouses(registry=registry)
     source = st.radio("Источник сценария", ["Factual Data Layer", "Ручной fallback"], horizontal=True,
                       help="Ручной режим никогда не включается автоматически при ошибке factual-источника.")
@@ -254,7 +256,7 @@ def render_outbound_experiment(model: dict[str, Any]) -> None:
     start_hash = receipt_hash = inventory_hash = outbound_hash = ""
     start_sheet = receipt_sheet = inventory_sheet = outbound_sheet = ""
     selected_warehouse = operational_date = None; outbound_rows: list[dict[str, Any]] = []
-    source_blockers: list[Any] = []
+    source_blockers: list[Any] = []; velocity_rows = None
 
     if source == "Factual Data Layer":
         st.success("Источник данных: ✅ Factual Data Layer")
@@ -274,11 +276,16 @@ def render_outbound_experiment(model: dict[str, Any]) -> None:
             start = build_start_state(operational_date, selected_warehouse, model,
                                       warehouse_binding=selected_warehouse if binding_confirmed else None,
                                       registry=registry)
-            outbound = load_outbound_for_day(operational_date, selected_warehouse, registry=registry)
+            outbound = load_routed_outbound_for_day(operational_date, selected_warehouse, model,
+                warehouse_binding=selected_warehouse if binding_confirmed else None, registry=registry)
             receipts = load_receipts_for_day(operational_date, selected_warehouse, registry=registry)
             inventory = load_inventory_for_day(operational_date, selected_warehouse, registry=registry)
-            classifications = build_factual_weight_classifications(
-                operational_date, selected_warehouse, registry=registry)
+            relevant = [*start.get("rows", []), *outbound.get("rows", [])]
+            classifications = build_scenario_weight_classifications(relevant, registry=registry)
+            velocity = load_outbound_history(operational_date, selected_warehouse, registry=registry)
+            tomorrow = (date.fromisoformat(str(operational_date)) + timedelta(days=1)).isoformat()
+            end = build_start_state(tomorrow, selected_warehouse, model,
+                warehouse_binding=selected_warehouse if binding_confirmed else None, registry=registry)
             source_blockers = [*start["blockers"], *outbound["blockers"], *classifications["blockers"]]
             start_state = start["state"] if start["authoritative"] else None
             outbound_rows = outbound["rows"] if outbound["authoritative"] else []
@@ -286,18 +293,22 @@ def render_outbound_experiment(model: dict[str, Any]) -> None:
             opening_rows = inventory["rows"] if inventory["authoritative"] and inventory["rows"] else None
             inventory_state = inventory if opening_rows else None
             loaded_classifications = classifications["rows"] if classifications["authoritative"] else []
+            end_state = end["state"] if end["authoritative"] and end["rows"] else None
+            velocity_rows = velocity["rows"] if velocity["authoritative"] else []
             if receipt_state:
                 day_state, _ = build_day_receipt_scenario_inputs(
                     receipt_state, operational_date=operational_date, selected_warehouses=[selected_warehouse])
             st.caption(f"START: historical placement · {operational_date} · {len(start.get('rows', []))} строк")
             st.caption(f"РО: factual Data Layer · parser factual-july-v5 · {len(outbound_rows)} строк")
-            st.caption(f"Приходы: factual Data Layer · {len(receipts['rows'])} строк; Inventory: {'factual' if opening_rows else 'не используется'}")
-            st.caption(f"Весовые зоны: factual receipts + VGH + сохранённые правила · {len(loaded_classifications)} строк")
+            st.caption(f"Приходы: factual Data Layer · {len(receipts['rows'])} строк; Inventory: diagnostic evidence, не box-control")
+            st.caption(f"Весовые зоны: scenario SKU + factual VGH + сохранённые правила · {len(loaded_classifications)} строк")
+            st.caption(f"END: historical placement D+1 · {'доступен' if end_state else 'необязательный snapshot отсутствует'}")
             with st.expander("Технические сведения об источниках"):
                 st.json({"start": {"blockers": start["blockers"], "duplicates": start["duplicates"]},
                          "outbound": {"blockers": outbound["blockers"], "duplicates": outbound["duplicates"]},
                          "receipts": {"blockers": receipts["blockers"]}, "inventory": {"blockers": inventory["blockers"]}})
     else:
+        velocity_rows = None
         st.warning("Источник данных: ⚠ Ручной fallback. Он выбран пользователем явно.")
         start_state, start_diag, start_hash, start_sheet = _excel_upload(
             "START — отдельный Excel", "experiment_start", get_actual_inventory_sheet_names,
@@ -322,6 +333,21 @@ def render_outbound_experiment(model: dict[str, Any]) -> None:
         loaded = load_receipts_state_cached(model)
         loaded_receipts = loaded[0] if isinstance(loaded, tuple) else loaded
         loaded_classifications = loaded_receipts.get("receipts", []) if isinstance(loaded_receipts, Mapping) else []
+        inventory_state, _, inventory_hash, inventory_sheet = _excel_upload(
+            "Инвентаризация / независимый контроль количества — необязательно", "experiment_inventory",
+            get_inventory_results_sheet_names, read_inventory_results_table,
+            detect_inventory_results_columns, build_inventory_results_import)
+        if inventory_state and selected_warehouse:
+            documents = [item for item in inventory_state.get("documents", [])
+                         if normalize_warehouse(item.get("warehouse")) == normalize_warehouse(selected_warehouse)]
+            keys = [item["document_key"] for item in documents]
+            selected_keys = st.multiselect("Документ инвентаризации", keys,
+                                           default=keys if len(keys) == 1 else [])
+            if selected_keys:
+                selection, _ = select_inventory_rows_for_opening_stock(
+                    inventory_state, selected_document_keys=selected_keys,
+                    included_warehouses=[selected_warehouse])
+                opening_rows = selection.get("inventory_rows", [])
         end_state, _, _, _ = _excel_upload("END snapshot — необязательно", "experiment_end", get_actual_inventory_sheet_names,
             read_actual_inventory_table, detect_actual_inventory_columns, build_actual_inventory_placement_state, model)
 
@@ -348,4 +374,5 @@ def render_outbound_experiment(model: dict[str, Any]) -> None:
     render_scenario_comparison(model, operational_date=operational_date, selected_warehouse=selected_warehouse,
         start_state=start_state, opening_rows=opening_rows, classification_rows=loaded_classifications,
         outbound_rows=outbound_rows, gate_state=gate_state, end_snapshot=end_state,
-        inventory_control_supplied=inventory_state is not None, rule_config=st.session_state.get("workspace_rule_config"))
+        inventory_control_supplied=inventory_state is not None, rule_config=st.session_state.get("workspace_rule_config"),
+        velocity_rows=velocity_rows)

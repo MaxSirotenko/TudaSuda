@@ -299,6 +299,7 @@ def render_scenario_comparison(
     end_snapshot: dict[str, Any] | None = None,
     inventory_control_supplied: bool | None = None,
     rule_config: Mapping[str, Any] | None = None,
+    velocity_rows: Sequence[Mapping[str, Any]] | None = None,
     show_distance: bool = True,
 ) -> None:
     """Render the independent placement preview before the outbound replay UI."""
@@ -359,7 +360,7 @@ def render_scenario_comparison(
     velocity_diagnostics: dict[str, Any] = {"valid": True, "errors": [], "warnings": []}
     if velocity_enabled:
         velocity_profile, velocity_diagnostics = build_sku_velocity_profile(
-            list(outbound_rows or []), as_of_date=str(operational_date),
+            list(velocity_rows if velocity_rows is not None else outbound_rows or []), as_of_date=str(operational_date),
             target_normalized_warehouse=target,
         )
         velocity_summary = velocity_profile.get("summary", {})

@@ -68,6 +68,8 @@ def normalize_weight_class(value: Any) -> str:
         return "heavy"
     if text in {"medium", "среднее", "средний"}:
         return "medium"
+    if text in {"medium_light", "mediumlight", "среднелегкое", "среднелегкий"}:
+        return "medium_light"
     if text in {"light", "легкое", "легкий"}:
         return "light"
     if text in {"fragile", "хрупкое", "хрупкий"}:
@@ -1029,6 +1031,11 @@ def calculate_basic_weight_placement(model: dict[str, Any], state: dict[str, Any
         item["sku_key"] = _display_value(item.get("sku_key")) or make_sku_key(item)
     factual = [dict(p) for p in state.get("placements", []) if p.get("placement_mode") == "factual" or p.get("source") == "inventory_with_cell"]
     manual = [dict(p) for p in state.get("placements", []) if p.get("placement_mode") == "manual" or p.get("source") == "manual"]
+    incoming_ids = {str(item.get("receipt_line_id")) for item in receipts if item.get("receipt_line_id")}
+    prior_receipts = [dict(p) for p in state.get("placements", [])
+        if p.get("placement_mode") == "calculated"
+        and not (set(map(str, p.get("receipt_line_ids", []) or [])) & incoming_ids)]
+    manual.extend(prior_receipts)
     all_items = factual + source_unplaced + receipts
     sku_classes, conflicts = _sku_weight_classes(all_items)
     row_zones = _row_zones(model)
@@ -1066,7 +1073,7 @@ def calculate_basic_weight_placement(model: dict[str, Any], state: dict[str, Any
                 "quantity_added": 0.0,
                 "quantity_after": before_qty + qty,
             })
-            if weight_class in {"heavy", "medium", "light", "fragile"} and zone != weight_class:
+            if weight_class in {"heavy", "medium_light", "medium", "light", "fragile"} and zone != weight_class:
                 placement["zone_mismatch"] = True
                 placement["unplaced_reason"] = "zone_mismatch"
                 zone_mismatches.append({"sku_key": sku, "sku_code": placement.get("sku_code", ""), "cell_key": key, "weight_class": weight_class, "weight_zone": zone})

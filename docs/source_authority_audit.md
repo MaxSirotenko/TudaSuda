@@ -8,7 +8,7 @@ Audit performed from merged PR #190 snapshot. Classification: **A** source of tr
 | CURRENT/PROPOSED V1 | START | formerly `_excel_upload` / actual-inventory importer | uploaded bytes | factual historical placement (A) | MIGRATED | adapter default; explicit manual radio |
 | CURRENT/PROPOSED V1 | outbound | formerly `load_outbound_orders_cached` | `outbound_orders.json` (manual A) | factual outbound (A) | MIGRATED | scoped adapter; legacy only explicit fallback |
 | CURRENT/PROPOSED V1 | receipts | day workbook / receipts JSON | manual state | factual receipts (A) | MIGRATED | adapter provides optional day input |
-| CURRENT/PROPOSED V1 | inventory | inventory-results workbook | uploaded control | factual inventory (A) | MIGRATED | automatic optional control |
+| CURRENT/PROPOSED V1 | inventory | factual evidence / explicit control workbook | factual source quantities or proven manual boxes | factual inventory is diagnostic evidence | CORRECTED | never promote `actual_quantity` to boxes; manual control remains explicit |
 | CURRENT/PROPOSED V1 | VGH | receipt classification overlay | derived zones | factual VGH (A) | OK | classification remains derived |
 | Monthly FACT / comparison | placement, outbound | effective factual loaders | factual partitions | factual (A) | OK | preserve mathematics |
 | Scenario comparison / proposed scenario | scenario inputs | caller-provided immutable states | in-memory/result | factual adapter upstream | OK | engine unchanged |

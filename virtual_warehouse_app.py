@@ -1008,7 +1008,7 @@ def _receipt_dataframe(receipts: list[dict]) -> pd.DataFrame:
 
 
 def _receipt_zone_summary(receipts: list[dict]) -> dict[str, int]:
-    summary = {"heavy": 0, "medium": 0, "light": 0, "fragile": 0, "unclassified": 0}
+    summary = {"heavy": 0, "medium_light": 0, "medium": 0, "light": 0, "fragile": 0, "unclassified": 0}
     for receipt in receipts:
         weight_class = str(receipt.get("calculated_zone") or receipt.get("weight_class") or "unclassified")
         if weight_class not in summary:
@@ -1108,7 +1108,8 @@ def render_receipts_section(model: dict) -> None:
     from warehouse_factual_scenario_inputs import (
         available_source_dates, available_warehouses, build_factual_weight_classifications,
     )
-    registry = ensure_compact_scope_indexes(load_registry())
+    with st.spinner("Однократная подготовка индекса складов factual receipts…"):
+        registry = ensure_compact_scope_indexes(load_registry(), source_types=("receipts",))
     factual_warehouses = available_warehouses(source_types=("receipts",), registry=registry)
     source_mode = st.radio("Источник приходов", ["Factual Data Layer", "Ручной fallback"],
                            horizontal=True, key="receipt_source_mode")
@@ -1322,6 +1323,9 @@ def render_receipts_section(model: dict) -> None:
                 if source_mode == "Ручной fallback":
                     state, state_warning = load_receipts_state(model)
                     if state_warning: st.warning(state_warning)
+                if source_mode == "Factual Data Layer":
+                    state = {**state, "receipts": [row for row in state.get("receipts", [])
+                                                   if row.get("placement_eligible") is True]}
                 model = apply_active_boundaries_to_model(model)
                 save_geometry_model(model)
                 save_pre_placement_snapshot(model, placement_state, state, trigger="receipt_placement")
@@ -1384,23 +1388,31 @@ def _current_warehouse_state(model: dict) -> None:
 
 def render_outbound_picking(model: dict) -> None:
     from warehouse_factual_scenario_inputs import (
-        available_source_dates, available_warehouses, load_outbound_for_day,
+        available_source_dates, available_warehouses, load_routed_outbound_for_day,
     )
     with measure_step("load_outbound_state"):
-        orders_state = load_outbound_orders_cached(model)
         execution_state = load_outbound_execution_state_cached(model)
         execution_log = load_outbound_execution_log_cached(model)
-    registry = ensure_compact_scope_indexes(load_registry())
+    with st.spinner("Однократная подготовка индекса складов factual outbound…"):
+        registry = ensure_compact_scope_indexes(load_registry(), source_types=("outbound",))
     source_mode = st.radio("Источник расходных ордеров", ["Factual Data Layer", "Ручной fallback"],
                            horizontal=True, key="outbound_picking_source")
-    rows = orders_state.get("rows", []) if source_mode == "Ручной fallback" else []
+    if source_mode == "Ручной fallback":
+        orders_state = load_outbound_orders_cached(model)
+        rows = orders_state.get("rows", [])
+    else:
+        rows = []
     if source_mode == "Factual Data Layer":
         warehouses = available_warehouses(source_types=("outbound",), registry=registry)
         selected_warehouse = st.selectbox("Склад РО", warehouses, key="outbound_picking_warehouse") if warehouses else None
         dates = available_source_dates("outbound", warehouse=selected_warehouse, registry=registry)
         selected_day = st.selectbox("Операционный день РО", dates, key="outbound_picking_day") if dates else None
-        factual = (load_outbound_for_day(selected_day, selected_warehouse, registry=registry)
-                   if selected_day and selected_warehouse else {"rows": [], "blockers": []})
+        binding_confirmed = st.checkbox(
+            f"Подтверждаю: historical placement относится к складу «{selected_warehouse}»",
+            key="outbound_picking_historical_binding") if selected_warehouse else False
+        factual = (load_routed_outbound_for_day(selected_day, selected_warehouse, model,
+                   warehouse_binding=selected_warehouse, registry=registry)
+                   if selected_day and selected_warehouse and binding_confirmed else {"rows": [], "blockers": []})
         rows = factual["rows"]
         st.success("Источник данных: ✅ factual outbound")
         if factual["blockers"]: st.error(f"Диагностика factual source: {factual['blockers']}")

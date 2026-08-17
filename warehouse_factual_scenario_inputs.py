@@ -11,14 +11,16 @@ import json
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
+from datetime import date, timedelta
 
 from warehouse_actual_inventory_import import classify_physical_pallet_evidence
 from warehouse_business_identity import normalize_warehouse
-from warehouse_factual_data import (DATA_ROOT, active_datasets, load_effective_placement,
+from warehouse_factual_data import (DATA_ROOT, PARSER_VERSION, active_datasets, load_effective_placement,
     load_effective_rows, load_registry, normalize_operational_day)
 from warehouse_outbound_orders import outbound_order_key
 from warehouse_receipts import calculate_receipt_zones
 from warehouse_weight_rules import load_weight_rules
+from warehouse_monthly_fact_replay import resolve_factual_route_order
 
 
 def _registry(registry: Mapping[str, Any] | None, root: Path) -> Mapping[str, Any]:
@@ -77,29 +79,108 @@ def _result(source_type: str, day: str | None, warehouse: str | None,
             "blockers": list(view.get("conflicts") or []), "duplicates": list(view.get("duplicates") or [])}
 
 
+def _lifecycle_blockers(registry: Mapping[str, Any]) -> list[dict[str, Any]]:
+    blockers = [dict(item) for item in registry.get("diagnostics", [])
+                if item.get("code") == "registry_activation_review_required"]
+    incompatible = [item.get("dataset_id") for item in registry.get("datasets", [])
+                    if item.get("active", True) and item.get("parser_version")
+                    and item.get("parser_version") != PARSER_VERSION]
+    if incompatible: blockers.append({"code": "parser_reimport_required", "dataset_ids": incompatible})
+    return blockers
+
+
 def load_outbound_for_day(operational_date: Any, warehouse: Any, *, registry: Mapping[str, Any] | None = None,
                           root: Path = DATA_ROOT) -> dict[str, Any]:
     """Adapt canonical box demand; outbound pick order is optional evidence."""
     day = normalize_operational_day(operational_date); target = normalize_warehouse(warehouse)
-    view = load_effective_rows("outbound", day, registry=_registry(registry, root), root=root, strict=False); rows = []
+    reg = _registry(registry, root); lifecycle = _lifecycle_blockers(reg)
+    if lifecycle:
+        return {"source": "factual", "source_type": "outbound", "operational_date": day,
+                "warehouse": target, "rows": [], "authoritative": False, "blockers": lifecycle, "duplicates": []}
+    view = load_effective_rows("outbound", day, registry=reg, root=root, strict=False); rows = []; quantity_blockers = []; confirmed_zero = 0
     if not view["conflicts"]:
         for factual in view["rows"]:
             if normalize_warehouse(factual.get("warehouse")) != target: continue
-            quantity = factual.get("quantity")
-            if not isinstance(quantity, (int, float)) or quantity <= 0: continue
+            quantity = factual.get("quantity"); reason = None
+            if quantity is None: reason = "factual_outbound_quantity_missing"
+            elif isinstance(quantity, bool) or not isinstance(quantity, (int, float)): reason = "factual_outbound_quantity_invalid"
+            elif quantity < 0: reason = "factual_outbound_quantity_negative"
+            elif not float(quantity).is_integer(): reason = "factual_outbound_quantity_fractional"
+            elif quantity == 0:
+                confirmed_zero += 1; continue
+            if reason:
+                quantity_blockers.append({"code": reason, "dataset_id": factual.get("dataset_id"),
+                                          "source_row": factual.get("source_row")})
             created = factual.get("occurred_at") or day
             number = factual.get("document_number") or factual.get("document_ref") or ""
             pick_order = factual.get("source_pick_order")
+            pick_order_valid = (pick_order is None or
+                isinstance(pick_order, (int, float)) and not isinstance(pick_order, bool)
+                and float(pick_order).is_integer() and pick_order >= 0)
             rows.append({"outbound_order_ref": factual.get("document_ref"), "outbound_order_number": number,
                 "created_at": created, "warehouse": factual.get("warehouse"), "nomenclature": factual.get("nomenclature"),
                 "characteristic": factual.get("characteristic"), "sku_key": factual.get("sku_key"),
-                "qty_units": int(quantity) if float(quantity).is_integer() else quantity, "calculated_box_qty": quantity,
+                "qty_units": None if reason else int(quantity), "calculated_box_qty": quantity,
                 "unit_name": "короб", "line_number": factual.get("line_number"), "pick_order": pick_order,
-                "pick_order_validation_reason": "", "route_sequence_authoritative": True,
-                "route_sequence_source": "optional_outbound_order" if pick_order is not None else "physical_pick_locations",
+                "quantity_validation_reason": reason or "",
+                "pick_order_validation_reason": "" if pick_order_valid else "optional_source_pick_order_invalid",
+                "route_sequence_authoritative": False, "route_sequence_source": "unresolved",
                 "order_key": outbound_order_key(factual.get("warehouse"), number, created), "line_status": "not_processed",
                 "factual_row": factual})
-    return _result("outbound", day, target, view, rows)
+    result = _result("outbound", day, target, view, rows)
+    result["blockers"] = [*result["blockers"], *quantity_blockers]
+    result["authoritative"] = result["authoritative"] and not quantity_blockers
+    result["diagnostics"] = {"confirmed_zero_non_demand_rows": confirmed_zero,
+                             "invalid_quantity_rows": len(quantity_blockers)}
+    return result
+
+
+def load_routed_outbound_for_day(operational_date: Any, warehouse: Any, model: Mapping[str, Any], *,
+                                 warehouse_binding: Any = None, registry: Mapping[str, Any] | None = None,
+                                 root: Path = DATA_ROOT) -> dict[str, Any]:
+    """Resolve one-day demand order from the same historical cell authority as monthly FACT."""
+    reg = _registry(registry, root); outbound = load_outbound_for_day(operational_date, warehouse, registry=reg, root=root)
+    if outbound["blockers"]: return outbound
+    target = normalize_warehouse(warehouse); binding = normalize_warehouse(warehouse_binding or model.get("factual_warehouse_binding"))
+    if not binding or binding != target:
+        outbound.update(rows=[], authoritative=False, blockers=[{"code": "historical_placement_warehouse_binding_required"
+            if not binding else "historical_placement_warehouse_binding_mismatch", "warehouse": target, "binding": binding}])
+        return outbound
+    placement = load_effective_placement(normalize_operational_day(operational_date) or "", model,
+                                         registry=reg, root=root, strict=False)
+    blockers = list(placement.get("conflicts") or []); by_sku: dict[str, list[Mapping[str, Any]]] = {}
+    for row in placement.get("rows", []): by_sku.setdefault(str(row.get("sku_key") or ""), []).append(row)
+    routed = []
+    for row in outbound["rows"]:
+        candidates = by_sku.get(str(row.get("sku_key") or ""), [])
+        authority = resolve_factual_route_order(candidates); code = authority["code"]
+        if code:
+            blockers.append({"code": code, "sku_key": row.get("sku_key")}); continue
+        routed.append({**row, "pick_order": authority["cell_picking_order"], "pick_order_validation_reason": "",
+                       "route_sequence_authoritative": True, "route_sequence_source": "historical_cell_picking_order",
+                       "factual_source_cell": authority["factual_source_cells"][0],
+                       "factual_geometry_cell": authority["factual_geometry_cells"][0]})
+    outbound.update(rows=routed if not blockers else [], blockers=blockers,
+                    authoritative=outbound["authoritative"] and not blockers)
+    return outbound
+
+
+def load_outbound_history(operational_date: Any, warehouse: Any, *, days: int = 28,
+                          registry: Mapping[str, Any] | None = None, root: Path = DATA_ROOT) -> dict[str, Any]:
+    """Read only daily partitions in ``[D-days, D)`` for velocity."""
+    end = date.fromisoformat(normalize_operational_day(operational_date) or "")
+    reg = _registry(registry, root); rows = []; blockers = _lifecycle_blockers(reg)
+    if blockers: return {"source": "factual", "rows": [], "blockers": blockers, "authoritative": False}
+    indexed_days = {normalize_operational_day(raw) for dataset in active_datasets(reg, "outbound")
+                    for raw in dataset.get("index", {}).get("dates", dataset.get("partitions", []))}
+    for offset in range(days, 0, -1):
+        day = (end - timedelta(days=offset)).isoformat()
+        if day not in indexed_days: continue
+        result = load_outbound_for_day(day, warehouse, registry=reg, root=root)
+        blockers.extend(result["blockers"]); rows.extend(result["rows"])
+    return {"source": "factual_outbound_history", "rows": rows, "blockers": blockers,
+            "authoritative": not blockers, "period_from": (end-timedelta(days=days)).isoformat(),
+            "period_to_exclusive": end.isoformat()}
 
 
 def build_start_state(operational_date: Any, warehouse: Any, model: Mapping[str, Any], *,
@@ -113,8 +194,9 @@ def build_start_state(operational_date: Any, warehouse: Any, model: Mapping[str,
     """
     day = normalize_operational_day(operational_date); target = normalize_warehouse(warehouse)
     binding = normalize_warehouse(warehouse_binding or model.get("factual_warehouse_binding"))
-    view = load_effective_placement(day or "", model, registry=_registry(registry, root), root=root, strict=False)
-    blockers = list(view.get("conflicts") or [])
+    reg = _registry(registry, root); lifecycle = _lifecycle_blockers(reg)
+    view = load_effective_placement(day or "", model, registry=reg, root=root, strict=False)
+    blockers = [*lifecycle, *(view.get("conflicts") or [])]
     if not binding: blockers.append({"code": "historical_placement_warehouse_binding_required", "warehouse": target})
     elif binding != target: blockers.append({"code": "historical_placement_warehouse_binding_mismatch",
                                               "binding": binding, "warehouse": target})
@@ -149,7 +231,10 @@ def build_start_state(operational_date: Any, warehouse: Any, model: Mapping[str,
 def _scoped(source_type: str, operational_date: Any = None, warehouse: Any = None, *, registry=None,
             root=DATA_ROOT) -> dict[str, Any]:
     day = normalize_operational_day(operational_date) if operational_date else None; target = normalize_warehouse(warehouse)
-    view = load_effective_rows(source_type, day, registry=_registry(registry, root), root=root, strict=False)
+    reg = _registry(registry, root); lifecycle = _lifecycle_blockers(reg)
+    if lifecycle: return {"source": "factual", "source_type": source_type, "operational_date": day,
+        "warehouse": target or None, "rows": [], "authoritative": False, "blockers": lifecycle, "duplicates": []}
+    view = load_effective_rows(source_type, day, registry=reg, root=root, strict=False)
     rows = [] if view["conflicts"] else [dict(row) for row in view["rows"]
         if not target or source_type == "vgh" or normalize_warehouse(row.get("warehouse")) == target]
     return _result(source_type, day, target or None, view, rows)
@@ -168,6 +253,8 @@ def _receipt_overlay(row: Mapping[str, Any], index: int) -> dict[str, Any]:
         "placement_mode": "not_calculated", "source_zone": "", "calculated_zone": "unassigned",
         "source_weight": None, "source_weight_raw": "", "weight_parse_status": "not_supplied",
         "weight_parse_reason": "Вес берётся из factual VGH", "fragile_flag": False,
+        "terminal_receipt_completed": row.get("terminal_completed"),
+        "placement_eligible": row.get("terminal_completed") is True,
         "zone_calculation_status": "not_calculated", "factual_row": dict(row)}
 
 
@@ -180,20 +267,28 @@ def load_receipts_for_day(operational_date: Any, warehouse: Any, **kwargs: Any) 
         "sku_key": row.get("sku_key"), "nomenclature": row.get("nomenclature"), "characteristic": row.get("characteristic"),
         "source_box_quantity": row.get("box_quantity"), "qty_units": row.get("box_quantity"), "unit_name": "короб",
         "terminal_receipt_completed": row.get("terminal_completed"), "expected_receipt": row.get("expected_receipt"),
-        "source_index": row.get("source_row", index), "factual_row": row} for index, row in enumerate(result["rows"])]
+        "source_index": row.get("source_row", index), "factual_row": row} for index, row in enumerate(result["rows"])
+        if row.get("terminal_completed") is True]
+    pending = [{"receipt_line_key": f"factual:{row.get('dataset_id')}:{row.get('source_row', index)}",
+        "document_key": f"ref:{row.get('document_ref') or row.get('document_number') or ''}",
+        "receipt_number": row.get("document_number"), "receipt_date": row.get("occurred_at"),
+        "warehouse": row.get("warehouse"), "sku_key": row.get("sku_key"), "qty_units": row.get("box_quantity"),
+        "reason": "terminal_receipt_not_completed"} for index, row in enumerate(result["rows"])
+        if row.get("terminal_completed") is not True]
     result["state"] = {"accepted_rows": accepted, "pending_receipt_rows": [], "zero_receipt_rows": [],
         "excluded_receipt_rows": [], "documents": [], "document_keys": sorted({r["document_key"] for r in accepted})}
+    result["state"]["pending_receipt_rows"] = pending
     result["classification_inputs"] = [_receipt_overlay(row, index) for index, row in enumerate(result["rows"])]
     return result
 
 
 def load_inventory_for_day(operational_date: Any, warehouse: Any, **kwargs: Any) -> dict[str, Any]:
     result = _scoped("inventory", operational_date, warehouse, **kwargs)
-    result["rows"] = [{"sku_key": row.get("sku_key"), "nomenclature": row.get("nomenclature"),
-        "characteristic": row.get("characteristic"), "warehouse": row.get("warehouse"),
-        "normalized_warehouse": normalize_warehouse(row.get("warehouse")), "qty_units": row.get("actual_quantity"),
-        "unit_name": "короб", "inventory_ref": row.get("inventory_ref"), "line_number": row.get("line_number"),
-        "factual_row": row} for row in result["rows"]]
+    result["evidence_rows"] = result.pop("rows")
+    result["rows"] = []
+    result["diagnostics"] = {"automatic_box_control_available": False,
+        "reason": "factual_inventory_has_source_quantities_without_authoritative_box_conversion",
+        "evidence_rows": len(result["evidence_rows"])}
     return result
 
 
@@ -214,4 +309,25 @@ def build_factual_weight_classifications(operational_date: Any, warehouse: Any, 
     rows, diagnostics = calculate_receipt_zones(receipts["classification_inputs"],
                                                 {"weight_bands": configured.get("bands", {})}, vgh["rows"])
     return {"source": "factual_receipts_vgh", "rows": rows, "diagnostics": diagnostics,
+            "blockers": [], "authoritative": True}
+
+
+def build_scenario_weight_classifications(relevant_rows: list[Mapping[str, Any]], *,
+                                          registry: Mapping[str, Any] | None = None, root: Path = DATA_ROOT,
+                                          rules: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Classify opening/demand SKU from factual VGH, independently of receipts D."""
+    reg = _registry(registry, root); vgh = load_vgh_attributes(registry=reg, root=root)
+    if vgh["blockers"]: return {"source": "factual", "rows": [], "diagnostics": {},
+                                "blockers": vgh["blockers"], "authoritative": False}
+    unique: dict[str, Mapping[str, Any]] = {}
+    for row in relevant_rows:
+        sku = str(row.get("sku_key") or "")
+        if sku: unique.setdefault(sku, row)
+    inputs = [_receipt_overlay({"sku_key": sku,
+        "nomenclature": row.get("nomenclature") or row.get("sku_name") or row.get("item_name"),
+        "characteristic": row.get("characteristic") or row.get("characteristic_name")}, index)
+        for index, (sku, row) in enumerate(sorted(unique.items()))]
+    configured = dict(rules) if rules is not None else load_weight_rules()
+    rows, diagnostics = calculate_receipt_zones(inputs, {"weight_bands": configured.get("bands", {})}, vgh["rows"])
+    return {"source": "factual_scenario_sku_vgh", "rows": rows, "diagnostics": diagnostics,
             "blockers": [], "authoritative": True}

@@ -541,15 +541,16 @@ def active_datasets(registry: Mapping[str, Any], source_type: str | None = None)
             and (source_type is None or item.get("source_type") == source_type)]
 
 
-def ensure_compact_scope_indexes(registry: dict[str, Any], *, root: Path = DATA_ROOT) -> dict[str, Any]:
+def ensure_compact_scope_indexes(registry: dict[str, Any], *, source_types: Iterable[str] | None = None,
+                                 root: Path = DATA_ROOT) -> dict[str, Any]:
     """Persist a one-time compact warehouse index for pre-index datasets.
 
     Old partitions are streamed rather than materialized. Once upgraded,
     normal UI reruns read registry metadata only.
     """
-    changed = False
+    changed = False; requested = set(source_types or {"outbound", "receipts", "inventory"})
     for dataset in registry.get("datasets", []):
-        if dataset.get("source_type") not in {"outbound", "receipts", "inventory"}: continue
+        if dataset.get("source_type") not in requested: continue
         index = dataset.setdefault("index", {})
         if "warehouses" in index and "warehouses_by_date" in index: continue
         by_date: dict[str, list[str]] = {}; all_warehouses: set[str] = set()
