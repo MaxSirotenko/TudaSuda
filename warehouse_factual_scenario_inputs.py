@@ -21,6 +21,7 @@ from warehouse_outbound_orders import outbound_order_key
 from warehouse_receipts import calculate_receipt_zones
 from warehouse_weight_rules import load_weight_rules
 from warehouse_monthly_fact_replay import resolve_factual_route_order
+from warehouse_day_receipts_import import normalize_receipt_boolean
 
 
 def _registry(registry: Mapping[str, Any] | None, root: Path) -> Mapping[str, Any]:
@@ -216,6 +217,11 @@ def build_start_state(operational_date: Any, warehouse: Any, model: Mapping[str,
     if invalid_quantities:
         blockers.append({"code": "historical_stock_quantity_invalid", "rows": len(invalid_quantities),
                          "source_rows": [row.get("source_row") for row in invalid_quantities[:20]]})
+    invalid_skus = [row for row in view["rows"] if row.get("source_stock_quantity") not in (None, 0)
+                    and not str(row.get("sku_key") or "").strip()]
+    if invalid_skus:
+        blockers.append({"code": "historical_sku_identity_invalid", "rows": len(invalid_skus),
+                         "source_rows": [row.get("source_row") for row in invalid_skus[:20]]})
     cells = {str(cell.get("cell_key")): cell for cell in model.get("cells", []) if isinstance(cell, Mapping)}
     placements = []
     if not blockers:
@@ -255,6 +261,8 @@ def _scoped(source_type: str, operational_date: Any = None, warehouse: Any = Non
 
 
 def _receipt_overlay(row: Mapping[str, Any], index: int) -> dict[str, Any]:
+    terminal = normalize_receipt_boolean(row.get("terminal_completed"))
+    expected = normalize_receipt_boolean(row.get("expected_receipt"))
     return {"receipt_id": f"factual:{row.get('dataset_id')}:{row.get('source_row', index)}",
         "receipt_line_id": f"factual:{row.get('dataset_id')}:{row.get('source_row', index)}",
         "source_row_number": row.get("source_row", index), "sku_key": row.get("sku_key"),
@@ -267,14 +275,15 @@ def _receipt_overlay(row: Mapping[str, Any], index: int) -> dict[str, Any]:
         "placement_mode": "not_calculated", "source_zone": "", "calculated_zone": "unassigned",
         "source_weight": None, "source_weight_raw": "", "weight_parse_status": "not_supplied",
         "weight_parse_reason": "Вес берётся из factual VGH", "fragile_flag": False,
-        "terminal_receipt_completed": row.get("terminal_completed"),
-        "placement_eligible": row.get("terminal_completed") is True,
+        "terminal_receipt_completed": terminal, "expected_receipt": expected,
+        "placement_eligible": terminal is True,
         "zone_calculation_status": "not_calculated", "factual_row": dict(row)}
 
 
 def load_receipts_for_day(operational_date: Any, warehouse: Any, **kwargs: Any) -> dict[str, Any]:
     result = _scoped("receipts", operational_date, warehouse, **kwargs)
-    invalid = [row for row in result["rows"] if row.get("terminal_completed") is True and
+    completed = {id(row): normalize_receipt_boolean(row.get("terminal_completed")) for row in result["rows"]}
+    invalid = [row for row in result["rows"] if completed[id(row)] is True and
         (isinstance(row.get("box_quantity"), bool) or not isinstance(row.get("box_quantity"), (int, float))
          or row.get("box_quantity") <= 0 or not float(row.get("box_quantity")).is_integer())]
     if invalid:
@@ -287,15 +296,16 @@ def load_receipts_for_day(operational_date: Any, warehouse: Any, **kwargs: Any) 
         "receipt_date": row.get("occurred_at"), "warehouse": row.get("warehouse"), "line_number": row.get("line_number"),
         "sku_key": row.get("sku_key"), "nomenclature": row.get("nomenclature"), "characteristic": row.get("characteristic"),
         "source_box_quantity": row.get("box_quantity"), "qty_units": row.get("box_quantity"), "unit_name": "короб",
-        "terminal_receipt_completed": row.get("terminal_completed"), "expected_receipt": row.get("expected_receipt"),
+        "terminal_receipt_completed": completed[id(row)],
+        "expected_receipt": normalize_receipt_boolean(row.get("expected_receipt")),
         "source_index": row.get("source_row", index), "factual_row": row} for index, row in enumerate(result["rows"])
-        if row.get("terminal_completed") is True and row not in invalid]
+        if completed[id(row)] is True and row not in invalid]
     pending = [{"receipt_line_key": f"factual:{row.get('dataset_id')}:{row.get('source_row', index)}",
         "document_key": f"ref:{row.get('document_ref') or row.get('document_number') or ''}",
         "receipt_number": row.get("document_number"), "receipt_date": row.get("occurred_at"),
         "warehouse": row.get("warehouse"), "sku_key": row.get("sku_key"), "qty_units": row.get("box_quantity"),
         "reason": "terminal_receipt_not_completed"} for index, row in enumerate(result["rows"])
-        if row.get("terminal_completed") is not True]
+        if completed[id(row)] is not True]
     result["state"] = {"accepted_rows": accepted, "pending_receipt_rows": [], "zero_receipt_rows": [],
         "excluded_receipt_rows": [], "documents": [], "document_keys": sorted({r["document_key"] for r in accepted})}
     result["state"]["pending_receipt_rows"] = pending

@@ -19,4 +19,5 @@ This table is the production contract. Effective views in `warehouse_factual_dat
 * One-day route order is resolved from the opening historical snapshot's unique `cell_picking_order`; outbound pick order is optional and missing/conflicting historical evidence blocks full-day authority.
 * Scenario weight zones use relevant START/outbound SKU + factual VGH + persisted user bands; they do not require a receipt on D.
 * Velocity history reads only `[D-28,D)` when the velocity rule is enabled and is cached by warehouse, day, and active outbound revision.
+* The outbound-picking workspace is an operational mutation workflow: factual outbound is demand authority, while pick locations/order come only from current mutable placement execution. Historical route authority is reserved for CURRENT/PROPOSED and monthly FACT.
 * Mutable placement, execution logs, model/geometry, gates, rules, render settings and comparison artifacts are derived state/configuration/results, not competing factual sources.

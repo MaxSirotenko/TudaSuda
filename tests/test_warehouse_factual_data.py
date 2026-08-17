@@ -360,3 +360,53 @@ def test_vgh_business_key_keeps_characteristics_distinct(tmp_path):
             for value in ("Красный", "Синий")]
     imported = import_excel_dataset(_xlsx(rows), "ВГХ.xlsx", root=tmp_path)
     assert len({row["sku_key"] for row in load_dataset_rows(imported)}) == 2
+
+
+def _effective_registry(tmp_path, source_type, datasets):
+    import gzip, json
+    entries = []
+    for index, rows in enumerate(datasets):
+        artifact = tmp_path / f"artifact-{index}"
+        target = artifact / "canonical" / "date=2026-07-15.jsonl.gz"
+        target.parent.mkdir(parents=True)
+        with gzip.open(target, "wt", encoding="utf-8") as stream:
+            for row_number, row in enumerate(rows, 2):
+                stream.write(json.dumps({"dataset_id": f"d{index}", "source_file_name": f"f{index}.xlsx",
+                    "source_row": row_number, "source_type": source_type, **row}, ensure_ascii=False) + "\n")
+        entries.append({"dataset_id": f"d{index}", "source_type": source_type, "active": True,
+            "artifact": str(artifact), "partitions": ["2026-07-15"], "index": {"dates": ["2026-07-15"]}})
+    return {"datasets": entries, "diagnostics": []}
+
+
+def test_vgh_weight_is_material_conflict_not_arbitrary_duplicate(tmp_path):
+    from warehouse_factual_data import load_effective_rows
+    base = {"sku_key": "sku", "boxes_per_layer": 2, "layers_per_pallet": 3,
+            "quantity_per_box": 1, "source_boxes_per_pallet": 6}
+    registry = _effective_registry(tmp_path, "vgh", [[{**base, "weight": 5}], [{**base, "weight": 15}]])
+    result = load_effective_rows("vgh", registry=registry, root=tmp_path, strict=False)
+    assert not result["authoritative"] and result["conflicts"]
+
+
+def test_historical_exact_evidence_dedup_does_not_double_stock(tmp_path):
+    from warehouse_factual_data import load_effective_rows
+    row = {"snapshot_at": "2026-07-15", "sku_key": "sku", "nomenclature": "N", "characteristic": "C",
+           "source_stock_quantity": 4, "source_pallet_ref": "P", "cell": "A", "cell_picking_order": 1}
+    registry = _effective_registry(tmp_path, "historical_placement", [[row, row]])
+    result = load_effective_rows("historical_placement", "2026-07-15", registry=registry, root=tmp_path)
+    assert len(result["rows"]) == 1 and result["rows"][0]["source_stock_quantity"] == 4
+    assert result["duplicates"][0]["code"] == "duplicate_historical_exact_evidence_collapsed"
+
+
+def test_outbound_number_date_fallback_identity_dedup_and_conflict(tmp_path):
+    from warehouse_factual_data import load_effective_rows
+    base = {"document_ref": None, "document_number": "RO", "occurred_at": "2026-07-15T10:00:00",
+            "line_number": 1, "warehouse": "W", "sku_key": "sku", "quantity": 4, "source_pick_order": None}
+    same = load_effective_rows("outbound", "2026-07-15",
+        registry=_effective_registry(tmp_path / "same", "outbound", [[base], [base]]), root=tmp_path / "same", strict=False)
+    assert same["authoritative"] and len(same["rows"]) == 1 and same["duplicates"]
+    conflict = load_effective_rows("outbound", "2026-07-15", registry=_effective_registry(
+        tmp_path / "conflict", "outbound", [[base], [{**base, "quantity": 5}]]), root=tmp_path / "conflict", strict=False)
+    assert not conflict["authoritative"] and conflict["conflicts"]
+    lines = load_effective_rows("outbound", "2026-07-15", registry=_effective_registry(
+        tmp_path / "lines", "outbound", [[base], [{**base, "line_number": 2}]]), root=tmp_path / "lines", strict=False)
+    assert lines["authoritative"] and len(lines["rows"]) == 2

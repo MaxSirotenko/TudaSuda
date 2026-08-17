@@ -676,8 +676,10 @@ MATERIAL_FIELDS = {
     "receipts": ("occurred_at", "warehouse", "sku_key", "box_quantity", "reported_pallets",
                  "terminal_completed", "expected_receipt"),
     "inventory": ("occurred_at", "warehouse", "sku_key", "actual_quantity", "accounting_quantity"),
-    "vgh": ("boxes_per_layer", "layers_per_pallet", "quantity_per_box", "source_boxes_per_pallet"),
+    "vgh": ("weight", "length", "width", "height", "boxes_per_layer", "layers_per_pallet",
+            "quantity_per_box", "source_boxes_per_pallet"),
 }
+EVIDENCE_SEMANTICS_UPGRADED = {"outbound", "vgh"}
 
 
 def _fingerprint(values: Any) -> str:
@@ -687,6 +689,8 @@ def _fingerprint(values: Any) -> str:
 
 def _business_evidence(row: Mapping[str, Any], source_type: str) -> dict[str, Any] | None:
     fields = BUSINESS_KEYS.get(source_type)
+    if source_type == "outbound" and not row.get("document_ref"):
+        fields = ("document_number", "occurred_at", "line_number")
     if not fields:
         return None
     key_values = [row.get(field) for field in fields]
@@ -1054,7 +1058,8 @@ def _source_conflicts(registry: Mapping[str, Any], source_type: str, day: str | 
     groups: dict[str, dict[str, list[dict[str, Any]]]] = defaultdict(lambda: defaultdict(list))
     for dataset in active_datasets(registry, source_type):
         path = Path(str(dataset["artifact"])) / "business_index.jsonl.gz"
-        if path.exists():
+        if path.exists() and (source_type not in EVIDENCE_SEMANTICS_UPGRADED
+                              or not (Path(str(dataset["artifact"])) / "canonical").exists()):
             evidence_rows = _read_jsonl(path)
         else:
             evidence_rows = [e for row in load_dataset_rows(dataset, day) if (e := _business_evidence(row, source_type))]
@@ -1097,7 +1102,8 @@ def _readiness_source_conflicts(registry: Mapping[str, Any], source_type: str,
         for dataset in active_datasets(registry, source_type):
             artifact = Path(str(dataset["artifact"]))
             business_index = artifact / "business_index.jsonl.gz"
-            if business_index.exists():
+            if business_index.exists() and (source_type not in EVIDENCE_SEMANTICS_UPGRADED
+                                            or not (artifact / "canonical").exists()):
                 with measure(f"factual.readiness_business_index_scan.{source_type}"):
                     for evidence in _iter_jsonl(business_index):
                         add(evidence)
@@ -1205,7 +1211,20 @@ def load_effective_rows(source_type: str, day: str | None = None, *, registry: M
             if strict: raise ValueError("multiple_active_placement_sources_for_snapshot")
             return {"rows": [], "duplicates": [], "conflicts": [conflict], "authoritative": False}
         rows = [row for dataset in candidates for row in load_dataset_rows(dataset, day)]
-        return {"rows": rows, "duplicates": [], "conflicts": [], "authoritative": len(candidates) <= 1}
+        provenance = {"dataset_id", "source_file_name", "content_hash", "source_type", "parser_version", "sheet",
+                      "source_row", "source_index", "imported_at", "duplicate_source_count",
+                      "duplicate_source_ids", "duplicate_source_filenames", "duplicate_row_evidence"}
+        representatives: dict[str, dict[str, Any]] = {}; evidence: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for row in rows:
+            payload = {key: value for key, value in row.items() if key not in provenance}
+            fingerprint = _fingerprint(payload)
+            evidence[fingerprint].append({"dataset_id": row.get("dataset_id"), "source_file_name": row.get("source_file_name"),
+                                          "source_row": row.get("source_row")})
+            representatives.setdefault(fingerprint, dict(row))
+        duplicates = [{"code": "duplicate_historical_exact_evidence_collapsed", "occurrences": occurrences}
+                      for occurrences in evidence.values() if len(occurrences) > 1]
+        return {"rows": list(representatives.values()), "duplicates": duplicates, "conflicts": [],
+                "authoritative": len(candidates) <= 1}
     analysis = _source_conflicts(registry, source_type, day)
     if analysis["conflicts"] and strict:
         raise ValueError("conflicting_factual_business_key")

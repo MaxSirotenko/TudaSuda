@@ -300,6 +300,7 @@ def render_scenario_comparison(
     inventory_control_supplied: bool | None = None,
     rule_config: Mapping[str, Any] | None = None,
     velocity_rows: Sequence[Mapping[str, Any]] | None = None,
+    velocity_history_blockers: Sequence[Mapping[str, Any]] | None = None,
     show_distance: bool = True,
 ) -> None:
     """Render the independent placement preview before the outbound replay UI."""
@@ -359,6 +360,11 @@ def render_scenario_comparison(
     velocity_profile = None
     velocity_diagnostics: dict[str, Any] = {"valid": True, "errors": [], "warnings": []}
     if velocity_enabled:
+        if velocity_history_blockers:
+            st.error("Velocity включён, но authoritative история [D-28,D) не готова.")
+            with st.expander("Диагностика velocity history"):
+                st.json(list(velocity_history_blockers))
+            return
         velocity_profile, velocity_diagnostics = build_sku_velocity_profile(
             list(velocity_rows if velocity_rows is not None else outbound_rows or []), as_of_date=str(operational_date),
             target_normalized_warehouse=target,

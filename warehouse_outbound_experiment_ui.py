@@ -68,6 +68,15 @@ def load_velocity_history_if_enabled(rule_config: Mapping[str, Any] | None, oper
         json.dumps(registry, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str))
 
 
+def velocity_history_gate(result: Mapping[str, Any] | None) -> tuple[list[dict[str, Any]] | None, list[dict[str, Any]]]:
+    """Never substitute day-D demand when enabled history is non-authoritative."""
+    if result is None: return None, []
+    blockers = list(result.get("blockers", []))
+    if result.get("authoritative") is not True and not blockers:
+        blockers.append({"code": "velocity_history_not_authoritative"})
+    return (list(result.get("rows", [])) if not blockers else []), blockers
+
+
 def _canonical(value: Any) -> Any:
     if isinstance(value, Mapping):
         return {str(k): _canonical(value[k]) for k in sorted(value, key=str)}
@@ -280,7 +289,7 @@ def render_outbound_experiment(model: dict[str, Any]) -> None:
     start_hash = receipt_hash = inventory_hash = outbound_hash = ""
     start_sheet = receipt_sheet = inventory_sheet = outbound_sheet = ""
     selected_warehouse = operational_date = None; outbound_rows: list[dict[str, Any]] = []
-    source_blockers: list[Any] = []; velocity_rows = None
+    source_blockers: list[Any] = []; velocity_rows = None; velocity_blockers: list[dict[str, Any]] = []
 
     if source == "Factual Data Layer":
         st.success("Источник данных: ✅ Factual Data Layer")
@@ -315,7 +324,9 @@ def render_outbound_experiment(model: dict[str, Any]) -> None:
             tomorrow = (date.fromisoformat(str(operational_date)) + timedelta(days=1)).isoformat()
             end = build_start_state(tomorrow, selected_warehouse, model,
                 warehouse_binding=selected_warehouse if binding_confirmed else None, registry=registry)
-            source_blockers = [*start["blockers"], *outbound["blockers"], *classifications["blockers"]]
+            velocity_rows, velocity_blockers = velocity_history_gate(velocity)
+            source_blockers = [*start["blockers"], *outbound["blockers"], *classifications["blockers"],
+                               *velocity_blockers]
             start_state = start["state"] if start["authoritative"] else None
             outbound_rows = outbound["rows"] if outbound["authoritative"] else []
             receipt_state = receipts.get("state") if receipts["authoritative"] else None
@@ -323,7 +334,6 @@ def render_outbound_experiment(model: dict[str, Any]) -> None:
             inventory_state = inventory if opening_rows else None
             loaded_classifications = classifications["rows"] if classifications["authoritative"] else []
             end_state = end["state"] if end["authoritative"] and end["rows"] else None
-            velocity_rows = velocity["rows"] if velocity and velocity["authoritative"] else None
             if receipt_state:
                 day_state, _ = build_day_receipt_scenario_inputs(
                     receipt_state, operational_date=operational_date, selected_warehouses=[selected_warehouse])
@@ -404,4 +414,4 @@ def render_outbound_experiment(model: dict[str, Any]) -> None:
         start_state=start_state, opening_rows=opening_rows, classification_rows=loaded_classifications,
         outbound_rows=outbound_rows, gate_state=gate_state, end_snapshot=end_state,
         inventory_control_supplied=inventory_state is not None, rule_config=st.session_state.get("workspace_rule_config"),
-        velocity_rows=velocity_rows)
+        velocity_rows=velocity_rows, velocity_history_blockers=velocity_blockers if source == "Factual Data Layer" else None)

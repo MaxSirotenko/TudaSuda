@@ -1388,7 +1388,7 @@ def _current_warehouse_state(model: dict) -> None:
 
 def render_outbound_picking(model: dict) -> None:
     from warehouse_factual_scenario_inputs import (
-        available_source_dates, available_warehouses, load_routed_outbound_for_day,
+        available_source_dates, available_warehouses, load_outbound_for_day,
     )
     with measure_step("load_outbound_state"):
         execution_state = load_outbound_execution_state_cached(model)
@@ -1407,14 +1407,10 @@ def render_outbound_picking(model: dict) -> None:
         selected_warehouse = st.selectbox("Склад РО", warehouses, key="outbound_picking_warehouse") if warehouses else None
         dates = available_source_dates("outbound", warehouse=selected_warehouse, registry=registry)
         selected_day = st.selectbox("Операционный день РО", dates, key="outbound_picking_day") if dates else None
-        binding_confirmed = st.checkbox(
-            f"Подтверждаю: historical placement относится к складу «{selected_warehouse}»",
-            key="outbound_picking_historical_binding") if selected_warehouse else False
-        factual = (load_routed_outbound_for_day(selected_day, selected_warehouse, model,
-                   warehouse_binding=selected_warehouse, registry=registry)
-                   if selected_day and selected_warehouse and binding_confirmed else {"rows": [], "blockers": []})
+        factual = (load_outbound_for_day(selected_day, selected_warehouse, registry=registry)
+                   if selected_day and selected_warehouse else {"rows": [], "blockers": []})
         rows = factual["rows"]
-        st.success("Источник данных: ✅ factual outbound")
+        st.success("Источник demand: ✅ factual outbound · исполнение: текущее mutable placement")
         if factual["blockers"]: st.error(f"Диагностика factual source: {factual['blockers']}")
     else:
         st.warning("Источник данных: ⚠ ручной/legacy fallback выбран явно.")

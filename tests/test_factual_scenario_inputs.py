@@ -212,7 +212,7 @@ def test_manual_inventory_fallback_and_factual_main_screens_are_present():
     app = Path("virtual_warehouse_app.py").read_text(encoding="utf-8")
     assert "get_inventory_results_sheet_names" in experiment and "select_inventory_rows_for_opening_stock" in experiment
     assert '["Factual Data Layer", "Ручной fallback"]' in app
-    assert "load_routed_outbound_for_day" in app
+    assert "load_outbound_for_day" in app
 
 
 def _receipt(line_id, sku, *, zone="medium_light", eligible=True):
@@ -271,3 +271,39 @@ def test_applying_d1_then_d2_preserves_d1_and_reapplying_d2_is_idempotent():
                 for sku in (sku1, sku2)}
     assert quantities(second) == {sku1: 1.0, sku2: 1.0}
     assert quantities(repeated) == quantities(second)
+
+
+def test_broken_enabled_velocity_history_is_explicitly_blocked_without_day_fallback():
+    rows, blockers = experiment_ui.velocity_history_gate(
+        {"authoritative": False, "rows": [{"created_at": DAY}], "blockers": [{"code": "prior_day_conflict"}]})
+    assert rows == [] and blockers == [{"code": "prior_day_conflict"}]
+    assert experiment_ui.velocity_history_gate(None) == (None, [])
+
+
+def test_historical_blank_sku_is_factual_source_blocker(monkeypatch):
+    monkeypatch.setattr(adapter, "load_effective_placement", lambda *a, **k: _view([{**_placement(), "sku_key": ""}]))
+    result = adapter.build_start_state(DAY, WAREHOUSE, _model(), warehouse_binding=WAREHOUSE,
+        registry=_registry("historical_placement"))
+    assert not result["authoritative"] and result["blockers"][0]["code"] == "historical_sku_identity_invalid"
+
+
+def test_receipt_boolean_normalization_for_existing_partition_scalars(monkeypatch):
+    template = {"dataset_id": "r", "document_ref": "p", "occurred_at": DAY, "warehouse": WAREHOUSE,
+        "sku_key": SKU, "box_quantity": 1, "reported_pallets": 1}
+    for value in ("Да", 1, True):
+        monkeypatch.setattr(adapter, "load_effective_rows", lambda *a, value=value, **k: _view([{**template, "terminal_completed": value}]))
+        result = adapter.load_receipts_for_day(DAY, WAREHOUSE, registry=_registry("receipts"))
+        assert result["state"]["accepted_rows"] and result["classification_inputs"][0]["placement_eligible"] is True
+    for value in ("Нет", 0, False, "unknown", None):
+        monkeypatch.setattr(adapter, "load_effective_rows", lambda *a, value=value, **k: _view([{**template, "terminal_completed": value}]))
+        result = adapter.load_receipts_for_day(DAY, WAREHOUSE, registry=_registry("receipts"))
+        assert not result["state"]["accepted_rows"] and result["state"]["pending_receipt_rows"]
+        assert result["classification_inputs"][0]["placement_eligible"] is False
+
+
+def test_outbound_picking_workspace_uses_factual_demand_not_historical_route_contract():
+    source = Path("virtual_warehouse_app.py").read_text(encoding="utf-8")
+    body = source[source.index("def render_outbound_picking"):source.index("def render_operation_history")]
+    assert "load_outbound_for_day" in body and "load_routed_outbound_for_day" not in body
+    assert "historical_binding" not in body
+    assert "текущее mutable placement" in body
