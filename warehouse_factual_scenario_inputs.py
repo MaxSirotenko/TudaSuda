@@ -21,6 +21,7 @@ from warehouse_outbound_orders import outbound_order_key
 from warehouse_receipts import calculate_receipt_zones
 from warehouse_weight_rules import load_weight_rules
 from warehouse_monthly_fact_replay import resolve_factual_route_order
+from warehouse_physical_graph import build_physical_warehouse_graph
 from warehouse_day_receipts_import import normalize_receipt_boolean
 
 
@@ -162,12 +163,17 @@ def load_routed_outbound_for_day(operational_date: Any, warehouse: Any, model: M
         return outbound
     placement = load_effective_placement(normalize_operational_day(operational_date) or "", model,
                                          registry=reg, root=root, strict=False)
+    graph, _ = build_physical_warehouse_graph(dict(model), None)
+    routable_cells = {str(item.get("cell_key")) for item in graph.get("cell_access_links", []) if item.get("cell_key")}
     blockers = list(placement.get("conflicts") or []); by_sku: dict[str, list[Mapping[str, Any]]] = {}
-    for row in placement.get("rows", []): by_sku.setdefault(str(row.get("sku_key") or ""), []).append(row)
+    for row in placement.get("rows", []):
+        quantity = row.get("source_stock_quantity")
+        if isinstance(quantity, (int, float)) and not isinstance(quantity, bool) and quantity > 0:
+            by_sku.setdefault(str(row.get("sku_key") or ""), []).append(row)
     routed = []
     for row in outbound["rows"]:
         candidates = by_sku.get(str(row.get("sku_key") or ""), [])
-        authority = resolve_factual_route_order(candidates); code = authority["code"]
+        authority = resolve_factual_route_order(candidates, routable_cells=routable_cells); code = authority["code"]
         if code:
             blockers.append({"code": code, "sku_key": row.get("sku_key")}); continue
         routed.append({**row, "pick_order": authority["cell_picking_order"],
@@ -310,6 +316,8 @@ def load_receipts_for_day(operational_date: Any, warehouse: Any, **kwargs: Any) 
     invalid_pallets = [row for row in result["rows"] if completed[id(row)] is True and
         (isinstance(row.get("reported_pallets"), bool)
          or not isinstance(row.get("reported_pallets"), (int, float)) or row.get("reported_pallets") <= 0)]
+    invalid_skus = [row for row in result["rows"] if completed[id(row)] is True
+                    and not str(row.get("sku_key") or "").strip()]
     if invalid:
         result["blockers"] = [*result["blockers"], {"code": "factual_receipt_box_quantity_invalid",
             "rows": len(invalid), "source_rows": [row.get("source_row") for row in invalid[:20]]}]
@@ -317,6 +325,11 @@ def load_receipts_for_day(operational_date: Any, warehouse: Any, **kwargs: Any) 
     if invalid_pallets:
         result["blockers"] = [*result["blockers"], {"code": "factual_receipt_pallet_quantity_missing_or_invalid",
             "rows": len(invalid_pallets), "source_rows": [row.get("source_row") for row in invalid_pallets[:20]]}]
+        result["authoritative"] = False
+    if invalid_skus:
+        result["blockers"] = [*result["blockers"], {"code": "factual_receipt_sku_identity_missing",
+            "rows": len(invalid_skus), "evidence": [{"dataset_id": row.get("dataset_id"),
+            "source_row": row.get("source_row")} for row in invalid_skus[:20]]}]
         result["authoritative"] = False
     accepted = [{"receipt_line_key": f"factual:{row.get('dataset_id')}:{row.get('source_row', index)}",
         "document_key": f"ref:{row.get('document_ref') or row.get('document_number') or ''}",
@@ -327,8 +340,10 @@ def load_receipts_for_day(operational_date: Any, warehouse: Any, **kwargs: Any) 
         "terminal_receipt_completed": completed[id(row)],
         "expected_receipt": normalize_receipt_boolean(row.get("expected_receipt")),
         "source_index": row.get("source_row", index), "factual_row": row} for index, row in enumerate(result["rows"])
-        if completed[id(row)] is True and row not in invalid and row not in invalid_pallets
+        if completed[id(row)] is True and row not in invalid and row not in invalid_pallets and row not in invalid_skus
         and row not in identityless and row not in unscoped]
+    if result["blockers"]:
+        accepted = []
     pending = [{"receipt_line_key": f"factual:{row.get('dataset_id')}:{row.get('source_row', index)}",
         "document_key": f"ref:{row.get('document_ref') or row.get('document_number') or ''}",
         "receipt_number": row.get("document_number"), "receipt_date": row.get("occurred_at"),

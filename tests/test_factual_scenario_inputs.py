@@ -1,5 +1,6 @@
 from pathlib import Path
 from datetime import date, timedelta
+import pytest
 
 import warehouse_factual_data as factual
 import warehouse_factual_scenario_inputs as adapter
@@ -48,6 +49,12 @@ def _view(rows, conflicts=None):
 def _bands():
     return {"light": {"min": 0, "max": 5}, "medium_light": {"min": 5, "max": 10},
             "medium": {"min": 10, "max": 20}, "heavy": {"min": 20, "max": None}}
+
+
+@pytest.fixture(autouse=True)
+def _routable_graph(monkeypatch):
+    monkeypatch.setattr(adapter, "build_physical_warehouse_graph", lambda *a, **k:
+        ({"cell_access_links": [{"cell_key": "1|1|1"}]}, {}))
 
 
 def test_indexed_selectors_and_normal_rerun_never_open_partitions(monkeypatch, tmp_path):
@@ -112,6 +119,21 @@ def test_missing_or_conflicting_historical_order_blocks_route(monkeypatch):
             registry=_registry("outbound", "historical_placement"))
         assert not result["authoritative"] and not result["rows"]
         assert result["blockers"][0]["code"] == "fact_cell_picking_order_missing_or_conflicting"
+
+
+def test_route_ignores_zero_stock_location_and_requires_routable_access(monkeypatch):
+    monkeypatch.setattr(adapter, "load_effective_rows", lambda *a, **k: _view([_outbound()]))
+    zero = {**_placement(), "source_row": 3, "source_cell": "B-1",
+            "resolved_geometry_cell_key": "2|1|1", "source_stock_quantity": 0}
+    monkeypatch.setattr(adapter, "load_effective_placement", lambda *a, **k: _view([_placement(order=17), zero]))
+    routed = adapter.load_routed_outbound_for_day(DAY, WAREHOUSE, _model(), warehouse_binding=WAREHOUSE,
+        registry=_registry("outbound", "historical_placement"))
+    assert routed["authoritative"] and routed["rows"][0]["factual_geometry_cell"] == "1|1|1"
+    monkeypatch.setattr(adapter, "build_physical_warehouse_graph", lambda *a, **k:
+        ({"cell_access_links": [{"cell_key": "other"}]}, {}))
+    blocked = adapter.load_routed_outbound_for_day(DAY, WAREHOUSE, _model(), warehouse_binding=WAREHOUSE,
+        registry=_registry("outbound", "historical_placement"))
+    assert not blocked["authoritative"] and blocked["blockers"][0]["code"] == "fact_cell_not_routable"
 
 
 def test_fractional_historical_order_and_invalid_start_quantity_block(monkeypatch):
@@ -342,7 +364,7 @@ def test_blank_receipt_warehouse_is_visible_source_blocker(monkeypatch):
     result = adapter.load_receipts_for_day(DAY, WAREHOUSE, registry=_registry("receipts"))
     blocker = next(item for item in result["blockers"] if item["code"] == "factual_receipt_warehouse_missing")
     assert not result["authoritative"] and blocker["source_rows"] == [3]
-    assert len(result["state"]["accepted_rows"]) == 1
+    assert result["state"]["accepted_rows"] == []
 
 
 def test_completed_receipt_requires_positive_reported_pallets(monkeypatch):
@@ -356,6 +378,18 @@ def test_completed_receipt_requires_positive_reported_pallets(monkeypatch):
     assert not missing["authoritative"] and missing["state"]["accepted_rows"] == []
     assert missing["classification_inputs"][0]["qty_pallets"] is None
     assert missing["classification_inputs"][0]["placement_eligible"] is False
+
+
+def test_completed_blank_sku_receipt_blocks_whole_day_and_partial_application(monkeypatch):
+    base = {"dataset_id": "r", "document_ref": "A", "occurred_at": DAY, "warehouse": WAREHOUSE,
+            "box_quantity": 1, "reported_pallets": 1, "terminal_completed": True}
+    rows = [{**base, "source_row": 2, "sku_key": SKU}, {**base, "document_ref": "B", "source_row": 3, "sku_key": ""}]
+    monkeypatch.setattr(adapter, "load_effective_rows", lambda *a, **k: _view(rows))
+    result = adapter.load_receipts_for_day(DAY, WAREHOUSE, registry=_registry("receipts"))
+    assert not result["authoritative"]
+    blocker = next(item for item in result["blockers"] if item["code"] == "factual_receipt_sku_identity_missing")
+    assert blocker["evidence"] == [{"dataset_id": "r", "source_row": 3}]
+    assert result["state"]["accepted_rows"] == []
 
 
 def test_receipt_weight_classification_scopes_vgh_conflicts_to_receipt_sku(monkeypatch):

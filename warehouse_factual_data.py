@@ -15,6 +15,7 @@ import os
 import sqlite3
 import tempfile
 import shutil
+import threading
 import time
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping
@@ -33,7 +34,9 @@ from warehouse_factual_artifacts import (
     write_jsonl as _artifact_write_jsonl,
 )
 
-from warehouse_business_identity import build_canonical_sku_identity, find_canonical_identity_collisions
+from warehouse_business_identity import (
+    build_canonical_sku_identity, find_canonical_identity_collisions, normalize_warehouse,
+)
 
 PARSER_VERSION = "factual-july-v5"
 # Level 6 retained ~97% of level-9 compression in the 10k-row benchmark while
@@ -549,7 +552,8 @@ def ensure_compact_scope_indexes(registry: dict[str, Any], *, source_types: Iter
     normal UI reruns read registry metadata only.
     """
     changed = False; requested = set(source_types or {"outbound", "receipts", "inventory"})
-    for dataset in registry.get("datasets", []):
+    effective = active_datasets(registry)
+    for dataset in effective:
         if dataset.get("source_type") not in requested: continue
         index = dataset.setdefault("index", {})
         if "warehouses" in index and "warehouses_by_date" in index: continue
@@ -564,7 +568,7 @@ def ensure_compact_scope_indexes(registry: dict[str, Any], *, source_types: Iter
         index["warehouses"] = sorted(all_warehouses); index["warehouses_by_date"] = by_date; changed = True
     # The same source-specific UI spinner also owns the one-time derived
     # business-evidence upgrade. It never rewrites canonical source rows.
-    for dataset in registry.get("datasets", []):
+    for dataset in effective:
         source_type = str(dataset.get("source_type") or "")
         if source_type in requested and source_type in BUSINESS_KEYS:
             _ensure_business_evidence_index(dataset, source_type)
@@ -715,8 +719,18 @@ def _evidence_semantics_signature(dataset: Mapping[str, Any], source_type: str) 
         "dataset_id": dataset.get("dataset_id"), "content_hash": dataset.get("content_hash")})
 
 
+_EVIDENCE_INDEX_LOCKS: defaultdict[str, threading.Lock] = defaultdict(threading.Lock)
+
+
 def _ensure_business_evidence_index(dataset: Mapping[str, Any], source_type: str,
                                     progress_callback: ImportProgressCallback | None = None) -> Path:
+    artifact = Path(str(dataset["artifact"]))
+    with _EVIDENCE_INDEX_LOCKS[str(artifact.resolve())]:
+        return _ensure_business_evidence_index_locked(dataset, source_type, progress_callback)
+
+
+def _ensure_business_evidence_index_locked(dataset: Mapping[str, Any], source_type: str,
+                                           progress_callback: ImportProgressCallback | None = None) -> Path:
     """Persist a derived evidence upgrade once; canonical source data stays immutable."""
     artifact = Path(str(dataset["artifact"])); target = artifact / "business_index"
     metadata_path = artifact / "business_index.meta.json"
@@ -731,10 +745,9 @@ def _ensure_business_evidence_index(dataset: Mapping[str, Any], source_type: str
     if not canonical.exists():
         legacy = artifact / "business_index.jsonl.gz"
         return legacy if legacy.exists() else target
-    temporary = artifact / f".business-index-{os.getpid()}"
+    temporary = Path(tempfile.mkdtemp(prefix=".business-index-", dir=artifact))
     processed = 0
     try:
-        temporary.mkdir(parents=True, exist_ok=False)
         for day in dataset.get("partitions", dataset.get("index", {}).get("dates", [])):
             partition_target = temporary / f"date={day}.jsonl.gz"
             with gzip.open(partition_target, "wt", encoding="utf-8", compresslevel=FACTUAL_GZIP_COMPRESSLEVEL) as stream:
@@ -746,7 +759,8 @@ def _ensure_business_evidence_index(dataset: Mapping[str, Any], source_type: str
                     if progress_callback and processed % IMPORT_PROGRESS_ROW_INTERVAL == 0:
                         progress_callback({"stage": "business_evidence_index_upgrade", "source_type": source_type,
                                            "dataset_id": dataset.get("dataset_id"), "processed_rows": processed})
-        old = artifact / f".business-index-old-{os.getpid()}"
+        old = Path(tempfile.mkdtemp(prefix=".business-index-old-", dir=artifact))
+        old.rmdir()
         if target.exists(): os.replace(target, old)
         os.replace(temporary, target)
         shutil.rmtree(old, ignore_errors=True)
@@ -769,7 +783,7 @@ def _business_evidence_partitions(index: Path, day: str | None = None) -> list[P
 
 
 def _scope_warehouse(value: Any) -> str:
-    return " ".join(str(value or "").split()).casefold()
+    return normalize_warehouse(value)
 
 
 def _stream_xlsx_dataset(data: bytes, filename: str, *, sheet: str | None, root: Path,

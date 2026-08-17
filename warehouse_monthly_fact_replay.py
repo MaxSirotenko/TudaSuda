@@ -101,8 +101,8 @@ def _opening_and_authority(rows: list[dict[str, Any]], access: set[str]) -> tupl
     lots = []
     for ordinal, row in enumerate(rows):
         sku, cell = str(row.get("sku_key") or ""), row.get("resolved_geometry_cell_key")
-        if sku: by_sku[sku].append(row)
         qty = _number(row.get("source_stock_quantity"))
+        if sku and qty > 0: by_sku[sku].append(row)
         if sku and cell and qty and str(cell) in access:
             lots.append({"stock_lot_id": f"fact:{ordinal}:{row.get('dataset_id')}:{row.get('source_row')}",
                          "sku_key": sku, "cell_key": str(cell), "qty_boxes": qty,

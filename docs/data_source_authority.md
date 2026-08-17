@@ -26,4 +26,8 @@ This table is the production contract. Effective views in `warehouse_factual_dat
 * Operational-day evidence is persisted in day partitions; one-day and velocity queries never scan or materialize a month-wide evidence artifact.
 * A completed receipt is placement-eligible only with a positive factual `reported_pallets`. Missing pallet quantity is a blocker; no unproven boxes-to-pallets conversion is applied.
 * Operational factual outbound executes fail-closed: any source blocker empties executable demand while preserving diagnostics.
+* Warehouse scope uses the shared canonical business-text normalizer; no adapter-specific or fuzzy warehouse matching is permitted.
+* Evidence-index publication is serialized per artifact and uses unique staging/swap directories, so concurrent first access cannot expose a partial index.
+* Route-location authority considers only positive opening stock and must belong to the shared physical graph's routable cell-access set.
+* Completed receipts require canonical SKU identity; any completed invalid row blocks application of the entire factual receipt input.
 * Mutable placement, execution logs, model/geometry, gates, rules, render settings and comparison artifacts are derived state/configuration/results, not competing factual sources.

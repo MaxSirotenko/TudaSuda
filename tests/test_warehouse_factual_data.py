@@ -483,3 +483,46 @@ def test_day_scoped_effective_view_reads_only_selected_evidence_partition(tmp_pa
     evidence_reads = [name for name in reads if name.startswith("date=")]
     assert evidence_reads.count("date=2026-07-15.jsonl.gz") == 2  # evidence + canonical
     assert "date=2026-07-14.jsonl.gz" not in evidence_reads and "date=2026-07-16.jsonl.gz" not in evidence_reads
+
+
+def test_warehouse_scope_uses_shared_yo_normalization(tmp_path):
+    from warehouse_factual_data import load_effective_rows
+    base = {"document_ref": "X", "line_number": 1, "occurred_at": "2026-07-15",
+            "warehouse": "Склад Ёлка", "sku_key": "sku", "quantity": 1}
+    registry = _effective_registry(tmp_path, "outbound", [[base], [{**base, "quantity": 2}]])
+    result = load_effective_rows("outbound", "2026-07-15", registry=registry, root=tmp_path,
+                                 warehouse="склад елка", strict=False)
+    assert not result["authoritative"] and result["conflicts"]
+
+
+def test_concurrent_evidence_index_first_access_is_serialized(tmp_path, monkeypatch):
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+    import warehouse_factual_data as factual
+    row = {"document_ref": "X", "line_number": 1, "occurred_at": "2026-07-15",
+           "warehouse": "A", "sku_key": "sku", "quantity": 1}
+    registry = _effective_registry(tmp_path, "outbound", [[row]])
+    dataset = registry["datasets"][0]; calls = []
+    original = factual._iter_jsonl
+    def slow(path):
+        if "/canonical/" in str(path): calls.append(str(path)); time.sleep(.02)
+        yield from original(path)
+    monkeypatch.setattr(factual, "_iter_jsonl", slow)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        paths = list(pool.map(lambda _: factual._ensure_business_evidence_index(dataset, "outbound"), range(2)))
+    assert paths[0] == paths[1] and paths[0].is_dir() and len(calls) == 1
+
+
+def test_compact_upgrade_skips_inactive_and_incompatible_datasets(tmp_path, monkeypatch):
+    import warehouse_factual_data as factual
+    healthy = {"dataset_id": "active", "source_type": "outbound", "active": True,
+        "parser_version": factual.PARSER_VERSION, "artifact": str(tmp_path / "active"),
+        "partitions": [], "index": {"dates": [], "warehouses": [], "warehouses_by_date": {}}}
+    inactive = {"dataset_id": "inactive", "source_type": "outbound", "active": False,
+        "artifact": str(tmp_path / "missing-inactive"), "partitions": ["2026-07-15"], "index": {"dates": ["2026-07-15"]}}
+    incompatible = {**inactive, "dataset_id": "incompatible", "active": True,
+                    "parser_version": "obsolete", "artifact": str(tmp_path / "missing-incompatible")}
+    touched = []
+    monkeypatch.setattr(factual, "_ensure_business_evidence_index", lambda dataset, source: touched.append(dataset["dataset_id"]) or Path(dataset["artifact"]))
+    factual.ensure_compact_scope_indexes({"datasets": [healthy, inactive, incompatible]}, source_types=("outbound",), root=tmp_path)
+    assert touched == ["active"]
