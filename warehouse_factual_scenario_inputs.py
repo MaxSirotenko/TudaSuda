@@ -108,6 +108,10 @@ def load_outbound_for_day(operational_date: Any, warehouse: Any, *, registry: Ma
                                           "dataset_id": factual.get("dataset_id"), "source_row": factual.get("source_row")})
                 continue
             if row_warehouse != target: continue
+            if not str(factual.get("sku_key") or "").strip():
+                quantity_blockers.append({"code": "factual_outbound_sku_identity_missing",
+                    "dataset_id": factual.get("dataset_id"), "source_row": factual.get("source_row")})
+                continue
             quantity = factual.get("quantity"); reason = None
             if quantity is None: reason = "factual_outbound_quantity_missing"
             elif isinstance(quantity, bool) or not isinstance(quantity, (int, float)): reason = "factual_outbound_quantity_invalid"
@@ -266,6 +270,8 @@ def _scoped(source_type: str, operational_date: Any = None, warehouse: Any = Non
 def _receipt_overlay(row: Mapping[str, Any], index: int) -> dict[str, Any]:
     terminal = normalize_receipt_boolean(row.get("terminal_completed"))
     expected = normalize_receipt_boolean(row.get("expected_receipt"))
+    pallets = row.get("reported_pallets")
+    usable_pallets = (isinstance(pallets, (int, float)) and not isinstance(pallets, bool) and pallets > 0)
     return {"receipt_id": f"factual:{row.get('dataset_id')}:{row.get('source_row', index)}",
         "receipt_line_id": f"factual:{row.get('dataset_id')}:{row.get('source_row', index)}",
         "source_row_number": row.get("source_row", index), "sku_key": row.get("sku_key"),
@@ -274,12 +280,12 @@ def _receipt_overlay(row: Mapping[str, Any], index: int) -> dict[str, Any]:
         "sku_name": row.get("nomenclature"), "nomenclature": row.get("nomenclature"),
         "characteristic_name": row.get("characteristic"), "characteristic": row.get("characteristic"),
         "qty_units": row.get("box_quantity") or 0, "qty_boxes": row.get("box_quantity") or 0,
-        "qty_pallets": row.get("reported_pallets") or 0, "placement_status": "not_placed",
+        "qty_pallets": pallets if usable_pallets else None, "placement_status": "not_placed",
         "placement_mode": "not_calculated", "source_zone": "", "calculated_zone": "unassigned",
         "source_weight": None, "source_weight_raw": "", "weight_parse_status": "not_supplied",
         "weight_parse_reason": "Вес берётся из factual VGH", "fragile_flag": False,
         "terminal_receipt_completed": terminal, "expected_receipt": expected,
-        "placement_eligible": terminal is True,
+        "placement_eligible": terminal is True and usable_pallets,
         "zone_calculation_status": "not_calculated", "factual_row": dict(row)}
 
 
@@ -301,9 +307,16 @@ def load_receipts_for_day(operational_date: Any, warehouse: Any, **kwargs: Any) 
     invalid = [row for row in result["rows"] if completed[id(row)] is True and
         (isinstance(row.get("box_quantity"), bool) or not isinstance(row.get("box_quantity"), (int, float))
          or row.get("box_quantity") <= 0 or not float(row.get("box_quantity")).is_integer())]
+    invalid_pallets = [row for row in result["rows"] if completed[id(row)] is True and
+        (isinstance(row.get("reported_pallets"), bool)
+         or not isinstance(row.get("reported_pallets"), (int, float)) or row.get("reported_pallets") <= 0)]
     if invalid:
         result["blockers"] = [*result["blockers"], {"code": "factual_receipt_box_quantity_invalid",
             "rows": len(invalid), "source_rows": [row.get("source_row") for row in invalid[:20]]}]
+        result["authoritative"] = False
+    if invalid_pallets:
+        result["blockers"] = [*result["blockers"], {"code": "factual_receipt_pallet_quantity_missing_or_invalid",
+            "rows": len(invalid_pallets), "source_rows": [row.get("source_row") for row in invalid_pallets[:20]]}]
         result["authoritative"] = False
     accepted = [{"receipt_line_key": f"factual:{row.get('dataset_id')}:{row.get('source_row', index)}",
         "document_key": f"ref:{row.get('document_ref') or row.get('document_number') or ''}",
@@ -314,7 +327,8 @@ def load_receipts_for_day(operational_date: Any, warehouse: Any, **kwargs: Any) 
         "terminal_receipt_completed": completed[id(row)],
         "expected_receipt": normalize_receipt_boolean(row.get("expected_receipt")),
         "source_index": row.get("source_row", index), "factual_row": row} for index, row in enumerate(result["rows"])
-        if completed[id(row)] is True and row not in invalid and row not in identityless and row not in unscoped]
+        if completed[id(row)] is True and row not in invalid and row not in invalid_pallets
+        and row not in identityless and row not in unscoped]
     pending = [{"receipt_line_key": f"factual:{row.get('dataset_id')}:{row.get('source_row', index)}",
         "document_key": f"ref:{row.get('document_ref') or row.get('document_number') or ''}",
         "receipt_number": row.get("document_number"), "receipt_date": row.get("occurred_at"),
@@ -348,12 +362,17 @@ def build_factual_weight_classifications(operational_date: Any, warehouse: Any, 
     """Apply the existing PR #190 VGH workflow and persisted user bands."""
     reg = _registry(registry, root)
     receipts = load_receipts_for_day(operational_date, warehouse, registry=reg, root=root)
-    vgh = load_vgh_attributes(registry=reg, root=root)
-    blockers = [*receipts["blockers"], *vgh["blockers"]]
+    lifecycle = _lifecycle_blockers(reg)
+    view = load_effective_rows("vgh", registry=reg, root=root, strict=False)
+    relevant_skus = {str(row.get("sku_key") or "") for row in receipts["classification_inputs"]}
+    relevant_conflicts = [conflict for conflict in view.get("conflicts", [])
+        if str((conflict.get("business_key") or [""])[0]) in relevant_skus]
+    blockers = [*receipts["blockers"], *lifecycle, *relevant_conflicts]
     if blockers: return {"source": "factual", "rows": [], "diagnostics": {}, "blockers": blockers, "authoritative": False}
     configured = dict(rules) if rules is not None else load_weight_rules()
     rows, diagnostics = calculate_receipt_zones(receipts["classification_inputs"],
-                                                {"weight_bands": configured.get("bands", {})}, vgh["rows"])
+                                                {"weight_bands": configured.get("bands", {})}, view["rows"])
+    diagnostics["unrelated_vgh_conflicts"] = len(view.get("conflicts", [])) - len(relevant_conflicts)
     return {"source": "factual_receipts_vgh", "rows": rows, "diagnostics": diagnostics,
             "blockers": [], "authoritative": True}
 

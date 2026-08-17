@@ -312,7 +312,8 @@ def test_outbound_picking_workspace_uses_factual_demand_not_historical_route_con
 def test_receipt_conflict_in_other_warehouse_does_not_block_selected_scope(tmp_path):
     from tests.test_warehouse_factual_data import _effective_registry
     base = {"document_ref": "A", "document_number": "A", "line_number": 1, "occurred_at": DAY,
-            "warehouse": "A", "sku_key": SKU, "box_quantity": 1, "terminal_completed": True}
+            "warehouse": "A", "sku_key": SKU, "box_quantity": 1, "reported_pallets": 1,
+            "terminal_completed": True}
     other = {**base, "document_ref": "B", "document_number": "B", "warehouse": "B"}
     registry = _effective_registry(tmp_path, "receipts", [[base, other], [{**other, "box_quantity": 2}]])
     selected = adapter.load_receipts_for_day(DAY, "A", registry=registry, root=tmp_path)
@@ -334,10 +335,58 @@ def test_number_only_receipts_are_blocked_and_never_double_mutable_stock(monkeyp
 
 def test_blank_receipt_warehouse_is_visible_source_blocker(monkeypatch):
     valid = {"dataset_id": "r", "source_row": 2, "document_ref": "A", "occurred_at": DAY,
-             "warehouse": WAREHOUSE, "sku_key": SKU, "box_quantity": 1, "terminal_completed": True}
+             "warehouse": WAREHOUSE, "sku_key": SKU, "box_quantity": 1, "reported_pallets": 1,
+             "terminal_completed": True}
     blank = {**valid, "source_row": 3, "document_ref": "B", "warehouse": ""}
     monkeypatch.setattr(adapter, "load_effective_rows", lambda *a, **k: _view([valid, blank]))
     result = adapter.load_receipts_for_day(DAY, WAREHOUSE, registry=_registry("receipts"))
     blocker = next(item for item in result["blockers"] if item["code"] == "factual_receipt_warehouse_missing")
     assert not result["authoritative"] and blocker["source_rows"] == [3]
     assert len(result["state"]["accepted_rows"]) == 1
+
+
+def test_completed_receipt_requires_positive_reported_pallets(monkeypatch):
+    base = {"dataset_id": "r", "source_row": 2, "document_ref": "A", "occurred_at": DAY,
+            "warehouse": WAREHOUSE, "sku_key": SKU, "box_quantity": 4, "terminal_completed": True}
+    monkeypatch.setattr(adapter, "load_effective_rows", lambda *a, **k: _view([{**base, "reported_pallets": 2}]))
+    valid = adapter.load_receipts_for_day(DAY, WAREHOUSE, registry=_registry("receipts"))
+    assert valid["authoritative"] and valid["classification_inputs"][0]["qty_pallets"] == 2
+    monkeypatch.setattr(adapter, "load_effective_rows", lambda *a, **k: _view([{**base, "reported_pallets": None}]))
+    missing = adapter.load_receipts_for_day(DAY, WAREHOUSE, registry=_registry("receipts"))
+    assert not missing["authoritative"] and missing["state"]["accepted_rows"] == []
+    assert missing["classification_inputs"][0]["qty_pallets"] is None
+    assert missing["classification_inputs"][0]["placement_eligible"] is False
+
+
+def test_receipt_weight_classification_scopes_vgh_conflicts_to_receipt_sku(monkeypatch):
+    receipt = {"dataset_id": "r", "source_row": 2, "document_ref": "R", "occurred_at": DAY,
+        "warehouse": WAREHOUSE, "sku_key": SKU, "nomenclature": "SKU", "box_quantity": 1,
+        "reported_pallets": 1, "terminal_completed": True}
+    unrelated = {"code": "conflicting_factual_business_key", "business_key": ["other"]}
+    relevant = {"code": "conflicting_factual_business_key", "business_key": [SKU]}
+    def unrelated_view(kind, *args, **kwargs):
+        return _view([receipt]) if kind == "receipts" else _view([{"sku_key": SKU, "weight": 2.5}], [unrelated])
+    monkeypatch.setattr(adapter, "load_effective_rows", unrelated_view)
+    clean = adapter.build_factual_weight_classifications(DAY, WAREHOUSE, registry=_registry("receipts"), rules={"bands": _bands()})
+    assert clean["authoritative"] and clean["rows"]
+    def relevant_view(kind, *args, **kwargs):
+        return _view([receipt]) if kind == "receipts" else _view([], [relevant])
+    monkeypatch.setattr(adapter, "load_effective_rows", relevant_view)
+    blocked = adapter.build_factual_weight_classifications(DAY, WAREHOUSE, registry=_registry("receipts"), rules={"bands": _bands()})
+    assert not blocked["authoritative"] and blocked["blockers"] == [relevant]
+
+
+def test_outbound_blank_sku_is_explicit_source_blocker(monkeypatch):
+    monkeypatch.setattr(adapter, "load_effective_rows", lambda *a, **k: _view([{**_outbound(), "sku_key": "", "source_row": 9}]))
+    result = adapter.load_outbound_for_day(DAY, WAREHOUSE, registry=_registry("outbound"))
+    assert not result["authoritative"] and result["rows"] == []
+    assert result["blockers"][0] == {"code": "factual_outbound_sku_identity_missing",
+                                     "dataset_id": "o", "source_row": 9}
+
+
+def test_outbound_picking_factual_path_is_fail_closed_in_source():
+    source = Path("virtual_warehouse_app.py").read_text(encoding="utf-8")
+    body = source[source.index("def render_outbound_picking"):source.index("def render_operation_history")]
+    assert 'rows = factual["rows"] if factual_ready else []' in body
+    assert 'disabled=True, key="outbound_execute_selected"' in body
+    assert 'disabled=True, key="outbound_execute_all"' in body

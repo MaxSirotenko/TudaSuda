@@ -461,3 +461,25 @@ def test_business_evidence_index_upgrade_is_persisted_and_versioned(tmp_path, mo
     monkeypatch.setattr(factual, "EVIDENCE_SEMANTICS_VERSION", factual.EVIDENCE_SEMANTICS_VERSION + 1)
     factual.load_effective_rows("outbound", "2026-07-15", registry=registry, root=tmp_path, strict=False)
     assert len(calls) == 2
+
+
+def test_day_scoped_effective_view_reads_only_selected_evidence_partition(tmp_path, monkeypatch):
+    import warehouse_factual_data as factual
+    days = ["2026-07-14", "2026-07-15", "2026-07-16"]
+    rows = [{"document_ref": day, "line_number": 1, "occurred_at": day, "warehouse": "A",
+             "sku_key": day, "quantity": 1} for day in days]
+    registry = _effective_registry(tmp_path, "outbound", [[rows[1]]])
+    dataset = registry["datasets"][0]; artifact = Path(dataset["artifact"])
+    canonical = artifact / "canonical"
+    for day, row in zip(days, rows):
+        target = canonical / f"date={day}.jsonl.gz"
+        with gzip.open(target, "wt", encoding="utf-8") as stream:
+            stream.write(json.dumps({"dataset_id": "d0", **row}) + "\n")
+    dataset["partitions"] = days; dataset["index"]["dates"] = days
+    factual._ensure_business_evidence_index(dataset, "outbound")
+    reads = []; original = factual._read_jsonl
+    monkeypatch.setattr(factual, "_read_jsonl", lambda path: reads.append(Path(path).name) or original(path))
+    factual.load_effective_rows("outbound", "2026-07-15", registry=registry, root=tmp_path, strict=False)
+    evidence_reads = [name for name in reads if name.startswith("date=")]
+    assert evidence_reads.count("date=2026-07-15.jsonl.gz") == 2  # evidence + canonical
+    assert "date=2026-07-14.jsonl.gz" not in evidence_reads and "date=2026-07-16.jsonl.gz" not in evidence_reads

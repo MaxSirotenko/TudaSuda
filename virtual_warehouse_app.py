@@ -1397,6 +1397,7 @@ def render_outbound_picking(model: dict) -> None:
         registry = ensure_compact_scope_indexes(load_registry(), source_types=("outbound",))
     source_mode = st.radio("Источник расходных ордеров", ["Factual Data Layer", "Ручной fallback"],
                            horizontal=True, key="outbound_picking_source")
+    factual_ready = True
     if source_mode == "Ручной fallback":
         orders_state = load_outbound_orders_cached(model)
         rows = orders_state.get("rows", [])
@@ -1409,9 +1410,10 @@ def render_outbound_picking(model: dict) -> None:
         selected_day = st.selectbox("Операционный день РО", dates, key="outbound_picking_day") if dates else None
         factual = (load_outbound_for_day(selected_day, selected_warehouse, registry=registry)
                    if selected_day and selected_warehouse else {"rows": [], "blockers": []})
-        rows = factual["rows"]
+        factual_ready = bool(factual.get("authoritative")) and not factual.get("blockers")
+        rows = factual["rows"] if factual_ready else []
         st.success("Источник demand: ✅ factual outbound · исполнение: текущее mutable placement")
-        if factual["blockers"]: st.error(f"Диагностика factual source: {factual['blockers']}")
+        if factual.get("blockers"): st.error(f"Диагностика factual source: {factual['blockers']}")
     else:
         st.warning("Источник данных: ⚠ ручной/legacy fallback выбран явно.")
     st.caption("Сборка выполняется последовательно в целых qty_units. Вес, масса и весовые коэффициенты не используются.")
@@ -1468,6 +1470,10 @@ def render_outbound_picking(model: dict) -> None:
     order_summary = summarize_outbound_orders(rows, execution_state)
     if not order_summary:
         st.info("Расходные ордера пока не загружены.")
+        if source_mode == "Factual Data Layer" and not factual_ready:
+            blocked_columns = st.columns(2)
+            blocked_columns[0].button("Собрать выбранные РО", disabled=True, key="outbound_execute_selected")
+            blocked_columns[1].button("Собрать все необработанные РО", disabled=True, key="outbound_execute_all")
         return
     st.markdown("**Расходные ордера**")
     st.dataframe(pd.DataFrame(order_summary), use_container_width=True, hide_index=True)

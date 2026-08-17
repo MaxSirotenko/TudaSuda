@@ -23,4 +23,7 @@ This table is the production contract. Effective views in `warehouse_factual_dat
 * Outbound, receipts and inventory conflicts are evaluated in the selected warehouse scope. Evidence with a missing warehouse remains a blocker because it cannot be assigned safely; a conflict spanning two warehouses relates to both scopes.
 * Factual receipts require `document_ref`; unlike outbound, they have no confirmed number/date identity fallback. Identityless completed rows never enter mutable placement.
 * Business-evidence indexes are derived, versioned by dataset identity/content and evidence semantics, and rebuilt from immutable canonical partitions only once when their signature changes.
+* Operational-day evidence is persisted in day partitions; one-day and velocity queries never scan or materialize a month-wide evidence artifact.
+* A completed receipt is placement-eligible only with a positive factual `reported_pallets`. Missing pallet quantity is a blocker; no unproven boxes-to-pallets conversion is applied.
+* Operational factual outbound executes fail-closed: any source blocker empties executable demand while preserving diagnostics.
 * Mutable placement, execution logs, model/geometry, gates, rules, render settings and comparison artifacts are derived state/configuration/results, not competing factual sources.

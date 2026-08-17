@@ -718,7 +718,7 @@ def _evidence_semantics_signature(dataset: Mapping[str, Any], source_type: str) 
 def _ensure_business_evidence_index(dataset: Mapping[str, Any], source_type: str,
                                     progress_callback: ImportProgressCallback | None = None) -> Path:
     """Persist a derived evidence upgrade once; canonical source data stays immutable."""
-    artifact = Path(str(dataset["artifact"])); target = artifact / "business_index.jsonl.gz"
+    artifact = Path(str(dataset["artifact"])); target = artifact / "business_index"
     metadata_path = artifact / "business_index.meta.json"
     signature = _evidence_semantics_signature(dataset, source_type)
     try:
@@ -729,12 +729,15 @@ def _ensure_business_evidence_index(dataset: Mapping[str, Any], source_type: str
         return target
     canonical = artifact / "canonical"
     if not canonical.exists():
-        return target
-    temporary = artifact / f".business-index-{os.getpid()}.jsonl.gz"
+        legacy = artifact / "business_index.jsonl.gz"
+        return legacy if legacy.exists() else target
+    temporary = artifact / f".business-index-{os.getpid()}"
     processed = 0
     try:
-        with gzip.open(temporary, "wt", encoding="utf-8", compresslevel=FACTUAL_GZIP_COMPRESSLEVEL) as stream:
-            for day in dataset.get("partitions", dataset.get("index", {}).get("dates", [])):
+        temporary.mkdir(parents=True, exist_ok=False)
+        for day in dataset.get("partitions", dataset.get("index", {}).get("dates", [])):
+            partition_target = temporary / f"date={day}.jsonl.gz"
+            with gzip.open(partition_target, "wt", encoding="utf-8", compresslevel=FACTUAL_GZIP_COMPRESSLEVEL) as stream:
                 for row in _iter_jsonl(canonical / f"date={day}.jsonl.gz"):
                     evidence = _business_evidence(row, source_type)
                     if evidence is not None:
@@ -743,12 +746,26 @@ def _ensure_business_evidence_index(dataset: Mapping[str, Any], source_type: str
                     if progress_callback and processed % IMPORT_PROGRESS_ROW_INTERVAL == 0:
                         progress_callback({"stage": "business_evidence_index_upgrade", "source_type": source_type,
                                            "dataset_id": dataset.get("dataset_id"), "processed_rows": processed})
+        old = artifact / f".business-index-old-{os.getpid()}"
+        if target.exists(): os.replace(target, old)
         os.replace(temporary, target)
+        shutil.rmtree(old, ignore_errors=True)
         _atomic_json(metadata_path, {"signature": signature, "evidence_semantics_version": EVIDENCE_SEMANTICS_VERSION,
             "dataset_id": dataset.get("dataset_id"), "content_hash": dataset.get("content_hash"), "rows_scanned": processed})
     finally:
-        temporary.unlink(missing_ok=True)
+        shutil.rmtree(temporary, ignore_errors=True)
     return target
+
+
+def _business_evidence_partitions(index: Path, day: str | None = None) -> list[Path]:
+    if index.is_file():
+        return [index]
+    if not index.exists():
+        return []
+    if day is not None:
+        partition = index / f"date={day}.jsonl.gz"
+        return [partition] if partition.exists() else []
+    return sorted(index.glob("date=*.jsonl.gz"))
 
 
 def _scope_warehouse(value: Any) -> str:
@@ -1111,8 +1128,9 @@ def _source_conflicts(registry: Mapping[str, Any], source_type: str, day: str | 
     groups: dict[str, dict[str, list[dict[str, Any]]]] = defaultdict(lambda: defaultdict(list))
     for dataset in active_datasets(registry, source_type):
         path = _ensure_business_evidence_index(dataset, source_type)
-        if path.exists():
-            evidence_rows = _read_jsonl(path)
+        partitions = _business_evidence_partitions(path, day if source_type != "vgh" else None)
+        if partitions:
+            evidence_rows = [row for partition in partitions for row in _read_jsonl(partition)]
         else:
             evidence_rows = [e for row in load_dataset_rows(dataset, day) if (e := _business_evidence(row, source_type))]
         for evidence in evidence_rows:
@@ -1160,10 +1178,12 @@ def _readiness_source_conflicts(registry: Mapping[str, Any], source_type: str,
         for dataset in active_datasets(registry, source_type):
             artifact = Path(str(dataset["artifact"]))
             business_index = _ensure_business_evidence_index(dataset, source_type)
-            if business_index.exists():
+            partitions = _business_evidence_partitions(business_index)
+            if partitions:
                 with measure(f"factual.readiness_business_index_scan.{source_type}"):
-                    for evidence in _iter_jsonl(business_index):
-                        add(evidence)
+                    for partition in partitions:
+                        for evidence in _iter_jsonl(partition):
+                            add(evidence)
             else:
                 # Legacy artifacts are deliberately visited one partition at a time.
                 for day in dataset.get("partitions", dataset.get("index", {}).get("dates", [])):
