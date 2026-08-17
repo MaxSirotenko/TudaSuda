@@ -233,140 +233,109 @@ def _render_results(state: dict[str, Any], diagnostics: dict[str, Any], input_st
 
 
 def render_outbound_experiment(model: dict[str, Any]) -> None:
-    """Render the authoritative SimulationState CURRENT/PROPOSED benchmark."""
+    """Render CURRENT/PROPOSED with factual inputs as the default authority."""
+    from warehouse_factual_data import load_registry
+    from warehouse_factual_scenario_inputs import (
+        available_operational_dates as factual_dates, available_warehouses as factual_warehouses,
+        build_start_state, load_inventory_for_day, load_outbound_for_day, load_receipts_for_day,
+    )
+
     st.subheader("Авторитетный CURRENT vs PROPOSED")
     st.caption("V1: начальный остаток → расходные ордера; приход внутри дня не моделируется. END — только независимая валидация.")
-    st.markdown("**Минимум для первого расчёта**")
-    st.caption("START / остатки по ячейкам · РО · ворота · геометрия склада, уже загруженная в проект")
-    st.markdown("**Дополнительный контроль**")
-    st.caption("inventory-results · END snapshot · receipts")
-    start_state, start_diag, start_hash, start_sheet = _excel_upload(
-        "Фактическое размещение / остаток по ячейкам — НАЧАЛО дня", "experiment_start", get_actual_inventory_sheet_names,
-        read_actual_inventory_table, detect_actual_inventory_columns, build_actual_inventory_placement_state, model)
-    receipt_state, receipt_diag, receipt_hash, receipt_sheet = _excel_upload(
-        "Дневной приход — не используется в V1 benchmark", "experiment_receipts", get_day_receipts_sheet_names,
-        read_day_receipts_table, detect_day_receipts_columns, build_day_receipts_import)
-    operational_date = None
-    day_state: dict[str, Any] = {}
-    warehouses = start_warehouses(start_state)
-    selected_warehouse = None
-    if len(warehouses) == 1:
-        selected_warehouse = warehouses[0]
-        st.caption(f"Склад START выбран автоматически: {selected_warehouse}")
-    elif len(warehouses) > 1:
-        selected_warehouse = st.selectbox("Склад START", warehouses, index=None,
-                                          placeholder="Выберите один склад", key="experiment_start_warehouse")
-    elif start_state:
-        st.error("START не содержит нормализованного склада.")
-    st.info("Дневной приход не обязателен для V1 benchmark и не определяет операционный день.")
-    end_state, end_diag, end_hash, end_sheet = _excel_upload(
-        "END snapshot — необязательно, только валидация", "experiment_end", get_actual_inventory_sheet_names,
-        read_actual_inventory_table, detect_actual_inventory_columns, build_actual_inventory_placement_state, model)
-    for title, diag in (("START", start_diag), ("END", end_diag)):
-        if diag:
-            st.caption(f"{title}: исходных {diag.get('rows_total', 0)}, принято {diag.get('accepted_rows', 0)} строк / "
-                       f"{diag.get('accepted_boxes', 0)} коробов; SKU {diag.get('accepted_sku_count', 0)}; "
-                       f"ячеек {diag.get('accepted_cell_count', 0)}; unmatched {diag.get('unmatched_rows', 0)}; excluded {diag.get('excluded_rows', 0)}")
+    st.caption("Дневной приход — не используется в V1 benchmark; END snapshot — необязательно, только валидация.")
+    st.caption("Инвентаризация / независимый контроль количества — необязательно.")
+    registry = load_registry()
+    warehouses = factual_warehouses(registry=registry)
+    source = st.radio("Источник сценария", ["Factual Data Layer", "Ручной fallback"], horizontal=True,
+                      help="Ручной режим никогда не включается автоматически при ошибке factual-источника.")
+    start_state = end_state = inventory_state = receipt_state = None
+    opening_rows = None; day_state: dict[str, Any] = {}; loaded_classifications: list[dict[str, Any]] = []
+    start_hash = receipt_hash = inventory_hash = outbound_hash = ""
+    start_sheet = receipt_sheet = inventory_sheet = outbound_sheet = ""
+    selected_warehouse = operational_date = None; outbound_rows: list[dict[str, Any]] = []
+    source_blockers: list[Any] = []
 
-    inventory_state, _, inventory_hash, inventory_sheet = _excel_upload(
-        "Инвентаризация / независимый контроль количества — необязательно", "experiment_inventory", get_inventory_results_sheet_names,
-        read_inventory_results_table, detect_inventory_results_columns, build_inventory_results_import)
-    inventory_keys: list[str] = []
-    opening_rows: list[dict[str, Any]] | None = None
-    if inventory_state:
-        docs = [d for d in inventory_state.get("documents", []) if not selected_warehouse or d.get("warehouse") == selected_warehouse]
-        options = [d["document_key"] for d in docs]
-        inventory_keys = st.multiselect("Документ инвентаризации", options, default=options if len(options) == 1 else [],
-                                        key="experiment_inventory_documents")
-        if inventory_keys and selected_warehouse:
-            selection, selection_diag = select_inventory_rows_for_opening_stock(
-                inventory_state, selected_document_keys=inventory_keys, included_warehouses=[selected_warehouse])
-            opening_rows = selection.get("inventory_rows", [])
-            st.caption(f"Выбрано строк остатков: {selection_diag.get('selected_inventory_rows', 0)}")
+    if source == "Factual Data Layer":
+        st.success("Источник данных: ✅ Factual Data Layer")
+        if not warehouses:
+            st.error("Factual outbound не содержит доступного склада. Ручной fallback можно выбрать явно выше.")
+        else:
+            selected_warehouse = st.selectbox("Склад", warehouses, key="experiment_factual_warehouse")
+            dates = factual_dates(warehouse=selected_warehouse, registry=registry)
+            operational_date = st.selectbox("Операционный день", dates, index=None,
+                placeholder="Дни с historical placement и outbound", key="experiment_day") if dates else None
+            if not dates:
+                st.error("Нет дня, где одновременно доступны factual historical placement и outbound для выбранного склада.")
+        if operational_date and selected_warehouse:
+            start = build_start_state(operational_date, selected_warehouse, model, registry=registry)
+            outbound = load_outbound_for_day(operational_date, selected_warehouse, registry=registry)
+            receipts = load_receipts_for_day(operational_date, selected_warehouse, registry=registry)
+            inventory = load_inventory_for_day(operational_date, selected_warehouse, registry=registry)
+            source_blockers = [*start["blockers"], *outbound["blockers"]]
+            start_state = start["state"] if start["authoritative"] else None
+            outbound_rows = outbound["rows"] if outbound["authoritative"] else []
+            receipt_state = receipts.get("state") if receipts["authoritative"] else None
+            opening_rows = inventory["rows"] if inventory["authoritative"] and inventory["rows"] else None
+            inventory_state = inventory if opening_rows else None
+            if receipt_state:
+                day_state, _ = build_day_receipt_scenario_inputs(
+                    receipt_state, operational_date=operational_date, selected_warehouses=[selected_warehouse])
+            st.caption(f"START: historical placement · {operational_date} · {len(start.get('rows', []))} строк")
+            st.caption(f"РО: factual Data Layer · parser factual-july-v5 · {len(outbound_rows)} строк")
+            st.caption(f"Приходы: factual Data Layer · {len(receipts['rows'])} строк; Inventory: {'factual' if opening_rows else 'не используется'}")
+            with st.expander("Технические сведения об источниках"):
+                st.json({"start": {"blockers": start["blockers"], "duplicates": start["duplicates"]},
+                         "outbound": {"blockers": outbound["blockers"], "duplicates": outbound["duplicates"]},
+                         "receipts": {"blockers": receipts["blockers"]}, "inventory": {"blockers": inventory["blockers"]}})
+    else:
+        st.warning("Источник данных: ⚠ Ручной fallback. Он выбран пользователем явно.")
+        start_state, start_diag, start_hash, start_sheet = _excel_upload(
+            "START — отдельный Excel", "experiment_start", get_actual_inventory_sheet_names,
+            read_actual_inventory_table, detect_actual_inventory_columns, build_actual_inventory_placement_state, model)
+        warehouses = start_warehouses(start_state)
+        selected_warehouse = (warehouses[0] if len(warehouses) == 1 else
+            st.selectbox("Склад START", warehouses, index=None, key="experiment_start_warehouse") if warehouses else None)
+        loaded_orders = load_outbound_orders_cached(model)
+        legacy_rows = loaded_orders.get("rows", []) if isinstance(loaded_orders, dict) else []
+        outbound_source = st.radio("Ручной источник РО", ["Legacy outbound_orders.json", "Отдельный Excel"], horizontal=True)
+        outbound_rows = legacy_rows if outbound_source.startswith("Legacy") else []
+        if outbound_source == "Отдельный Excel":
+            uploaded = st.file_uploader("Расходные ордера", type=["xlsx", "xls"], key="experiment_outbound")
+            if uploaded:
+                data = uploaded.getvalue(); outbound_hash = _hash_bytes(data)
+                outbound_sheet = st.selectbox("Лист — расходные ордера", get_outbound_sheet_names(data))
+                table = read_outbound_table(data, outbound_sheet)
+                outbound_rows, diagnostics = normalize_outbound_table(table, detect_outbound_columns(table))
+                if diagnostics: st.json(diagnostics)
+        dates = available_operational_dates(outbound_rows, selected_warehouse)
+        operational_date = st.selectbox("Операционный день", dates, index=None, key="experiment_day") if dates else None
+        loaded = load_receipts_state_cached(model)
+        loaded_receipts = loaded[0] if isinstance(loaded, tuple) else loaded
+        loaded_classifications = loaded_receipts.get("receipts", []) if isinstance(loaded_receipts, Mapping) else []
+        end_state, _, _, _ = _excel_upload("END snapshot — необязательно", "experiment_end", get_actual_inventory_sheet_names,
+            read_actual_inventory_table, detect_actual_inventory_columns, build_actual_inventory_placement_state, model)
 
-    loaded_receipts_result = load_receipts_state_cached(model)
-    loaded_receipts = loaded_receipts_result[0] if isinstance(loaded_receipts_result, tuple) else loaded_receipts_result
-    loaded_receipts = loaded_receipts if isinstance(loaded_receipts, Mapping) else {}
-    loaded_classifications = loaded_receipts.get("receipts", [])
-    loaded_orders = load_outbound_orders_cached(model)
-    application_rows = loaded_orders.get("rows", []) if isinstance(loaded_orders, dict) else []
-    sources = ["Загруженные в приложении", "Отдельный файл"]
-    source = st.radio("Источник РО", sources, index=0 if application_rows else 1, horizontal=True)
-    outbound_hash, outbound_sheet = "application", ""
-    outbound_rows = application_rows
-    if source == "Отдельный файл":
-        uploaded = st.file_uploader("Расходные ордера", type=["xlsx", "xls"], key="experiment_outbound")
-        outbound_rows = []
-        if uploaded:
-            data = uploaded.getvalue(); outbound_hash = _hash_bytes(data)
-            outbound_sheet = st.selectbox("Лист — расходные ордера", get_outbound_sheet_names(data))
-            table = read_outbound_table(data, outbound_sheet)
-            outbound_rows, outbound_diag = normalize_outbound_table(table, detect_outbound_columns(table))
-            if outbound_diag: st.json(outbound_diag)
-
-    dates = available_operational_dates(outbound_rows, selected_warehouse)
-    operational_date = st.selectbox("Операционный день", dates, index=None,
-                                    placeholder="Выберите день из расходных РО", key="experiment_day") if dates else None
-    if receipt_state and operational_date and selected_warehouse:
-        day_state, day_diag = build_day_receipt_scenario_inputs(
-            receipt_state, operational_date=operational_date, selected_warehouses=[selected_warehouse])
-        if day_diag.get("configuration_errors"):
-            st.warning("Приход не соответствует выбранному дню; это не блокирует V1 benchmark.")
-
-    scope_errors = validate_outbound_scope(outbound_rows, selected_warehouse, operational_date)
+    scope_errors = ([str(item.get("code", item)) for item in source_blockers] if source_blockers else
+                    validate_outbound_scope(outbound_rows, selected_warehouse, operational_date))
     for error in scope_errors:
         issue = get_ui_message(error)
         st.error(f"{issue['title']}\n\n{issue['message']}\n\nЧто сделать: {issue['solution']}")
-        with st.expander("Технический код"):
-            st.code(issue["technical_code"])
-
-    classifications = {r.get("sku_key"): r.get("calculated_zone") for r in loaded_receipts.get("receipts", [])
-                       if r.get("calculated_zone") in CODE_TO_ZONE}
-    editor_rows = [{"SKU": b.get("sku_key"), "Номенклатура": b.get("nomenclature"),
-                    "Характеристика": b.get("characteristic"), "Коробов прихода": b.get("qty_units"),
-                    "Весовая зона": CODE_TO_ZONE.get(classifications.get(b.get("sku_key")), "Не задано"),
-                    "Приоритет": None} for b in day_state.get("receipt_sku_batches", [])]
-    edited = st.data_editor(pd.DataFrame(editor_rows), disabled=["SKU", "Номенклатура", "Характеристика", "Коробов прихода"],
-                            column_config={"Весовая зона": st.column_config.SelectboxColumn(options=[*ZONE_TO_CODE, "Не задано"])},
-                            use_container_width=True, key="experiment_slotting") if editor_rows else pd.DataFrame(editor_rows)
-    slotting_rows = []
-    for row in edited.to_dict("records"):
-        zone = ZONE_TO_CODE.get(row.get("Весовая зона"))
-        if zone:
-            original = classifications.get(row.get("SKU"))
-            priority = row.get("Приоритет")
-            slotting_rows.append({"sku_key": row.get("SKU"), "weight_zone": zone,
-                                  "priority_rank": None if pd.isna(priority) else int(priority),
-                                  "source": "loaded_receipt_classification" if original == zone else "experiment_ui_manual"})
+        with st.expander("Технический код"): st.code(issue["technical_code"])
 
     persistent_gate_state = st.session_state.get("workspace_gate_state") or {}
     if persistent_gate_state.get("model_id") != model.get("model_id"):
         persistent_gate_state = {"model_id": model.get("model_id"), "gates": model.get("gates", []) or []}
     gate_options = [gate for gate in persistent_gate_state.get("gates", []) or [] if gate.get("gate_key")]
-    selected_gate_key = None
-    if len(gate_options) > 1:
-        selected_gate_key = st.selectbox("Ворота начала/возврата", [gate["gate_key"] for gate in gate_options],
-                                         index=None, placeholder="Выберите настроенные ворота")
-    elif gate_options:
-        selected_gate_key = gate_options[0]["gate_key"]
-        st.caption(f"Ворота: {gate_options[0].get('gate_name') or selected_gate_key}")
-    gate_model = {**model, "gates": gate_options}
-    gate_state = configured_gate_state(gate_model, selected_gate_key)
-    if gate_state is None:
-        st.warning("Сначала настройте ворота в Склад → Ворота.")
-
+    selected_gate_key = (st.selectbox("Ворота начала/возврата", [g["gate_key"] for g in gate_options], index=None)
+                         if len(gate_options) > 1 else gate_options[0]["gate_key"] if gate_options else None)
+    gate_state = configured_gate_state({**model, "gates": gate_options}, selected_gate_key)
+    if gate_state is None: st.warning("Сначала настройте ворота в Склад → Ворота.")
     st.session_state["outbound_selected_warehouse"] = selected_warehouse
     st.session_state["outbound_selected_date"] = operational_date
     st.session_state["placement_comparison_gate_state"] = gate_state
     st.session_state["outbound_mandatory_data_checks_passed"] = not scope_errors and bool(start_state)
     st.session_state["placement_comparison_benchmark_prerequisites_ready"] = bool(gate_state and not scope_errors)
-
-    render_scenario_comparison(
-        model, operational_date=operational_date, selected_warehouse=selected_warehouse,
-        start_state=start_state, opening_rows=opening_rows,
-        classification_rows=loaded_classifications, outbound_rows=outbound_rows,
-        gate_state=gate_state,
-        end_snapshot=end_state,
-        inventory_control_supplied=inventory_state is not None,
-        rule_config=st.session_state.get("workspace_rule_config"),
-    )
+    render_scenario_comparison(model, operational_date=operational_date, selected_warehouse=selected_warehouse,
+        start_state=start_state, opening_rows=opening_rows, classification_rows=loaded_classifications,
+        outbound_rows=outbound_rows, gate_state=gate_state, end_snapshot=end_state,
+        inventory_control_supplied=inventory_state is not None, rule_config=st.session_state.get("workspace_rule_config"))
