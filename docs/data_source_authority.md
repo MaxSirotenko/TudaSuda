@@ -20,4 +20,7 @@ This table is the production contract. Effective views in `warehouse_factual_dat
 * Scenario weight zones use relevant START/outbound SKU + factual VGH + persisted user bands; they do not require a receipt on D.
 * Velocity history reads only `[D-28,D)` when the velocity rule is enabled and is cached by warehouse, day, and active outbound revision.
 * The outbound-picking workspace is an operational mutation workflow: factual outbound is demand authority, while pick locations/order come only from current mutable placement execution. Historical route authority is reserved for CURRENT/PROPOSED and monthly FACT.
+* Outbound, receipts and inventory conflicts are evaluated in the selected warehouse scope. Evidence with a missing warehouse remains a blocker because it cannot be assigned safely; a conflict spanning two warehouses relates to both scopes.
+* Factual receipts require `document_ref`; unlike outbound, they have no confirmed number/date identity fallback. Identityless completed rows never enter mutable placement.
+* Business-evidence indexes are derived, versioned by dataset identity/content and evidence semantics, and rebuilt from immutable canonical partitions only once when their signature changes.
 * Mutable placement, execution logs, model/geometry, gates, rules, render settings and comparison artifacts are derived state/configuration/results, not competing factual sources.

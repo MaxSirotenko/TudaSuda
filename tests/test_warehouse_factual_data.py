@@ -410,3 +410,54 @@ def test_outbound_number_date_fallback_identity_dedup_and_conflict(tmp_path):
     lines = load_effective_rows("outbound", "2026-07-15", registry=_effective_registry(
         tmp_path / "lines", "outbound", [[base], [{**base, "line_number": 2}]]), root=tmp_path / "lines", strict=False)
     assert lines["authoritative"] and len(lines["rows"]) == 2
+
+
+def test_warehouse_scoped_outbound_conflict_only_blocks_related_scope(tmp_path):
+    from warehouse_factual_data import load_effective_rows
+    clean = {"document_ref": "A", "line_number": 1, "occurred_at": "2026-07-15", "warehouse": "A",
+             "sku_key": "sku-a", "quantity": 1}
+    conflict = {"document_ref": "B", "line_number": 1, "occurred_at": "2026-07-15", "warehouse": "B",
+                "sku_key": "sku-b", "quantity": 1}
+    registry = _effective_registry(tmp_path, "outbound", [[clean, conflict], [{**conflict, "quantity": 2}]])
+    warehouse_a = load_effective_rows("outbound", "2026-07-15", registry=registry, root=tmp_path,
+                                      warehouse="A", strict=False)
+    warehouse_b = load_effective_rows("outbound", "2026-07-15", registry=registry, root=tmp_path,
+                                      warehouse="B", strict=False)
+    assert warehouse_a["authoritative"] and [row["sku_key"] for row in warehouse_a["rows"]] == ["sku-a"]
+    assert not warehouse_b["authoritative"] and warehouse_b["conflicts"]
+
+
+def test_cross_warehouse_business_key_conflict_blocks_both_scopes(tmp_path):
+    from warehouse_factual_data import load_effective_rows
+    base = {"document_ref": "X", "line_number": 1, "occurred_at": "2026-07-15",
+            "sku_key": "sku", "quantity": 1}
+    registry = _effective_registry(tmp_path, "outbound", [[{**base, "warehouse": "A"}], [{**base, "warehouse": "B"}]])
+    for warehouse in ("A", "B"):
+        result = load_effective_rows("outbound", "2026-07-15", registry=registry, root=tmp_path,
+                                     warehouse=warehouse, strict=False)
+        assert not result["authoritative"] and result["conflicts"]
+
+
+def test_business_evidence_index_upgrade_is_persisted_and_versioned(tmp_path, monkeypatch):
+    import warehouse_factual_data as factual
+    row = {"document_ref": "X", "line_number": 1, "occurred_at": "2026-07-15", "warehouse": "A",
+           "sku_key": "sku", "quantity": 1}
+    registry = _effective_registry(tmp_path, "outbound", [[row]])
+    dataset = registry["datasets"][0]
+    artifact = Path(dataset["artifact"])
+    calls = []
+    original = factual._iter_jsonl
+
+    def counted(path):
+        if "/canonical/" in str(path):
+            calls.append(str(path))
+        yield from original(path)
+
+    monkeypatch.setattr(factual, "_iter_jsonl", counted)
+    factual.load_effective_rows("outbound", "2026-07-15", registry=registry, root=tmp_path, strict=False)
+    assert len(calls) == 1 and (artifact / "business_index.meta.json").exists()
+    factual.load_effective_rows("outbound", "2026-07-15", registry=registry, root=tmp_path, strict=False)
+    assert len(calls) == 1
+    monkeypatch.setattr(factual, "EVIDENCE_SEMANTICS_VERSION", factual.EVIDENCE_SEMANTICS_VERSION + 1)
+    factual.load_effective_rows("outbound", "2026-07-15", registry=registry, root=tmp_path, strict=False)
+    assert len(calls) == 2

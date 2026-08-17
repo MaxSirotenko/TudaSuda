@@ -98,7 +98,8 @@ def load_outbound_for_day(operational_date: Any, warehouse: Any, *, registry: Ma
     if lifecycle:
         return {"source": "factual", "source_type": "outbound", "operational_date": day,
                 "warehouse": target, "rows": [], "authoritative": False, "blockers": lifecycle, "duplicates": []}
-    view = load_effective_rows("outbound", day, registry=reg, root=root, strict=False); rows = []; quantity_blockers = []; confirmed_zero = 0
+    view = load_effective_rows("outbound", day, registry=reg, root=root, strict=False,
+                               warehouse=target); rows = []; quantity_blockers = []; confirmed_zero = 0
     if not view["conflicts"]:
         for factual in view["rows"]:
             row_warehouse = normalize_warehouse(factual.get("warehouse"))
@@ -254,9 +255,11 @@ def _scoped(source_type: str, operational_date: Any = None, warehouse: Any = Non
     reg = _registry(registry, root); lifecycle = _lifecycle_blockers(reg)
     if lifecycle: return {"source": "factual", "source_type": source_type, "operational_date": day,
         "warehouse": target or None, "rows": [], "authoritative": False, "blockers": lifecycle, "duplicates": []}
-    view = load_effective_rows(source_type, day, registry=reg, root=root, strict=False)
+    view = load_effective_rows(source_type, day, registry=reg, root=root, strict=False,
+                               warehouse=target or None)
     rows = [] if view["conflicts"] else [dict(row) for row in view["rows"]
-        if not target or source_type == "vgh" or normalize_warehouse(row.get("warehouse")) == target]
+        if not target or source_type == "vgh" or not normalize_warehouse(row.get("warehouse"))
+        or normalize_warehouse(row.get("warehouse")) == target]
     return _result(source_type, day, target or None, view, rows)
 
 
@@ -282,6 +285,18 @@ def _receipt_overlay(row: Mapping[str, Any], index: int) -> dict[str, Any]:
 
 def load_receipts_for_day(operational_date: Any, warehouse: Any, **kwargs: Any) -> dict[str, Any]:
     result = _scoped("receipts", operational_date, warehouse, **kwargs)
+    identityless = [row for row in result["rows"] if not str(row.get("document_ref") or "").strip()]
+    unscoped = [row for row in result["rows"] if not normalize_warehouse(row.get("warehouse"))]
+    source_blockers = []
+    if identityless:
+        source_blockers.append({"code": "factual_receipt_document_identity_missing", "rows": len(identityless),
+            "source_rows": [row.get("source_row") for row in identityless[:20]]})
+    if unscoped:
+        source_blockers.append({"code": "factual_receipt_warehouse_missing", "rows": len(unscoped),
+            "source_rows": [row.get("source_row") for row in unscoped[:20]]})
+    if source_blockers:
+        result["blockers"] = [*result["blockers"], *source_blockers]
+        result["authoritative"] = False
     completed = {id(row): normalize_receipt_boolean(row.get("terminal_completed")) for row in result["rows"]}
     invalid = [row for row in result["rows"] if completed[id(row)] is True and
         (isinstance(row.get("box_quantity"), bool) or not isinstance(row.get("box_quantity"), (int, float))
@@ -299,7 +314,7 @@ def load_receipts_for_day(operational_date: Any, warehouse: Any, **kwargs: Any) 
         "terminal_receipt_completed": completed[id(row)],
         "expected_receipt": normalize_receipt_boolean(row.get("expected_receipt")),
         "source_index": row.get("source_row", index), "factual_row": row} for index, row in enumerate(result["rows"])
-        if completed[id(row)] is True and row not in invalid]
+        if completed[id(row)] is True and row not in invalid and row not in identityless and row not in unscoped]
     pending = [{"receipt_line_key": f"factual:{row.get('dataset_id')}:{row.get('source_row', index)}",
         "document_key": f"ref:{row.get('document_ref') or row.get('document_number') or ''}",
         "receipt_number": row.get("document_number"), "receipt_date": row.get("occurred_at"),

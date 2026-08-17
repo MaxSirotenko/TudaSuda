@@ -307,3 +307,37 @@ def test_outbound_picking_workspace_uses_factual_demand_not_historical_route_con
     assert "load_outbound_for_day" in body and "load_routed_outbound_for_day" not in body
     assert "historical_binding" not in body
     assert "текущее mutable placement" in body
+
+
+def test_receipt_conflict_in_other_warehouse_does_not_block_selected_scope(tmp_path):
+    from tests.test_warehouse_factual_data import _effective_registry
+    base = {"document_ref": "A", "document_number": "A", "line_number": 1, "occurred_at": DAY,
+            "warehouse": "A", "sku_key": SKU, "box_quantity": 1, "terminal_completed": True}
+    other = {**base, "document_ref": "B", "document_number": "B", "warehouse": "B"}
+    registry = _effective_registry(tmp_path, "receipts", [[base, other], [{**other, "box_quantity": 2}]])
+    selected = adapter.load_receipts_for_day(DAY, "A", registry=registry, root=tmp_path)
+    blocked = adapter.load_receipts_for_day(DAY, "B", registry=registry, root=tmp_path)
+    assert selected["authoritative"] and len(selected["state"]["accepted_rows"]) == 1
+    assert not blocked["authoritative"] and blocked["blockers"]
+
+
+def test_number_only_receipts_are_blocked_and_never_double_mutable_stock(monkeypatch):
+    rows = [{"dataset_id": "r", "source_row": index, "document_ref": "", "document_number": "N",
+             "line_number": 1, "occurred_at": DAY, "warehouse": WAREHOUSE, "sku_key": SKU,
+             "box_quantity": 2, "terminal_completed": True} for index in (2, 3)]
+    monkeypatch.setattr(adapter, "load_effective_rows", lambda *a, **k: _view(rows))
+    result = adapter.load_receipts_for_day(DAY, WAREHOUSE, registry=_registry("receipts"))
+    assert not result["authoritative"]
+    assert result["blockers"][0]["code"] == "factual_receipt_document_identity_missing"
+    assert result["state"]["accepted_rows"] == []
+
+
+def test_blank_receipt_warehouse_is_visible_source_blocker(monkeypatch):
+    valid = {"dataset_id": "r", "source_row": 2, "document_ref": "A", "occurred_at": DAY,
+             "warehouse": WAREHOUSE, "sku_key": SKU, "box_quantity": 1, "terminal_completed": True}
+    blank = {**valid, "source_row": 3, "document_ref": "B", "warehouse": ""}
+    monkeypatch.setattr(adapter, "load_effective_rows", lambda *a, **k: _view([valid, blank]))
+    result = adapter.load_receipts_for_day(DAY, WAREHOUSE, registry=_registry("receipts"))
+    blocker = next(item for item in result["blockers"] if item["code"] == "factual_receipt_warehouse_missing")
+    assert not result["authoritative"] and blocker["source_rows"] == [3]
+    assert len(result["state"]["accepted_rows"]) == 1
