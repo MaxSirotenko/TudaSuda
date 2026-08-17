@@ -100,7 +100,12 @@ def load_outbound_for_day(operational_date: Any, warehouse: Any, *, registry: Ma
     view = load_effective_rows("outbound", day, registry=reg, root=root, strict=False); rows = []; quantity_blockers = []; confirmed_zero = 0
     if not view["conflicts"]:
         for factual in view["rows"]:
-            if normalize_warehouse(factual.get("warehouse")) != target: continue
+            row_warehouse = normalize_warehouse(factual.get("warehouse"))
+            if not row_warehouse:
+                quantity_blockers.append({"code": "factual_outbound_warehouse_missing",
+                                          "dataset_id": factual.get("dataset_id"), "source_row": factual.get("source_row")})
+                continue
+            if row_warehouse != target: continue
             quantity = factual.get("quantity"); reason = None
             if quantity is None: reason = "factual_outbound_quantity_missing"
             elif isinstance(quantity, bool) or not isinstance(quantity, (int, float)): reason = "factual_outbound_quantity_invalid"
@@ -113,6 +118,9 @@ def load_outbound_for_day(operational_date: Any, warehouse: Any, *, registry: Ma
                                           "source_row": factual.get("source_row")})
             created = factual.get("occurred_at") or day
             number = factual.get("document_number") or factual.get("document_ref") or ""
+            if not number:
+                quantity_blockers.append({"code": "factual_outbound_document_identity_missing",
+                                          "dataset_id": factual.get("dataset_id"), "source_row": factual.get("source_row")})
             pick_order = factual.get("source_pick_order")
             pick_order_valid = (pick_order is None or
                 isinstance(pick_order, (int, float)) and not isinstance(pick_order, bool)
@@ -156,7 +164,7 @@ def load_routed_outbound_for_day(operational_date: Any, warehouse: Any, model: M
         authority = resolve_factual_route_order(candidates); code = authority["code"]
         if code:
             blockers.append({"code": code, "sku_key": row.get("sku_key")}); continue
-        routed.append({**row, "pick_order": authority["cell_picking_order"], "pick_order_validation_reason": "",
+        routed.append({**row, "pick_order": authority["cell_picking_order"],
                        "route_sequence_authoritative": True, "route_sequence_source": "historical_cell_picking_order",
                        "factual_source_cell": authority["factual_source_cells"][0],
                        "factual_geometry_cell": authority["factual_geometry_cells"][0]})
@@ -202,6 +210,12 @@ def build_start_state(operational_date: Any, warehouse: Any, model: Mapping[str,
                                               "binding": binding, "warehouse": target})
     unresolved = [row for row in view["rows"] if row.get("cell_resolution_status") != "resolved"]
     if unresolved: blockers.append({"code": "historical_cell_resolution_blocked", "rows": len(unresolved)})
+    invalid_quantities = [row for row in view["rows"] if isinstance(row.get("source_stock_quantity"), bool)
+        or not isinstance(row.get("source_stock_quantity"), (int, float))
+        or row.get("source_stock_quantity") < 0 or not float(row.get("source_stock_quantity")).is_integer()]
+    if invalid_quantities:
+        blockers.append({"code": "historical_stock_quantity_invalid", "rows": len(invalid_quantities),
+                         "source_rows": [row.get("source_row") for row in invalid_quantities[:20]]})
     cells = {str(cell.get("cell_key")): cell for cell in model.get("cells", []) if isinstance(cell, Mapping)}
     placements = []
     if not blockers:
@@ -260,6 +274,13 @@ def _receipt_overlay(row: Mapping[str, Any], index: int) -> dict[str, Any]:
 
 def load_receipts_for_day(operational_date: Any, warehouse: Any, **kwargs: Any) -> dict[str, Any]:
     result = _scoped("receipts", operational_date, warehouse, **kwargs)
+    invalid = [row for row in result["rows"] if row.get("terminal_completed") is True and
+        (isinstance(row.get("box_quantity"), bool) or not isinstance(row.get("box_quantity"), (int, float))
+         or row.get("box_quantity") <= 0 or not float(row.get("box_quantity")).is_integer())]
+    if invalid:
+        result["blockers"] = [*result["blockers"], {"code": "factual_receipt_box_quantity_invalid",
+            "rows": len(invalid), "source_rows": [row.get("source_row") for row in invalid[:20]]}]
+        result["authoritative"] = False
     accepted = [{"receipt_line_key": f"factual:{row.get('dataset_id')}:{row.get('source_row', index)}",
         "document_key": f"ref:{row.get('document_ref') or row.get('document_number') or ''}",
         "receipt_ref": row.get("document_ref"), "receipt_number": row.get("document_number"),
@@ -268,7 +289,7 @@ def load_receipts_for_day(operational_date: Any, warehouse: Any, **kwargs: Any) 
         "source_box_quantity": row.get("box_quantity"), "qty_units": row.get("box_quantity"), "unit_name": "короб",
         "terminal_receipt_completed": row.get("terminal_completed"), "expected_receipt": row.get("expected_receipt"),
         "source_index": row.get("source_row", index), "factual_row": row} for index, row in enumerate(result["rows"])
-        if row.get("terminal_completed") is True]
+        if row.get("terminal_completed") is True and row not in invalid]
     pending = [{"receipt_line_key": f"factual:{row.get('dataset_id')}:{row.get('source_row', index)}",
         "document_key": f"ref:{row.get('document_ref') or row.get('document_number') or ''}",
         "receipt_number": row.get("document_number"), "receipt_date": row.get("occurred_at"),
@@ -316,18 +337,24 @@ def build_scenario_weight_classifications(relevant_rows: list[Mapping[str, Any]]
                                           registry: Mapping[str, Any] | None = None, root: Path = DATA_ROOT,
                                           rules: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Classify opening/demand SKU from factual VGH, independently of receipts D."""
-    reg = _registry(registry, root); vgh = load_vgh_attributes(registry=reg, root=root)
-    if vgh["blockers"]: return {"source": "factual", "rows": [], "diagnostics": {},
-                                "blockers": vgh["blockers"], "authoritative": False}
+    reg = _registry(registry, root); lifecycle = _lifecycle_blockers(reg)
+    if lifecycle: return {"source": "factual", "rows": [], "diagnostics": {},
+                           "blockers": lifecycle, "authoritative": False}
     unique: dict[str, Mapping[str, Any]] = {}
     for row in relevant_rows:
         sku = str(row.get("sku_key") or "")
         if sku: unique.setdefault(sku, row)
+    view = load_effective_rows("vgh", registry=reg, root=root, strict=False)
+    relevant_conflicts = [conflict for conflict in view.get("conflicts", [])
+        if str((conflict.get("business_key") or [""])[0]) in unique]
+    if relevant_conflicts: return {"source": "factual", "rows": [], "diagnostics": {},
+                                   "blockers": relevant_conflicts, "authoritative": False}
     inputs = [_receipt_overlay({"sku_key": sku,
         "nomenclature": row.get("nomenclature") or row.get("sku_name") or row.get("item_name"),
         "characteristic": row.get("characteristic") or row.get("characteristic_name")}, index)
         for index, (sku, row) in enumerate(sorted(unique.items()))]
     configured = dict(rules) if rules is not None else load_weight_rules()
-    rows, diagnostics = calculate_receipt_zones(inputs, {"weight_bands": configured.get("bands", {})}, vgh["rows"])
+    rows, diagnostics = calculate_receipt_zones(inputs, {"weight_bands": configured.get("bands", {})}, view.get("rows", []))
+    diagnostics["unrelated_vgh_conflicts"] = len(view.get("conflicts", [])) - len(relevant_conflicts)
     return {"source": "factual_scenario_sku_vgh", "rows": rows, "diagnostics": diagnostics,
             "blockers": [], "authoritative": True}

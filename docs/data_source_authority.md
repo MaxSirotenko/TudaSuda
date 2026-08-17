@@ -18,4 +18,5 @@ This table is the production contract. Effective views in `warehouse_factual_dat
 * Manual/legacy sources are compatibility inputs, never an automatic empty/error fallback.
 * One-day route order is resolved from the opening historical snapshot's unique `cell_picking_order`; outbound pick order is optional and missing/conflicting historical evidence blocks full-day authority.
 * Scenario weight zones use relevant START/outbound SKU + factual VGH + persisted user bands; they do not require a receipt on D.
+* Velocity history reads only `[D-28,D)` when the velocity rule is enabled and is cached by warehouse, day, and active outbound revision.
 * Mutable placement, execution logs, model/geometry, gates, rules, render settings and comparison artifacts are derived state/configuration/results, not competing factual sources.

@@ -14,6 +14,8 @@ from warehouse_persistence import read_json
 
 from warehouse_placement_diagnostics import placement_reason_text
 from warehouse_business_identity import canonical_sku_key
+from warehouse_placement_zones import (get_assignable_placement_zones, get_placement_zone_label,
+    is_assignable_placement_zone, normalize_placement_zone)
 
 PLACEMENTS_PATH = Path("data/last_import/placements.json")
 
@@ -26,8 +28,9 @@ ROW_ALIASES = ["ряд", "row", "row_number"]
 CELL_ALIASES = ["ячейка", "cell_number", "номер ячейки"]
 TIER_ALIASES = ["ярус", "tier"]
 WEIGHT_CLASS_ALIASES = ["weight_class", "weight_zone", "зона", "весоваякатегория", "весовая категория", "категориявеса", "зонаразмещения", "зона размещения"]
-WEIGHT_CLASS_LABELS = {"heavy": "Тяжёлое", "medium": "Среднее", "light": "Лёгкое", "fragile": "Хрупкое", "unclassified": "Не классифицировано"}
-WEIGHT_ZONE_LABELS = {"heavy": "Тяжёлое", "medium": "Среднее", "light": "Лёгкое", "fragile": "Хрупкое", "unassigned": "Не назначено"}
+WEIGHT_CLASS_LABELS = {zone: get_placement_zone_label(zone) for zone in ("heavy", "medium", "medium_light", "light", "fragile")}
+WEIGHT_CLASS_LABELS["unclassified"] = "Не классифицировано"
+WEIGHT_ZONE_LABELS = {**WEIGHT_CLASS_LABELS, "unassigned": "Не назначено"}
 OPTIONAL_ALIASES = {
     "expiry_date": ["дата срока годности", "срок годности", "expiry", "expiry_date"],
     "batch": ["партия", "batch"],
@@ -939,13 +942,14 @@ def _sku_weight_classes(items: list[dict[str, Any]]) -> tuple[dict[str, str], di
 def _row_zones(model: dict[str, Any]) -> dict[str, str]:
     zones = {}
     for row in model.get("rows", []):
-        zone = _display_value(row.get("weight_zone"))
-        zones[_display_value(row.get("row_number"))] = zone if zone in {"heavy", "medium", "light", "fragile"} else "unassigned"
+        zone = normalize_placement_zone(row.get("weight_zone"))
+        zones[_display_value(row.get("row_number"))] = zone if is_assignable_placement_zone(zone) else "unassigned"
     return zones
 
 
 def _zone_capacity(model: dict[str, Any], occupied: dict[str, float]) -> dict[str, float]:
-    free = {"heavy": 0.0, "medium": 0.0, "light": 0.0, "fragile": 0.0, "unassigned": 0.0}
+    free = {zone: 0.0 for zone in get_assignable_placement_zones()}
+    free["unassigned"] = 0.0
     for cell in model.get("cells", []):
         zone = _display_value(cell.get("weight_zone")) or "unassigned"
         if zone not in free:
@@ -1020,7 +1024,8 @@ def _same_item(a: dict[str, Any], b: dict[str, Any]) -> bool:
 
 
 def calculate_basic_weight_placement(model: dict[str, Any], state: dict[str, Any], receipts_state: dict[str, Any] | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
-    receipts = [dict(item) for item in (receipts_state or {}).get("receipts", [])]
+    receipts = [dict(item) for item in (receipts_state or {}).get("receipts", [])
+                if item.get("placement_eligible") is not False]
     for item in receipts:
         item.setdefault("source", "receipt")
         item["sku_key"] = _display_value(item.get("sku_key")) or make_sku_key(item)

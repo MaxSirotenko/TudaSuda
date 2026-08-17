@@ -3,10 +3,12 @@ from datetime import date, timedelta
 
 import warehouse_factual_data as factual
 import warehouse_factual_scenario_inputs as adapter
+import warehouse_outbound_experiment_ui as experiment_ui
 from warehouse_business_identity import canonical_sku_key
 from warehouse_pick_demands import build_outbound_pick_demands
 from warehouse_scenario_comparison_ui import build_comparison_baseline
 from warehouse_sku_velocity import build_sku_velocity_profile
+from warehouse_inventory_placement import calculate_basic_weight_placement
 
 DAY = "2026-07-15"; WAREHOUSE = "Основной"
 SKU = canonical_sku_key({"nomenclature": "SKU", "characteristic": "A"})
@@ -88,6 +90,15 @@ def test_outbound_without_source_order_uses_historical_cell_order(monkeypatch):
     assert demand["orders"][0]["demands"][0]["pick_order"] == 17
 
 
+def test_invalid_optional_outbound_pick_order_diagnostic_survives_historical_resolution(monkeypatch):
+    monkeypatch.setattr(adapter, "load_effective_rows", lambda *a, **k: _view([{**_outbound(), "source_pick_order": 1.5}]))
+    monkeypatch.setattr(adapter, "load_effective_placement", lambda *a, **k: _view([_placement(order=17)]))
+    result = adapter.load_routed_outbound_for_day(DAY, WAREHOUSE, _model(), warehouse_binding=WAREHOUSE,
+        registry=_registry("outbound", "historical_placement"))
+    assert result["authoritative"] and result["rows"][0]["pick_order"] == 17
+    assert result["rows"][0]["pick_order_validation_reason"] == "optional_source_pick_order_invalid"
+
+
 def test_missing_or_conflicting_historical_order_blocks_route(monkeypatch):
     monkeypatch.setattr(adapter, "load_effective_rows", lambda *a, **k: _view([_outbound()]))
     for placement in ([_placement(order=None)], [_placement(order=1), {**_placement(order=2), "source_row": 3}]):
@@ -98,11 +109,32 @@ def test_missing_or_conflicting_historical_order_blocks_route(monkeypatch):
         assert result["blockers"][0]["code"] == "fact_cell_picking_order_missing_or_conflicting"
 
 
+def test_fractional_historical_order_and_invalid_start_quantity_block(monkeypatch):
+    monkeypatch.setattr(adapter, "load_effective_rows", lambda *a, **k: _view([_outbound()]))
+    monkeypatch.setattr(adapter, "load_effective_placement", lambda *a, **k: _view([_placement(order=1.5)]))
+    routed = adapter.load_routed_outbound_for_day(DAY, WAREHOUSE, _model(), warehouse_binding=WAREHOUSE,
+        registry=_registry("outbound", "historical_placement"))
+    assert routed["blockers"][0]["code"] == "fact_cell_picking_order_missing_or_conflicting"
+    monkeypatch.setattr(adapter, "load_effective_placement", lambda *a, **k: _view([{**_placement(), "source_stock_quantity": None}]))
+    start = adapter.build_start_state(DAY, WAREHOUSE, _model(), warehouse_binding=WAREHOUSE,
+        registry=_registry("historical_placement"))
+    assert not start["authoritative"] and start["blockers"][0]["code"] == "historical_stock_quantity_invalid"
+
+
 def test_invalid_factual_quantity_blocks_full_day_authority(monkeypatch):
     monkeypatch.setattr(adapter, "load_effective_rows", lambda *a, **k: _view([_outbound(), {**_outbound(quantity=None), "source_row": 3}]))
     result = adapter.load_outbound_for_day(DAY, WAREHOUSE, registry=_registry("outbound"))
     assert not result["authoritative"] and result["blockers"][0]["code"] == "factual_outbound_quantity_missing"
     assert any(row["quantity_validation_reason"] for row in result["rows"])
+
+
+def test_unscoped_or_identityless_outbound_rows_are_blockers(monkeypatch):
+    monkeypatch.setattr(adapter, "load_effective_rows", lambda *a, **k: _view([
+        {**_outbound(), "warehouse": ""}, {**_outbound(), "document_ref": "", "document_number": "", "source_row": 3}]))
+    result = adapter.load_outbound_for_day(DAY, WAREHOUSE, registry=_registry("outbound"))
+    assert not result["authoritative"]
+    assert {item["code"] for item in result["blockers"]} == {
+        "factual_outbound_warehouse_missing", "factual_outbound_document_identity_missing"}
 
 
 def test_scenario_opening_sku_gets_vgh_zone_without_receipt_day(monkeypatch):
@@ -111,6 +143,15 @@ def test_scenario_opening_sku_gets_vgh_zone_without_receipt_day(monkeypatch):
     result = adapter.build_scenario_weight_classifications([_placement()], registry=_registry("vgh"), rules={"bands": _bands()})
     assert result["rows"][0]["calculated_zone"] == "light"
     assert result["diagnostics"]["SKU с подтверждённой зоной"] == 1
+
+
+def test_unrelated_vgh_conflict_does_not_block_relevant_scenario_sku(monkeypatch):
+    conflict = {"code": "conflicting_factual_business_key", "business_key": ["other"]}
+    monkeypatch.setattr(adapter, "load_effective_rows", lambda *a, **k: _view(
+        [{"sku_key": SKU, "nomenclature": "SKU", "characteristic": "A", "weight": 2.5}], [conflict]))
+    result = adapter.build_scenario_weight_classifications([_placement()], registry=_registry("vgh"), rules={"bands": _bands()})
+    assert result["authoritative"] and result["rows"][0]["calculated_zone"] == "light"
+    assert result["diagnostics"]["unrelated_vgh_conflicts"] == 1
 
 
 def test_velocity_loader_reads_exact_28_prior_days(monkeypatch):
@@ -126,6 +167,24 @@ def test_velocity_loader_reads_exact_28_prior_days(monkeypatch):
     assert len(calls) == 28 and DAY not in calls
     assert profile["summary"]["accepted_history_rows"] == 28
     assert profile["summary"]["history_span_complete"] is True
+
+
+def test_velocity_disabled_does_not_call_history_loader(monkeypatch):
+    monkeypatch.setattr(experiment_ui, "_cached_factual_outbound_history", lambda *a, **k:
+        (_ for _ in ()).throw(AssertionError("history loader called")))
+    assert experiment_ui.load_velocity_history_if_enabled(
+        {"velocity": {"enabled": False}}, DAY, WAREHOUSE, _registry("outbound")) is None
+
+
+def test_velocity_history_cache_reuses_same_source_revision(monkeypatch):
+    calls = []
+    monkeypatch.setattr(adapter, "load_outbound_history", lambda *a, **k: calls.append(1) or
+        {"rows": [], "authoritative": True, "blockers": []})
+    experiment_ui._cached_factual_outbound_history.clear()
+    config = {"velocity": {"enabled": True}}; registry = _registry("outbound")
+    experiment_ui.load_velocity_history_if_enabled(config, DAY, WAREHOUSE, registry)
+    experiment_ui.load_velocity_history_if_enabled(config, DAY, WAREHOUSE, registry)
+    assert calls == [1]
 
 
 def test_registry_activation_review_blocks_scenario_without_legacy_fallback(monkeypatch):
@@ -149,3 +208,61 @@ def test_manual_inventory_fallback_and_factual_main_screens_are_present():
     assert "get_inventory_results_sheet_names" in experiment and "select_inventory_rows_for_opening_stock" in experiment
     assert '["Factual Data Layer", "Ручной fallback"]' in app
     assert "load_routed_outbound_for_day" in app
+
+
+def _receipt(line_id, sku, *, zone="medium_light", eligible=True):
+    return {"receipt_line_id": line_id, "receipt_number": line_id, "source_row_number": 1,
+        "sku_key": sku, "sku_name": sku, "characteristic_name": "", "qty_pallets": 1,
+        "qty_units": 1, "calculated_zone": zone, "weight_class": zone,
+        "placement_eligible": eligible, "placement_status": "not_placed"}
+
+
+def _medium_light_model():
+    return {"model_id": "zones", "rows": [{"row_number": "1", "row_order": 1, "weight_zone": "medium_light"}],
+        "cells": [{"cell_key": "1|1|1", "row_number": "1", "cell_number": "1", "tier": "1",
+                   "row_order": 1, "capacity_pallets": 4, "weight_zone": "medium_light"},
+                  {"cell_key": "1|2|1", "row_number": "1", "cell_number": "2", "tier": "1",
+                   "row_order": 1, "capacity_pallets": 4, "weight_zone": "medium_light"}]}
+
+
+def test_medium_light_receipt_places_in_canonical_medium_light_row():
+    sku = canonical_sku_key({"nomenclature": "ML"})
+    state, diagnostics = calculate_basic_weight_placement(
+        _medium_light_model(), {"placements": [], "unplaced_inventory": []}, {"receipts": [_receipt("D1", sku)]})
+    placed = [row for row in state["placements"] if row.get("receipt_line_ids") == ["D1"]]
+    assert placed and placed[0]["weight_zone"] == "medium_light"
+    assert not placed[0].get("zone_mismatch") and diagnostics.get("Не размещено паллет", 0) == 0
+
+
+def test_pending_factual_receipt_is_classified_but_never_mutates_placement(monkeypatch):
+    row = {"dataset_id": "r", "source_row": 2, "document_ref": "p", "document_number": "P",
+        "occurred_at": DAY, "warehouse": WAREHOUSE, "sku_key": SKU, "nomenclature": "SKU",
+        "characteristic": "A", "box_quantity": 1, "reported_pallets": 1, "terminal_completed": False}
+    monkeypatch.setattr(adapter, "load_effective_rows", lambda *a, **k: _view([row]))
+    factual = adapter.load_receipts_for_day(DAY, WAREHOUSE, registry=_registry("receipts"))
+    assert factual["classification_inputs"] and not factual["state"]["accepted_rows"]
+    receipt = factual["classification_inputs"][0] | {"calculated_zone": "medium_light", "qty_pallets": 1}
+    state, _ = calculate_basic_weight_placement(_medium_light_model(), {"placements": []}, {"receipts": [receipt]})
+    assert not state["placements"]
+
+
+def test_completed_receipt_with_invalid_box_quantity_is_blocked(monkeypatch):
+    row = {"dataset_id": "r", "source_row": 2, "document_ref": "p", "occurred_at": DAY,
+        "warehouse": WAREHOUSE, "sku_key": SKU, "box_quantity": None, "reported_pallets": 1,
+        "terminal_completed": True}
+    monkeypatch.setattr(adapter, "load_effective_rows", lambda *a, **k: _view([row]))
+    result = adapter.load_receipts_for_day(DAY, WAREHOUSE, registry=_registry("receipts"))
+    assert not result["authoritative"] and not result["state"]["accepted_rows"]
+    assert result["blockers"][0]["code"] == "factual_receipt_box_quantity_invalid"
+
+
+def test_applying_d1_then_d2_preserves_d1_and_reapplying_d2_is_idempotent():
+    model = _medium_light_model(); sku1 = canonical_sku_key({"nomenclature": "A"}); sku2 = canonical_sku_key({"nomenclature": "B"})
+    first, _ = calculate_basic_weight_placement(model, {"placements": []}, {"receipts": [_receipt("D1", sku1)]})
+    second, _ = calculate_basic_weight_placement(model, first, {"receipts": [_receipt("D2", sku2)]})
+    repeated, _ = calculate_basic_weight_placement(model, second, {"receipts": [_receipt("D2", sku2)]})
+    def quantities(state):
+        return {sku: sum(float(row.get("qty_pallets") or 0) for row in state["placements"] if row.get("sku_key") == sku)
+                for sku in (sku1, sku2)}
+    assert quantities(second) == {sku1: 1.0, sku2: 1.0}
+    assert quantities(repeated) == quantities(second)

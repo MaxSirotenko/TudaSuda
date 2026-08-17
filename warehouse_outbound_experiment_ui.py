@@ -44,6 +44,30 @@ SESSION_KEYS = (
 )
 
 
+def factual_outbound_revision(registry: Mapping[str, Any]) -> str:
+    """Stable cache identity for active factual outbound source versions."""
+    values = sorted((str(item.get("dataset_id")), str(item.get("version") or item.get("content_hash")))
+        for item in registry.get("datasets", []) if item.get("active", True) and item.get("source_type") == "outbound")
+    return hashlib.sha256(json.dumps(values, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
+
+
+@st.cache_data(show_spinner=False)
+def _cached_factual_outbound_history(operational_date: str, warehouse: str, source_revision: str,
+                                     registry_json: str) -> dict[str, Any]:
+    del source_revision
+    from warehouse_factual_scenario_inputs import load_outbound_history
+    return load_outbound_history(operational_date, warehouse, registry=json.loads(registry_json))
+
+
+def load_velocity_history_if_enabled(rule_config: Mapping[str, Any] | None, operational_date: str,
+                                     warehouse: str, registry: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Avoid all history I/O unless velocity is enabled; cache by source revision."""
+    if not bool((rule_config or {}).get("velocity", {}).get("enabled")):
+        return None
+    return _cached_factual_outbound_history(operational_date, warehouse, factual_outbound_revision(registry),
+        json.dumps(registry, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str))
+
+
 def _canonical(value: Any) -> Any:
     if isinstance(value, Mapping):
         return {str(k): _canonical(value[k]) for k in sorted(value, key=str)}
@@ -239,7 +263,7 @@ def render_outbound_experiment(model: dict[str, Any]) -> None:
     from warehouse_factual_scenario_inputs import (
         available_operational_dates as factual_dates, available_warehouses as factual_warehouses,
         build_scenario_weight_classifications, build_start_state, load_inventory_for_day,
-        load_outbound_history, load_receipts_for_day, load_routed_outbound_for_day,
+        load_receipts_for_day, load_routed_outbound_for_day,
     )
 
     st.subheader("Авторитетный CURRENT vs PROPOSED")
@@ -281,8 +305,13 @@ def render_outbound_experiment(model: dict[str, Any]) -> None:
             receipts = load_receipts_for_day(operational_date, selected_warehouse, registry=registry)
             inventory = load_inventory_for_day(operational_date, selected_warehouse, registry=registry)
             relevant = [*start.get("rows", []), *outbound.get("rows", [])]
-            classifications = build_scenario_weight_classifications(relevant, registry=registry)
-            velocity = load_outbound_history(operational_date, selected_warehouse, registry=registry)
+            rule_config = st.session_state.get("workspace_rule_config") or {}
+            weight_zones_enabled = bool(rule_config.get("weight_zones", {}).get("enabled"))
+            classifications = (build_scenario_weight_classifications(relevant, registry=registry)
+                if weight_zones_enabled else {"rows": [], "blockers": [], "authoritative": True,
+                                              "diagnostics": {"status": "weight_zones_disabled"}})
+            velocity = load_velocity_history_if_enabled(
+                st.session_state.get("workspace_rule_config"), operational_date, selected_warehouse, registry)
             tomorrow = (date.fromisoformat(str(operational_date)) + timedelta(days=1)).isoformat()
             end = build_start_state(tomorrow, selected_warehouse, model,
                 warehouse_binding=selected_warehouse if binding_confirmed else None, registry=registry)
@@ -294,7 +323,7 @@ def render_outbound_experiment(model: dict[str, Any]) -> None:
             inventory_state = inventory if opening_rows else None
             loaded_classifications = classifications["rows"] if classifications["authoritative"] else []
             end_state = end["state"] if end["authoritative"] and end["rows"] else None
-            velocity_rows = velocity["rows"] if velocity["authoritative"] else []
+            velocity_rows = velocity["rows"] if velocity and velocity["authoritative"] else None
             if receipt_state:
                 day_state, _ = build_day_receipt_scenario_inputs(
                     receipt_state, operational_date=operational_date, selected_warehouses=[selected_warehouse])
