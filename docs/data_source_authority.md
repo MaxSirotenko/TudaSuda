@@ -14,5 +14,6 @@ This table is the production contract. Effective views in `warehouse_factual_dat
 
 * SKU identity remains `Номенклатура + Характеристика` through the shared business-identity boundary.
 * Historical cells use exact authoritative resolution or an explicit persisted user mapping; ambiguous/unresolved cells block START.
+* Historical placement has no warehouse column. A selected outbound warehouse is never copied onto it implicitly; an explicit dataset/model-to-warehouse confirmation is required.
 * Manual/legacy sources are compatibility inputs, never an automatic empty/error fallback.
 * Mutable placement, execution logs, model/geometry, gates, rules, render settings and comparison artifacts are derived state/configuration/results, not competing factual sources.

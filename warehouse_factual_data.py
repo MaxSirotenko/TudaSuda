@@ -541,6 +541,30 @@ def active_datasets(registry: Mapping[str, Any], source_type: str | None = None)
             and (source_type is None or item.get("source_type") == source_type)]
 
 
+def ensure_compact_scope_indexes(registry: dict[str, Any], *, root: Path = DATA_ROOT) -> dict[str, Any]:
+    """Persist a one-time compact warehouse index for pre-index datasets.
+
+    Old partitions are streamed rather than materialized. Once upgraded,
+    normal UI reruns read registry metadata only.
+    """
+    changed = False
+    for dataset in registry.get("datasets", []):
+        if dataset.get("source_type") not in {"outbound", "receipts", "inventory"}: continue
+        index = dataset.setdefault("index", {})
+        if "warehouses" in index and "warehouses_by_date" in index: continue
+        by_date: dict[str, list[str]] = {}; all_warehouses: set[str] = set()
+        artifact = Path(str(dataset.get("artifact") or root / str(dataset.get("dataset_id", "")).removeprefix("dataset:")))
+        for raw_day in index.get("dates", dataset.get("partitions", [])):
+            day = normalize_operational_day(raw_day) or str(raw_day)
+            path = artifact / "canonical" / f"date={raw_day}.jsonl.gz"
+            warehouses = sorted({str(row.get("warehouse")) for row in _iter_jsonl(path) if row.get("warehouse")}) if path.exists() else []
+            by_date[day] = warehouses; all_warehouses.update(warehouses)
+            index.setdefault("daily", {}).setdefault(day, {})["warehouses"] = warehouses
+        index["warehouses"] = sorted(all_warehouses); index["warehouses_by_date"] = by_date; changed = True
+    if changed: _atomic_json(root / "registry.json", registry)
+    return registry
+
+
 def _import_excel_dataset_buffered(data: bytes, filename: str, *, sheet: str | None = None, root: Path = DATA_ROOT,
                          geometry_cells: Iterable[str] | None = None, reimport: bool = False,
                          parser_version: str = PARSER_VERSION) -> dict[str, Any]:
@@ -598,7 +622,11 @@ def _import_excel_dataset_buffered(data: bytes, filename: str, *, sheet: str | N
         daily[day] = {"rows": len(rows), "sku": len({r.get("sku_key") for r in rows if r.get("sku_key")}),
             "cells": len({r.get("cell") for r in rows if r.get("cell")}), "documents": len(docs),
             "positive_quantity": sum(positive), "positive_sku_keys": sorted({r.get("sku_key") for r in rows if r.get("sku_key") and isinstance(r.get("quantity"), (int, float)) and r.get("quantity") > 0})}
-    index = {"sku_keys": sku_index, "dates": sorted(partitions), "daily": daily, "document_keys": sorted(document_keys)}
+    index = {"sku_keys": sku_index, "dates": sorted(partitions), "daily": daily,
+             "warehouses": sorted({str(row.get("warehouse")) for row in canonical if row.get("warehouse")}),
+             "warehouses_by_date": {day: sorted({str(row.get("warehouse")) for row in rows if row.get("warehouse")})
+                                    for day, rows in partitions.items()},
+             "document_keys": sorted(document_keys)}
     metadata = {"dataset_id": dataset_id, "source_file_name": filename, "content_hash": digest, "source_type": source_type,
         "source_label": SOURCE_LABELS[source_type], "parser_version": parser_version, "sheet": selected, "rows": len(raw),
         "period_from": diagnostics["period_from"], "period_to": diagnostics["period_to"], "unique_sku": diagnostics["unique_sku"],
@@ -732,7 +760,7 @@ def _stream_xlsx_dataset(data: bytes, filename: str, *, sheet: str | None, root:
         writers: dict[str, Any] = {}
         raw_writer = index_writer = None
         row_count = missing_sku = duplicate_raw = zero = negative = missing_qty = 0
-        raw_hashes: set[str] = set(); sku_keys: set[str] = set(); days: set[str] = set()
+        raw_hashes: set[str] = set(); sku_keys: set[str] = set(); days: set[str] = set(); warehouses: set[str] = set()
         daily: dict[str, dict[str, Any]] = defaultdict(lambda: {"rows": 0, "sku_keys": set(), "cells": set(),
             "documents": set(), "positive_quantity": 0, "positive_sku_keys": set()})
         placement_sku_cells: dict[tuple[Any, Any], set[str]] = defaultdict(set)
@@ -821,6 +849,9 @@ def _stream_xlsx_dataset(data: bytes, filename: str, *, sheet: str | None, root:
                 started = time.perf_counter()
                 sku = record.get("sku_key"); missing_sku += not bool(sku)
                 if sku: sku_keys.add(sku); daily[day]["sku_keys"].add(sku)
+                if record.get("warehouse") not in (None, ""):
+                    warehouse = str(record["warehouse"]); warehouses.add(warehouse)
+                    daily[day].setdefault("warehouses", set()).add(warehouse)
                 daily[day]["rows"] += 1
                 if record.get("cell") not in (None, ""): daily[day]["cells"].add(str(record["cell"]))
                 doc = (record.get("document_ref") or record.get("inventory_ref"),
@@ -887,8 +918,11 @@ def _stream_xlsx_dataset(data: bytes, filename: str, *, sheet: str | None, root:
         diagnostics["warnings"].append("historical_cell_not_resolved_to_geometry")
     index_daily = {day: {"rows": values["rows"], "sku": len(values["sku_keys"]), "cells": len(values["cells"]),
         "documents": len(values["documents"]), "positive_quantity": values["positive_quantity"],
-        "positive_sku_keys": sorted(values["positive_sku_keys"])} for day, values in daily.items()}
+        "positive_sku_keys": sorted(values["positive_sku_keys"]),
+        "warehouses": sorted(values.get("warehouses", set()))} for day, values in daily.items()}
     index = {"sku_keys": sorted(sku_keys), "dates": sorted(days), "daily": index_daily,
+             "warehouses": sorted(warehouses),
+             "warehouses_by_date": {day: values["warehouses"] for day, values in index_daily.items()},
              "business_key_count": business_key_count, "business_index_artifact": "business_index.jsonl.gz"}
     stage_seconds["final_metadata_publication"] += time.perf_counter() - finalization_started
     elapsed = time.perf_counter() - import_started

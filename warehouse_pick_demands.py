@@ -130,10 +130,11 @@ def build_outbound_pick_demands(order_rows: list[dict[str, Any]]) -> dict[str, A
         pick_order = _integer_evidence(row.get("pick_order"))
         line_number = _integer_evidence(row.get("line_number"))
         sequence_reason = _text(row.get("pick_order_validation_reason"))
-        if pick_order is None:
-            sequence_reason = sequence_reason or "pick_order_missing"
+        # The factual outbound contract intentionally makes source pick order
+        # optional. Route replay derives visit order from authoritative stock
+        # locations/warehouse graph; only supplied invalid evidence blocks it.
         if sequence_reason or row.get("route_sequence_authoritative") is False:
-            reason = sequence_reason or "pick_order_not_authoritative"
+            reason = sequence_reason or ("pick_order_missing" if pick_order is None else "pick_order_not_authoritative")
             diagnostics["route_sequence_authoritative"] = False
             counts = diagnostics["route_sequence_reason_counts"]
             counts[reason] = counts.get(reason, 0) + 1
