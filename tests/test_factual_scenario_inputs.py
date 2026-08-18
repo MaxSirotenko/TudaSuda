@@ -274,7 +274,7 @@ def test_pending_factual_receipt_is_classified_but_never_mutates_placement(monke
 
 
 def test_completed_receipt_with_invalid_box_quantity_is_blocked(monkeypatch):
-    row = {"dataset_id": "r", "source_row": 2, "document_ref": "p", "occurred_at": DAY,
+    row = {"dataset_id": "r", "source_row": 2, "document_ref": "p", "line_number": 1, "occurred_at": DAY,
         "warehouse": WAREHOUSE, "sku_key": SKU, "box_quantity": None, "reported_pallets": 1,
         "terminal_completed": True}
     monkeypatch.setattr(adapter, "load_effective_rows", lambda *a, **k: _view([row]))
@@ -295,6 +295,58 @@ def test_applying_d1_then_d2_preserves_d1_and_reapplying_d2_is_idempotent():
     assert quantities(repeated) == quantities(second)
 
 
+def _factual_receipt(doc, line, warehouse, qty, *, dataset="A", source_row=10, sku=SKU):
+    row = {"dataset_id": dataset, "source_row": source_row, "document_ref": doc, "document_number": doc,
+        "line_number": line, "occurred_at": DAY, "warehouse": warehouse, "sku_key": sku,
+        "nomenclature": "SKU", "box_quantity": qty, "reported_pallets": qty, "terminal_completed": True}
+    return {**adapter._receipt_overlay(row, source_row), "calculated_zone": "medium_light",
+            "weight_class": "medium_light", "qty_pallets": qty}
+
+
+def test_factual_receipt_business_identity_replaces_corrected_dataset_line():
+    model = _medium_light_model()
+    v1 = _factual_receipt("R", 5, "A", 1, dataset="A", source_row=10)
+    v2 = _factual_receipt("R", 5, "A", 2, dataset="B", source_row=14)
+    assert v1["receipt_line_id"] == v2["receipt_line_id"]
+    first, _ = calculate_basic_weight_placement(model, {"placements": []}, {"receipts": [v1]})
+    corrected, _ = calculate_basic_weight_placement(model, first, {"receipts": [v2]})
+    repeated, _ = calculate_basic_weight_placement(model, corrected, {"receipts": [v2]})
+    assert sum(row.get("qty_pallets", 0) for row in corrected["placements"]) == 2
+    assert sum(row.get("qty_pallets", 0) for row in repeated["placements"]) == 2
+
+
+def test_factual_receipt_line_number_is_independent_mutation_identity():
+    first = _factual_receipt("R", 5, "A", 1)
+    second = _factual_receipt("R", 6, "A", 1, source_row=11)
+    assert first["receipt_line_id"] != second["receipt_line_id"]
+    model = _medium_light_model()
+    d1, _ = calculate_basic_weight_placement(model, {"placements": []}, {"receipts": [first]})
+    state, _ = calculate_basic_weight_placement(model, d1, {"receipts": [second]})
+    repeated, _ = calculate_basic_weight_placement(model, state, {"receipts": [second]})
+    ids = {value for row in state["placements"] for value in row.get("receipt_line_ids", [])}
+    assert ids == {first["receipt_line_id"], second["receipt_line_id"]}
+    assert sum(row.get("qty_pallets", 0) for row in repeated["placements"]) == 2
+
+
+def test_factual_receipt_placement_never_retains_another_warehouse():
+    model = _medium_light_model()
+    warehouse_a = _factual_receipt("A", 1, "Склад А", 1)
+    warehouse_b = _factual_receipt("B", 1, "Склад Б", 1)
+    first, _ = calculate_basic_weight_placement(model, {"placements": []}, {"receipts": [warehouse_a]})
+    switched, _ = calculate_basic_weight_placement(model, first, {"receipts": [warehouse_b]})
+    assert {row.get("source_warehouse") for row in switched["placements"]} == {"склад б"}
+    assert sum(row.get("qty_pallets", 0) for row in switched["placements"]) == 1
+
+
+def test_unknown_prior_receipt_warehouse_is_excluded_with_diagnostic():
+    model = _medium_light_model(); incoming = _factual_receipt("B", 1, "Склад Б", 1)
+    prior = {"placement_id": "legacy", "placement_mode": "calculated", "source": "receipt",
+        "cell_key": "1|1|1", "sku_key": SKU, "qty_pallets": 3, "receipt_line_ids": ["legacy"]}
+    state, diagnostics = calculate_basic_weight_placement(model, {"placements": [prior]}, {"receipts": [incoming]})
+    assert all(row.get("placement_id") != "legacy" for row in state["placements"])
+    assert diagnostics["Исключено calculated receipts без warehouse provenance"] == 1
+
+
 def test_broken_enabled_velocity_history_is_explicitly_blocked_without_day_fallback():
     rows, blockers = experiment_ui.velocity_history_gate(
         {"authoritative": False, "rows": [{"created_at": DAY}], "blockers": [{"code": "prior_day_conflict"}]})
@@ -310,7 +362,7 @@ def test_historical_blank_sku_is_factual_source_blocker(monkeypatch):
 
 
 def test_receipt_boolean_normalization_for_existing_partition_scalars(monkeypatch):
-    template = {"dataset_id": "r", "document_ref": "p", "occurred_at": DAY, "warehouse": WAREHOUSE,
+    template = {"dataset_id": "r", "document_ref": "p", "line_number": 1, "occurred_at": DAY, "warehouse": WAREHOUSE,
         "sku_key": SKU, "box_quantity": 1, "reported_pallets": 1}
     for value in ("Да", 1, True):
         monkeypatch.setattr(adapter, "load_effective_rows", lambda *a, value=value, **k: _view([{**template, "terminal_completed": value}]))
@@ -368,7 +420,7 @@ def test_blank_receipt_warehouse_is_visible_source_blocker(monkeypatch):
 
 
 def test_completed_receipt_requires_positive_reported_pallets(monkeypatch):
-    base = {"dataset_id": "r", "source_row": 2, "document_ref": "A", "occurred_at": DAY,
+    base = {"dataset_id": "r", "source_row": 2, "document_ref": "A", "line_number": 1, "occurred_at": DAY,
             "warehouse": WAREHOUSE, "sku_key": SKU, "box_quantity": 4, "terminal_completed": True}
     monkeypatch.setattr(adapter, "load_effective_rows", lambda *a, **k: _view([{**base, "reported_pallets": 2}]))
     valid = adapter.load_receipts_for_day(DAY, WAREHOUSE, registry=_registry("receipts"))
@@ -393,7 +445,7 @@ def test_completed_blank_sku_receipt_blocks_whole_day_and_partial_application(mo
 
 
 def test_receipt_weight_classification_scopes_vgh_conflicts_to_receipt_sku(monkeypatch):
-    receipt = {"dataset_id": "r", "source_row": 2, "document_ref": "R", "occurred_at": DAY,
+    receipt = {"dataset_id": "r", "source_row": 2, "document_ref": "R", "line_number": 1, "occurred_at": DAY,
         "warehouse": WAREHOUSE, "sku_key": SKU, "nomenclature": "SKU", "box_quantity": 1,
         "reported_pallets": 1, "terminal_completed": True}
     unrelated = {"code": "conflicting_factual_business_key", "business_key": ["other"]}

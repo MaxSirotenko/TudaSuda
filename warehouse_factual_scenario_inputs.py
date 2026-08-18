@@ -15,8 +15,8 @@ from datetime import date, timedelta
 
 from warehouse_actual_inventory_import import classify_physical_pallet_evidence
 from warehouse_business_identity import normalize_warehouse
-from warehouse_factual_data import (DATA_ROOT, PARSER_VERSION, active_datasets, load_effective_placement,
-    load_effective_rows, load_registry, normalize_operational_day)
+from warehouse_factual_data import (DATA_ROOT, PARSER_VERSION, active_datasets, factual_receipt_line_identity,
+    load_effective_placement, load_effective_rows, load_registry, normalize_operational_day)
 from warehouse_outbound_orders import outbound_order_key
 from warehouse_receipts import calculate_receipt_zones
 from warehouse_weight_rules import load_weight_rules
@@ -278,11 +278,12 @@ def _receipt_overlay(row: Mapping[str, Any], index: int) -> dict[str, Any]:
     expected = normalize_receipt_boolean(row.get("expected_receipt"))
     pallets = row.get("reported_pallets")
     usable_pallets = (isinstance(pallets, (int, float)) and not isinstance(pallets, bool) and pallets > 0)
-    return {"receipt_id": f"factual:{row.get('dataset_id')}:{row.get('source_row', index)}",
-        "receipt_line_id": f"factual:{row.get('dataset_id')}:{row.get('source_row', index)}",
+    stable_identity = factual_receipt_line_identity(row)
+    return {"receipt_id": stable_identity, "receipt_line_id": stable_identity,
         "source_row_number": row.get("source_row", index), "sku_key": row.get("sku_key"),
         "receipt_date": row.get("occurred_at"), "receipt_number": row.get("document_number"),
         "receipt_document": row.get("document_ref"), "warehouse": row.get("warehouse"),
+        "source_warehouse": normalize_warehouse(row.get("warehouse")), "source_authority": "factual",
         "sku_name": row.get("nomenclature"), "nomenclature": row.get("nomenclature"),
         "characteristic_name": row.get("characteristic"), "characteristic": row.get("characteristic"),
         "qty_units": row.get("box_quantity") or 0, "qty_boxes": row.get("box_quantity") or 0,
@@ -297,7 +298,7 @@ def _receipt_overlay(row: Mapping[str, Any], index: int) -> dict[str, Any]:
 
 def load_receipts_for_day(operational_date: Any, warehouse: Any, **kwargs: Any) -> dict[str, Any]:
     result = _scoped("receipts", operational_date, warehouse, **kwargs)
-    identityless = [row for row in result["rows"] if not str(row.get("document_ref") or "").strip()]
+    identityless = [row for row in result["rows"] if not factual_receipt_line_identity(row)]
     unscoped = [row for row in result["rows"] if not normalize_warehouse(row.get("warehouse"))]
     source_blockers = []
     if identityless:

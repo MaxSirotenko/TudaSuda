@@ -30,4 +30,6 @@ This table is the production contract. Effective views in `warehouse_factual_dat
 * Evidence-index publication is serialized per artifact and uses unique staging/swap directories, so concurrent first access cannot expose a partial index.
 * Route-location authority considers only positive opening stock and must belong to the shared physical graph's routable cell-access set.
 * Completed receipts require canonical SKU identity; any completed invalid row blocks application of the entire factual receipt input.
+* Mutable factual receipt identity is the authoritative `document_ref + line_number` business key; dataset/version/source-row values remain provenance only.
+* Calculated factual receipt placements are warehouse-scoped. A new factual calculation retains prior receipt lines only from the same normalized warehouse; unknown provenance is excluded with diagnostics.
 * Mutable placement, execution logs, model/geometry, gates, rules, render settings and comparison artifacts are derived state/configuration/results, not competing factual sources.

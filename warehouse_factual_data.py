@@ -713,6 +713,15 @@ def _business_evidence(row: Mapping[str, Any], source_type: str) -> dict[str, An
             "source_file_name": row.get("source_file_name"), "source_row": row.get("source_row")}
 
 
+def factual_receipt_line_identity(row: Mapping[str, Any]) -> str:
+    """Stable mutable identity from the authoritative receipt business key."""
+    evidence = _business_evidence(row, "receipts")
+    if evidence is None:
+        return ""
+    return "factual-receipt:" + hashlib.sha256(
+        str(evidence["business_key"]).encode("utf-8")).hexdigest()[:24]
+
+
 def _evidence_semantics_signature(dataset: Mapping[str, Any], source_type: str) -> str:
     return _fingerprint({"version": EVIDENCE_SEMANTICS_VERSION, "source_type": source_type,
         "business_keys": BUSINESS_KEYS.get(source_type), "material_fields": MATERIAL_FIELDS.get(source_type),
