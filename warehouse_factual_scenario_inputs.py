@@ -99,6 +99,21 @@ def load_outbound_for_day(operational_date: Any, warehouse: Any, *, registry: Ma
     if lifecycle:
         return {"source": "factual", "source_type": "outbound", "operational_date": day,
                 "warehouse": target, "rows": [], "authoritative": False, "blockers": lifecycle, "duplicates": []}
+    undated_available = any("undated" in dataset.get("index", {}).get("dates", dataset.get("partitions", []))
+        for dataset in active_datasets(reg, "outbound"))
+    undated_blockers = []
+    if undated_available:
+        undated = load_effective_rows("outbound", "undated", registry=reg, root=root, strict=False,
+                                      warehouse=target)
+        evidence = [{"dataset_id": row.get("dataset_id"), "source_row": row.get("source_row"),
+                     "warehouse": row.get("warehouse")} for row in undated.get("rows", [])]
+        for conflict in undated.get("conflicts", []):
+            evidence.extend({"dataset_id": item.get("dataset_id"), "source_row": item.get("source_row"),
+                             "warehouse": (item.get("payload") or {}).get("warehouse")}
+                            for item in conflict.get("occurrences", []))
+        if evidence:
+            undated_blockers.append({"code": "factual_outbound_operational_date_missing_or_invalid",
+                                     "rows": len(evidence), "evidence": evidence[:20]})
     view = load_effective_rows("outbound", day, registry=reg, root=root, strict=False,
                                warehouse=target); rows = []; quantity_blockers = []; confirmed_zero = 0
     if not view["conflicts"]:
@@ -143,8 +158,8 @@ def load_outbound_for_day(operational_date: Any, warehouse: Any, *, registry: Ma
                 "order_key": outbound_order_key(factual.get("warehouse"), number, created), "line_status": "not_processed",
                 "factual_row": factual})
     result = _result("outbound", day, target, view, rows)
-    result["blockers"] = [*result["blockers"], *quantity_blockers]
-    result["authoritative"] = result["authoritative"] and not quantity_blockers
+    result["blockers"] = [*result["blockers"], *undated_blockers, *quantity_blockers]
+    result["authoritative"] = result["authoritative"] and not result["blockers"]
     result["diagnostics"] = {"confirmed_zero_non_demand_rows": confirmed_zero,
                              "invalid_quantity_rows": len(quantity_blockers)}
     return result

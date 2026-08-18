@@ -347,3 +347,22 @@ def test_map_tooltip_reports_before_current_picked_and_last_order(tmp_path, monk
     assert "Текущий остаток юнитов: 2" in tooltip
     assert "Списано юнитов: 3" in tooltip
     assert "Последний РО: RO-9" in tooltip
+
+
+def test_execution_view_is_scoped_to_current_factual_orders():
+    d1 = _order("D1", 1, created="2026-07-20T10:00:00")
+    d2 = _order("D2", 1, created="2026-07-21T10:00:00")
+    state = {"processed_orders": {
+        d1["order_key"]: {"status": "completed"}, d2["order_key"]: {"status": "failed"}},
+        "line_results": [
+            {"order_key": d1["order_key"], "outbound_order_number": "D1", "created_at": d1["created_at"], "picked_units": 1},
+            {"order_key": d2["order_key"], "outbound_order_number": "D2", "created_at": d2["created_at"], "shortage_units": 1}],
+        "technical_errors": [], "freed_cell_keys": ["1|1|1"]}
+    log = [{"order_key": d1["order_key"], "outbound_order_number": "D1", "created_at": d1["created_at"]},
+           {"order_key": d2["order_key"], "outbound_order_number": "D2", "created_at": d2["created_at"]}]
+    d2_state, d2_log = outbound.scope_outbound_execution_view([d2], state, log)
+    assert set(d2_state["processed_orders"]) == {d2["order_key"]}
+    assert [row["outbound_order_number"] for row in d2_state["line_results"]] == ["D2"]
+    assert [row["outbound_order_number"] for row in d2_log] == ["D2"]
+    d1_state, _ = outbound.scope_outbound_execution_view([d1], state, log)
+    assert set(d1_state["processed_orders"]) == {d1["order_key"]}

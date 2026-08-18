@@ -151,8 +151,10 @@ from warehouse_outbound_orders import (
     save_outbound_execution_log,
     save_outbound_execution_state,
     save_outbound_orders,
+    scope_outbound_execution_view,
     summarize_outbound_orders,
 )
+from warehouse_business_identity import normalize_warehouse
 from warehouse_state_cache import (
     load_outbound_execution_log_cached,
     load_outbound_execution_state_cached,
@@ -1017,6 +1019,20 @@ def _receipt_zone_summary(receipts: list[dict]) -> dict[str, int]:
     return summary
 
 
+def _receipt_visible_medium_light_total(summary: dict[str, int]) -> int:
+    return summary.get("medium", 0) + summary.get("medium_light", 0) + summary.get("light", 0)
+
+
+def factual_outbound_binding_blockers(model: dict, selected_warehouse: object) -> list[dict]:
+    binding = normalize_warehouse(model.get("factual_warehouse_binding"))
+    selected = normalize_warehouse(selected_warehouse)
+    if binding and binding == selected:
+        return []
+    return [{"code": "mutable_placement_warehouse_binding_required" if not binding
+        else "mutable_placement_warehouse_binding_mismatch", "binding": binding or None,
+        "selected_warehouse": selected or None}]
+
+
 def _zone_calculation_dataframe(receipts: list[dict]) -> pd.DataFrame:
     receipt_count_by_sku = {}
     for receipt in receipts:
@@ -1299,7 +1315,7 @@ def render_receipts_section(model: dict) -> None:
             z1.metric("С зоной", classified)
             z2.metric("Без зоны", zone_summary.get("unclassified", 0))
             z3.metric("Тяжёлое", zone_summary.get("heavy", 0))
-            z4.metric("Среднее/лёгкое", zone_summary.get("medium", 0) + zone_summary.get("light", 0))
+            z4.metric("Среднее/лёгкое", _receipt_visible_medium_light_total(zone_summary))
             z5.metric("Хрупкое", zone_summary.get("fragile", 0))
             if classified == 0 and not rules.get("bands"):
                 st.info(f"Вес найден для {zone_diagnostics.get('Вес найден', 0)} SKU, но диапазоны весовых категорий ещё не настроены.")
@@ -1410,6 +1426,8 @@ def render_outbound_picking(model: dict) -> None:
         selected_day = st.selectbox("Операционный день РО", dates, key="outbound_picking_day") if dates else None
         factual = (load_outbound_for_day(selected_day, selected_warehouse, registry=registry)
                    if selected_day and selected_warehouse else {"rows": [], "blockers": []})
+        binding_blockers = factual_outbound_binding_blockers(model, selected_warehouse)
+        factual["blockers"] = [*factual.get("blockers", []), *binding_blockers]
         factual_ready = bool(factual.get("authoritative")) and not factual.get("blockers")
         rows = factual["rows"] if factual_ready else []
         st.success("Источник demand: ✅ factual outbound · исполнение: текущее mutable placement")
@@ -1467,7 +1485,9 @@ def render_outbound_picking(model: dict) -> None:
                         return
                     st.success(f"Загружено строк РО: {len(normalized_rows)}.")
                     st.rerun()
-    order_summary = summarize_outbound_orders(rows, execution_state)
+    display_execution_state, display_execution_log = ((scope_outbound_execution_view(rows, execution_state, execution_log))
+        if source_mode == "Factual Data Layer" else (execution_state, execution_log))
+    order_summary = summarize_outbound_orders(rows, display_execution_state)
     if not order_summary:
         st.info("Расходные ордера пока не загружены.")
         if source_mode == "Factual Data Layer" and not factual_ready:
@@ -1524,8 +1544,8 @@ def render_outbound_picking(model: dict) -> None:
         else:
             st.error(result["message"])
 
-    line_results = execution_state.get("line_results", [])
-    summary = outbound_execution_summary(rows, execution_state, line_results)
+    line_results = display_execution_state.get("line_results", [])
+    summary = outbound_execution_summary(rows, display_execution_state, line_results)
     metric_columns = st.columns(5)
     for index, (label, value) in enumerate(summary.items()):
         metric_columns[index % 5].metric(label, value)
@@ -1535,9 +1555,9 @@ def render_outbound_picking(model: dict) -> None:
         shortages = [item for item in line_results if int(item.get("shortage_units", 0) or 0) > 0 or item.get("line_status") not in {"completed"}]
         with st.expander("Дефицитные и отклонённые строки"):
             st.dataframe(pd.DataFrame(shortages), use_container_width=True)
-    if execution_log:
+    if display_execution_log:
         with st.expander("Журнал списаний по ячейкам"):
-            st.dataframe(pd.DataFrame(execution_log), use_container_width=True)
+            st.dataframe(pd.DataFrame(display_execution_log), use_container_width=True)
 
 
 @st.fragment

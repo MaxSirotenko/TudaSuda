@@ -316,6 +316,23 @@ def summarize_outbound_orders(rows: list[dict[str, Any]], execution_state: dict[
     return sorted(grouped.values(), key=lambda item: (item["created_at"], item["outbound_order_number"], item["order_key"]))
 
 
+def scope_outbound_execution_view(rows: list[dict[str, Any]], execution_state: dict[str, Any],
+                                  execution_log: list[dict[str, Any]]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Return a read-only execution view for exactly the supplied factual orders."""
+    keys = {str(row.get("order_key") or "") for row in rows}
+    identities = {(str(row.get("outbound_order_number") or ""), str(row.get("created_at") or "")) for row in rows}
+    def relevant(item: dict[str, Any]) -> bool:
+        key = str(item.get("order_key") or "")
+        return key in keys if key else (str(item.get("outbound_order_number") or ""), str(item.get("created_at") or "")) in identities
+    scoped = copy.deepcopy(execution_state)
+    scoped["processed_orders"] = {key: value for key, value in execution_state.get("processed_orders", {}).items()
+                                   if str(key) in keys}
+    scoped["line_results"] = [copy.deepcopy(item) for item in execution_state.get("line_results", []) if relevant(item)]
+    scoped["technical_errors"] = [copy.deepcopy(item) for item in execution_state.get("technical_errors", []) if relevant(item)]
+    scoped["freed_cell_keys"] = []
+    return scoped, [copy.deepcopy(item) for item in execution_log if relevant(item)]
+
+
 def _placement_units(placement: dict[str, Any]) -> int:
     value, reason = _parse_units(placement.get("qty_units"))
     return value if not reason and value is not None else 0
@@ -342,6 +359,7 @@ def _cell_sort_key(placement: dict[str, Any], model: dict[str, Any]) -> tuple[An
 def _line_result(row: dict[str, Any], **updates: Any) -> dict[str, Any]:
     result = {
         "outbound_order_number": row.get("outbound_order_number", ""),
+        "order_key": row.get("order_key", ""),
         "created_at": row.get("created_at", ""),
         "nomenclature": row.get("nomenclature", ""),
         "characteristic": row.get("characteristic", ""),
@@ -392,6 +410,7 @@ def _execute_order(model: dict[str, Any], placement_state: dict[str, Any], order
             entries.append({
                 "sequence_number": len(entries) + 1,
                 "outbound_order_number": row.get("outbound_order_number", ""),
+                "order_key": row.get("order_key", ""),
                 "created_at": row.get("created_at", ""),
                 "sku_key": row.get("sku_key", ""),
                 "row_number": placement.get("row_number", ""),

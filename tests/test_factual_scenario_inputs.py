@@ -5,6 +5,7 @@ import pytest
 import warehouse_factual_data as factual
 import warehouse_factual_scenario_inputs as adapter
 import warehouse_outbound_experiment_ui as experiment_ui
+import virtual_warehouse_app as app
 from warehouse_business_identity import canonical_sku_key
 from warehouse_pick_demands import build_outbound_pick_demands
 from warehouse_scenario_comparison_ui import build_comparison_baseline
@@ -468,6 +469,36 @@ def test_outbound_blank_sku_is_explicit_source_blocker(monkeypatch):
     assert not result["authoritative"] and result["rows"] == []
     assert result["blockers"][0] == {"code": "factual_outbound_sku_identity_missing",
                                      "dataset_id": "o", "source_row": 9}
+
+
+def test_undated_outbound_blocks_only_relevant_or_unknown_warehouse(monkeypatch):
+    registry = _registry("outbound")
+    registry["datasets"][0]["index"]["dates"].append("undated")
+    registry["datasets"][0]["partitions"].append("undated")
+    valid = _view([_outbound()])
+    for undated_warehouse, blocked in ((WAREHOUSE, True), ("Другой", False), ("", True)):
+        undated = _view([{**_outbound(), "occurred_at": None, "warehouse": undated_warehouse, "source_row": 8}])
+        scoped_undated = undated if not undated_warehouse or undated_warehouse == WAREHOUSE else _view([])
+        monkeypatch.setattr(adapter, "load_effective_rows", lambda kind, day=None, **kwargs:
+            scoped_undated if day == "undated" else valid)
+        result = adapter.load_outbound_for_day(DAY, WAREHOUSE, registry=registry)
+        assert bool(result["blockers"]) is blocked
+        if blocked:
+            assert result["blockers"][0]["code"] == "factual_outbound_operational_date_missing_or_invalid"
+
+
+def test_operational_factual_outbound_requires_matching_model_binding():
+    assert app.factual_outbound_binding_blockers({"factual_warehouse_binding": WAREHOUSE}, WAREHOUSE) == []
+    assert app.factual_outbound_binding_blockers({"factual_warehouse_binding": WAREHOUSE}, "Другой")[0]["code"] == \
+        "mutable_placement_warehouse_binding_mismatch"
+    assert app.factual_outbound_binding_blockers({}, WAREHOUSE)[0]["code"] == \
+        "mutable_placement_warehouse_binding_required"
+
+
+def test_medium_light_is_in_visible_receipt_total():
+    summary = app._receipt_zone_summary([{"calculated_zone": "medium_light"}])
+    assert sum(summary.values()) == 1
+    assert app._receipt_visible_medium_light_total(summary) == 1
 
 
 def test_outbound_picking_factual_path_is_fail_closed_in_source():
