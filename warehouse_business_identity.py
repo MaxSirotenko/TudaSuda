@@ -19,6 +19,35 @@ def normalize_warehouse(value: Any) -> str:
     return normalize_business_text(value)
 
 
+# Source scopes remain exact and separate.  Physical equivalence is a different
+# contract used only when deciding whether one mutable physical placement may be
+# consumed by an operational source scope.  Add aliases only after the business
+# relation has been explicitly confirmed.
+PHYSICAL_WAREHOUSE_GROUPS = {
+    "veshki_frov": frozenset({
+        normalize_warehouse("Овощи Фрукты"),
+        normalize_warehouse("Комплектация Овощи Фрукты"),
+    }),
+}
+_PHYSICAL_WAREHOUSE_BY_SOURCE = {
+    source_scope: physical_key
+    for physical_key, source_scopes in PHYSICAL_WAREHOUSE_GROUPS.items()
+    for source_scope in source_scopes
+}
+
+
+def physical_warehouse_key(value: Any) -> str:
+    """Resolve a confirmed physical warehouse without changing source scope identity."""
+    source_scope = normalize_warehouse(value)
+    return _PHYSICAL_WAREHOUSE_BY_SOURCE.get(source_scope, source_scope)
+
+
+def same_physical_warehouse(left: Any, right: Any) -> bool:
+    """Compare confirmed physical scope while keeping factual source filtering exact."""
+    left_key, right_key = physical_warehouse_key(left), physical_warehouse_key(right)
+    return bool(left_key and right_key and left_key == right_key)
+
+
 def normalize_unit_name(value: Any) -> str | None:
     value = normalize_business_text(value)
     return CANONICAL_BOX_UNIT if value in {"короб", "короба", "коробов"} else None
