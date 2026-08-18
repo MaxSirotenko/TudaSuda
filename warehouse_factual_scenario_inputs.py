@@ -91,6 +91,12 @@ def _lifecycle_blockers(registry: Mapping[str, Any]) -> list[dict[str, Any]]:
     return blockers
 
 
+def _has_line_identity(value: Any) -> bool:
+    if value is None or isinstance(value, bool):
+        return False
+    return not (isinstance(value, str) and not value.strip())
+
+
 def load_outbound_for_day(operational_date: Any, warehouse: Any, *, registry: Mapping[str, Any] | None = None,
                           root: Path = DATA_ROOT) -> dict[str, Any]:
     """Adapt canonical box demand; outbound pick order is optional evidence."""
@@ -128,6 +134,10 @@ def load_outbound_for_day(operational_date: Any, warehouse: Any, *, registry: Ma
                 quantity_blockers.append({"code": "factual_outbound_sku_identity_missing",
                     "dataset_id": factual.get("dataset_id"), "source_row": factual.get("source_row")})
                 continue
+            line_number = factual.get("line_number")
+            if not _has_line_identity(line_number):
+                quantity_blockers.append({"code": "factual_outbound_line_identity_missing",
+                    "dataset_id": factual.get("dataset_id"), "source_row": factual.get("source_row")})
             quantity = factual.get("quantity"); reason = None
             if quantity is None: reason = "factual_outbound_quantity_missing"
             elif isinstance(quantity, bool) or not isinstance(quantity, (int, float)): reason = "factual_outbound_quantity_invalid"
@@ -151,7 +161,7 @@ def load_outbound_for_day(operational_date: Any, warehouse: Any, *, registry: Ma
                 "created_at": created, "warehouse": factual.get("warehouse"), "nomenclature": factual.get("nomenclature"),
                 "characteristic": factual.get("characteristic"), "sku_key": factual.get("sku_key"),
                 "qty_units": None if reason else int(quantity), "calculated_box_qty": quantity,
-                "unit_name": "короб", "line_number": factual.get("line_number"), "pick_order": pick_order,
+                "unit_name": "короб", "line_number": line_number, "pick_order": pick_order,
                 "quantity_validation_reason": reason or "",
                 "pick_order_validation_reason": "" if pick_order_valid else "optional_source_pick_order_invalid",
                 "route_sequence_authoritative": False, "route_sequence_source": "unresolved",
@@ -326,6 +336,23 @@ def load_receipts_for_day(operational_date: Any, warehouse: Any, **kwargs: Any) 
         result["blockers"] = [*result["blockers"], *source_blockers]
         result["authoritative"] = False
     completed = {id(row): normalize_receipt_boolean(row.get("terminal_completed")) for row in result["rows"]}
+    completion_by_document: dict[str, set[bool | None]] = {}
+    rows_by_document: dict[str, list[Mapping[str, Any]]] = {}
+    for row in result["rows"]:
+        document_ref = str(row.get("document_ref") or "").strip()
+        if not document_ref:
+            continue
+        completion_by_document.setdefault(document_ref, set()).add(completed[id(row)])
+        rows_by_document.setdefault(document_ref, []).append(row)
+    inconsistent_documents = [document_ref for document_ref, values in completion_by_document.items() if len(values) > 1]
+    if inconsistent_documents:
+        evidence = [{"document_ref": document_ref,
+                     "source_rows": [row.get("source_row") for row in rows_by_document[document_ref][:20]]}
+                    for document_ref in inconsistent_documents[:20]]
+        result["blockers"] = [*result["blockers"], {
+            "code": "factual_receipt_terminal_completion_inconsistent",
+            "documents": len(inconsistent_documents), "evidence": evidence}]
+        result["authoritative"] = False
     invalid = [row for row in result["rows"] if completed[id(row)] is True and
         (isinstance(row.get("box_quantity"), bool) or not isinstance(row.get("box_quantity"), (int, float))
          or row.get("box_quantity") <= 0 or not float(row.get("box_quantity")).is_integer())]
