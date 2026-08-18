@@ -139,7 +139,7 @@ def resolve_factual_route_order(candidates: list[Mapping[str, Any]], *,
     """Shared one-day/monthly authority for factual SKU source and pick order."""
     factual_cells = sorted({str(r.get("source_cell") or r.get("cell")) for r in candidates})
     resolved = sorted({str(r.get("resolved_geometry_cell_key")) for r in candidates if r.get("resolved_geometry_cell_key")})
-    raw_orders = [r.get("cell_picking_order") for r in candidates if r.get("cell_picking_order") is not None]
+    raw_orders = [r.get("cell_picking_order") for r in candidates]
     valid_orders = [value for value in raw_orders if isinstance(value, (int, float)) and not isinstance(value, bool)
                     and float(value).is_integer() and value >= 0]
     orders = set(valid_orders)
