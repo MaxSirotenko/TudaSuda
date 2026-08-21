@@ -125,7 +125,7 @@ def detect_day_receipts_columns(table: pd.DataFrame) -> dict[str, str | None]:
     return {field: _find_column(columns, canonical, ALIASES.get(field, [])) for field, canonical in FIELDS.items()}
 
 
-def _bool(value: Any) -> bool | None:
+def normalize_receipt_boolean(value: Any) -> bool | None:
     if isinstance(value, bool):
         return value
     if isinstance(value, int) and not isinstance(value, bool):
@@ -139,6 +139,9 @@ def _bool(value: Any) -> bool | None:
     if text in {"0", "нет", "ложь", "false", "no"}:
         return False
     return None
+
+
+_bool = normalize_receipt_boolean
 
 
 def _box_qty(value: Any) -> tuple[int | None, str | None]:

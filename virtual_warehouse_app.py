@@ -108,7 +108,7 @@ from warehouse_receipts import (
     save_receipts_state,
     zone_classification_settings_hash,
 )
-from warehouse_factual_data import load_effective_rows, load_registry
+from warehouse_factual_data import ensure_compact_scope_indexes, load_effective_rows, load_registry
 from warehouse_weight_rules import (
     WEIGHT_CLASSES, WEIGHT_CLASS_LABELS, load_weight_rules, save_weight_rules,
 )
@@ -151,8 +151,11 @@ from warehouse_outbound_orders import (
     save_outbound_execution_log,
     save_outbound_execution_state,
     save_outbound_orders,
+    scope_outbound_execution_view,
     summarize_outbound_orders,
 )
+from warehouse_business_identity import normalize_warehouse, same_physical_warehouse
+from warehouse_placement_zones import get_placement_zone_label
 from warehouse_state_cache import (
     load_outbound_execution_log_cached,
     load_outbound_execution_state_cached,
@@ -265,7 +268,10 @@ def render_data_revisions(model: dict | object | None) -> None:
     st.caption(f"Причина: {change.get('reason') or '—'}")
     st.caption(f"Домены последней операции: {', '.join(change.get('domains', [])) or '—'}")
 
-WEIGHT_ZONE_LABELS = {"heavy": "Тяжёлое", "medium": "Среднее", "light": "Лёгкое", "fragile": "Хрупкое", "unassigned": "Не назначено"}
+WEIGHT_ZONE_LABELS = {
+    zone: get_placement_zone_label(zone)
+    for zone in ("heavy", "medium", "medium_light", "light", "fragile", "unassigned")
+}
 WEIGHT_ZONE_VALUES = list(WEIGHT_ZONE_LABELS)
 WEIGHT_ZONE_LABEL_TO_VALUE = {label: value for value, label in WEIGHT_ZONE_LABELS.items()}
 STORAGE_TYPE_LABELS = {"normal": "Обычная", "deep_lane": "Набивная"}
@@ -1008,13 +1014,64 @@ def _receipt_dataframe(receipts: list[dict]) -> pd.DataFrame:
 
 
 def _receipt_zone_summary(receipts: list[dict]) -> dict[str, int]:
-    summary = {"heavy": 0, "medium": 0, "light": 0, "fragile": 0, "unclassified": 0}
+    summary = {"heavy": 0, "medium_light": 0, "medium": 0, "light": 0, "fragile": 0, "unclassified": 0}
     for receipt in receipts:
         weight_class = str(receipt.get("calculated_zone") or receipt.get("weight_class") or "unclassified")
         if weight_class not in summary:
             weight_class = "unclassified"
         summary[weight_class] += 1
     return summary
+
+
+def _receipt_visible_medium_light_total(summary: dict[str, int]) -> int:
+    return summary.get("medium", 0) + summary.get("medium_light", 0) + summary.get("light", 0)
+
+
+def factual_outbound_binding_blockers(model: dict, selected_warehouse: object) -> list[dict]:
+    selected = normalize_warehouse(selected_warehouse)
+    binding = normalize_warehouse(model.get("factual_warehouse_binding"))
+    if binding:
+        if same_physical_warehouse(binding, selected):
+            return []
+        return [{
+            "code": "mutable_placement_warehouse_binding_mismatch",
+            "binding": binding,
+            "selected_warehouse": selected or None,
+            "discovered_scopes": [binding],
+        }]
+
+    placement_state, _placement_warning = load_placement_state_cached(model)
+    discovered_scopes: list[str] = []
+    for placement in placement_state.get("placements", []):
+        source = placement.get("source")
+        is_factual = placement.get("source_authority") == "factual" or (
+            isinstance(source, str) and source.startswith("factual_")
+        )
+        if not is_factual:
+            continue
+        scope = normalize_warehouse(
+            placement.get("source_warehouse")
+            or placement.get("normalized_warehouse")
+            or placement.get("warehouse")
+        )
+        if scope and scope not in discovered_scopes:
+            discovered_scopes.append(scope)
+
+    if not discovered_scopes:
+        return [{
+            "code": "mutable_placement_warehouse_binding_required",
+            "binding": None,
+            "selected_warehouse": selected or None,
+            "discovered_scopes": [],
+        }]
+    if all(same_physical_warehouse(scope, selected) for scope in discovered_scopes):
+        return []
+    return [{
+        "code": "mutable_placement_warehouse_binding_mismatch",
+        "binding": None,
+        "selected_warehouse": selected or None,
+        "discovered_scopes": discovered_scopes,
+    }]
 
 
 def _zone_calculation_dataframe(receipts: list[dict]) -> pd.DataFrame:
@@ -1105,9 +1162,36 @@ def _render_receipt_placement_diagnostics(diag: dict | None) -> None:
 
 def render_receipts_section(model: dict) -> None:
     st.subheader("Приходы")
-    state, state_warning = load_receipts_state_cached(model)
-    if state_warning:
-        st.warning(state_warning)
+    from warehouse_factual_scenario_inputs import (
+        available_source_dates, available_warehouses, build_factual_weight_classifications,
+    )
+    with st.spinner("Однократная подготовка индекса складов factual receipts…"):
+        registry = ensure_compact_scope_indexes(load_registry(), source_types=("receipts",))
+    factual_warehouses = available_warehouses(source_types=("receipts",), registry=registry)
+    source_mode = st.radio("Источник приходов", ["Factual Data Layer", "Ручной fallback"],
+                           horizontal=True, key="receipt_source_mode")
+    state_warning = None
+    if source_mode == "Factual Data Layer":
+        selected_warehouse = st.selectbox("Склад приходов", factual_warehouses,
+            key="receipt_factual_warehouse") if factual_warehouses else None
+        receipt_dates = available_source_dates("receipts", warehouse=selected_warehouse, registry=registry)
+        selected_date = st.selectbox("Операционный день приходов", receipt_dates,
+            key="receipt_factual_day") if receipt_dates else None
+        factual = (build_factual_weight_classifications(selected_date, selected_warehouse, registry=registry)
+                   if selected_date and selected_warehouse else
+                   {"rows": [], "diagnostics": {}, "blockers": [{"code": "factual_receipts_scope_not_selected"}]})
+        state = {"model_id": model.get("model_id"), "source_file_name": "Factual Data Layer",
+                 "created_at": "effective view", "receipts": factual["rows"],
+                 "diagnostics": build_receipt_diagnostics(factual["rows"], len(factual["rows"])),
+                 "zone_classification_diagnostics": factual["diagnostics"],
+                 "zone_classification_settings": {"weight_bands": load_weight_rules().get("bands", {})},
+                 "source_authority": "factual"}
+        st.success("Источник данных: ✅ factual receipts + factual VGH")
+        if factual["blockers"]: st.warning(f"Диагностика factual source: {factual['blockers']}")
+    else:
+        state, state_warning = load_receipts_state_cached(model)
+        st.warning("Источник данных: ⚠ ручной/legacy fallback выбран явно.")
+        if state_warning: st.warning(state_warning)
     receipts = state.get("receipts", [])
     diagnostics = state.get("diagnostics", {})
     if receipts:
@@ -1128,69 +1212,72 @@ def render_receipts_section(model: dict) -> None:
     upload_tab, data_tab, diag_tab = st.tabs(["Загрузка приходов", "Приходы к размещению", "Диагностика приходов"])
 
     with upload_tab:
-        st.caption("Загрузите Excel с приходами и проверьте соответствие колонок. После загрузки приходы сохраняются как отдельный слой данных.")
-        receipt_file = st.file_uploader("Загрузить Excel с приходами", type=["xlsx"], key="receipt_upload")
-        replace_current = st.checkbox("Заменить текущие загруженные приходы", value=True, key="receipt_replace_current")
-        if receipt_file is not None:
-            receipt_bytes = receipt_file.getvalue()
-            receipt_hash = file_hash(receipt_bytes)
-            sheet_names = get_receipt_sheet_names(receipt_bytes)
-            sheet_name = st.selectbox("Выбрать лист", sheet_names, key="receipt_sheet")
-            header_rows = st.radio("Строк заголовка приходов", [1, 2], index=0, horizontal=True, key="receipt_header_rows")
-            receipt_df = read_receipt_table_cached(receipt_bytes, receipt_hash, sheet_name, header_rows)
-            with st.expander("Предпросмотр", expanded=False):
-                st.dataframe(receipt_df.head(30), use_container_width=True)
-            detected = detect_receipt_columns(receipt_df)
-            columns = optional_receipt_column_options(list(receipt_df.columns))
-            st.caption("Обязательные поля отмечены *. Для необязательных полей можно выбрать «— Не указано —».")
-            c1, c2, c3, c4, c5 = st.columns(5)
-            c6, c7, c8, c9, c10 = st.columns(5)
-            c11, c12, c13, c14, c15 = st.columns(5)
-            zone_detected = detect_zone_classification_columns(receipt_df)
-            mapping = {
-                "sku_code": c1.selectbox("Код товара *", columns, index=optional_receipt_column_index(columns, detected["sku_code"]), format_func=format_receipt_column_option, key="receipt_map_sku"),
-                "sku_name": c2.selectbox("Наименование *", columns, index=optional_receipt_column_index(columns, detected["sku_name"]), format_func=format_receipt_column_option, key="receipt_map_name"),
-                "qty_pallets": c3.selectbox("Количество паллет *", columns, index=optional_receipt_column_index(columns, detected["qty_pallets"]), format_func=format_receipt_column_option, key="receipt_map_pallets"),
-                "qty_boxes": c4.selectbox("Количество коробов", columns, index=columns.index(detected["qty_boxes"]) if detected["qty_boxes"] in columns else 0, format_func=format_receipt_column_option, key="receipt_map_boxes"),
-                "qty_units": c5.selectbox("Базовое количество", columns, index=columns.index(detected["qty_units"]) if detected["qty_units"] in columns else 0, format_func=format_receipt_column_option, key="receipt_map_units"),
-                "receipt_date": c6.selectbox("Дата прихода", columns, index=columns.index(detected["receipt_date"]) if detected["receipt_date"] in columns else 0, format_func=format_receipt_column_option, key="receipt_map_date"),
-                "receipt_number": c7.selectbox("Номер документа", columns, index=columns.index(detected["receipt_number"]) if detected["receipt_number"] in columns else 0, format_func=format_receipt_column_option, key="receipt_map_number"),
-                "receipt_document": c8.selectbox("Документ прихода", columns, index=columns.index(detected["receipt_document"]) if detected["receipt_document"] in columns else 0, format_func=format_receipt_column_option, key="receipt_map_document"),
-                "warehouse": c9.selectbox("Склад", columns, index=columns.index(detected["warehouse"]) if detected["warehouse"] in columns else 0, format_func=format_receipt_column_option, key="receipt_map_warehouse"),
-                "warehouse_zone": c10.selectbox("Складская зона", columns, index=columns.index(detected["warehouse_zone"]) if detected["warehouse_zone"] in columns else 0, format_func=format_receipt_column_option, key="receipt_map_zone"),
-                "characteristic_code": c11.selectbox("Код характеристики", columns, index=columns.index(detected["characteristic_code"]) if detected["characteristic_code"] in columns else 0, format_func=format_receipt_column_option, key="receipt_map_char_code"),
-                "characteristic_name": c12.selectbox("Характеристика", columns, index=columns.index(detected["characteristic_name"]) if detected["characteristic_name"] in columns else 0, format_func=format_receipt_column_option, key="receipt_map_char_name"),
-                "batch": c13.selectbox("Партия", columns, index=columns.index(detected["batch"]) if detected["batch"] in columns else 0, format_func=format_receipt_column_option, key="receipt_map_batch"),
-                "expiry_date": c14.selectbox("Срок годности", columns, index=columns.index(detected["expiry_date"]) if detected["expiry_date"] in columns else 0, format_func=format_receipt_column_option, key="receipt_map_expiry"),
-                "comment": c15.selectbox("Комментарий", columns, index=columns.index(detected["comment"]) if detected["comment"] in columns else 0, format_func=format_receipt_column_option, key="receipt_map_comment"),
-                "weight_class": None,
-            }
-            # Every selector below maps optional receipt metadata.  The shared
-            # options list and formatter make its None value visible instead of
-            # coercing an undetected field to the first Excel column.
-            st.subheader("Правила определения зоны товара")
-            st.caption("Используются только подтверждённые весовые диапазоны и явная зона источника; неподтверждённые веса остаются без зоны.")
-            zc1, zc2, zc3 = st.columns(3)
-            mapping["source_weight"] = zc1.selectbox("Вес товара — необязательно", columns, index=optional_receipt_column_index(columns, zone_detected["weight_column"]), format_func=format_receipt_column_option, help="Используется для определения весовой зоны SKU, если зона не подтверждена другим источником.", key="receipt_map_source_weight")
-            mapping["fragile_flag"] = zc2.selectbox("Признак хрупкости — необязательно", columns, index=optional_receipt_column_index(columns, zone_detected["fragile_column"]), format_func=format_receipt_column_option, key="receipt_map_fragile_flag")
-            mapping["source_zone"] = zc3.selectbox("Исходная зона — необязательно", columns, index=optional_receipt_column_index(columns, zone_detected["source_zone_column"]), format_func=format_receipt_column_option, key="receipt_map_source_zone")
-            zone_settings = default_zone_classification_settings()
-            zone_settings.update({"weight_column": mapping.get("source_weight"), "fragile_column": mapping.get("fragile_flag"), "source_zone_column": mapping.get("source_zone")})
-            normalized_receipts, receipt_diagnostics, receipt_messages = normalize_receipt_table_cached(receipt_df.to_json(orient="split", force_ascii=False), json.dumps(mapping, ensure_ascii=False))
-            if receipt_messages:
-                st.dataframe(pd.DataFrame(receipt_messages), use_container_width=True)
-            if st.button("Загрузить приходы", type="primary", key="receipt_import_button"):
-                if any(item.get("level") == "error" for item in receipt_messages):
-                    st.error("Исправьте обязательные колонки или ошибки данных перед загрузкой приходов.")
-                elif not replace_current and receipts:
-                    st.error("Подтвердите замену текущих загруженных приходов или очистите их вручную.")
-                else:
-                    new_state = make_receipts_state(model, receipt_file.name, receipt_hash, normalized_receipts, receipt_diagnostics, mapping, zone_settings)
-                    save_receipts_state(new_state)
-                    if not update_data_revisions(model, ["receipts"], "save_receipts"):
-                        return
-                    st.success("Приходы загружены и сохранены. Все строки имеют статус ‘Не размещено’.")
-                    st.rerun()
+        if source_mode != "Ручной fallback":
+            st.info("Ручная загрузка доступна только после явного выбора «Ручной fallback».")
+        else:
+            st.caption("Загрузите Excel с приходами и проверьте соответствие колонок. После загрузки приходы сохраняются как отдельный слой данных.")
+            receipt_file = st.file_uploader("Загрузить Excel с приходами", type=["xlsx"], key="receipt_upload")
+            replace_current = st.checkbox("Заменить текущие загруженные приходы", value=True, key="receipt_replace_current")
+            if receipt_file is not None:
+                receipt_bytes = receipt_file.getvalue()
+                receipt_hash = file_hash(receipt_bytes)
+                sheet_names = get_receipt_sheet_names(receipt_bytes)
+                sheet_name = st.selectbox("Выбрать лист", sheet_names, key="receipt_sheet")
+                header_rows = st.radio("Строк заголовка приходов", [1, 2], index=0, horizontal=True, key="receipt_header_rows")
+                receipt_df = read_receipt_table_cached(receipt_bytes, receipt_hash, sheet_name, header_rows)
+                with st.expander("Предпросмотр", expanded=False):
+                    st.dataframe(receipt_df.head(30), use_container_width=True)
+                detected = detect_receipt_columns(receipt_df)
+                columns = optional_receipt_column_options(list(receipt_df.columns))
+                st.caption("Обязательные поля отмечены *. Для необязательных полей можно выбрать «— Не указано —».")
+                c1, c2, c3, c4, c5 = st.columns(5)
+                c6, c7, c8, c9, c10 = st.columns(5)
+                c11, c12, c13, c14, c15 = st.columns(5)
+                zone_detected = detect_zone_classification_columns(receipt_df)
+                mapping = {
+                    "sku_code": c1.selectbox("Код товара *", columns, index=optional_receipt_column_index(columns, detected["sku_code"]), format_func=format_receipt_column_option, key="receipt_map_sku"),
+                    "sku_name": c2.selectbox("Наименование *", columns, index=optional_receipt_column_index(columns, detected["sku_name"]), format_func=format_receipt_column_option, key="receipt_map_name"),
+                    "qty_pallets": c3.selectbox("Количество паллет *", columns, index=optional_receipt_column_index(columns, detected["qty_pallets"]), format_func=format_receipt_column_option, key="receipt_map_pallets"),
+                    "qty_boxes": c4.selectbox("Количество коробов", columns, index=columns.index(detected["qty_boxes"]) if detected["qty_boxes"] in columns else 0, format_func=format_receipt_column_option, key="receipt_map_boxes"),
+                    "qty_units": c5.selectbox("Базовое количество", columns, index=columns.index(detected["qty_units"]) if detected["qty_units"] in columns else 0, format_func=format_receipt_column_option, key="receipt_map_units"),
+                    "receipt_date": c6.selectbox("Дата прихода", columns, index=columns.index(detected["receipt_date"]) if detected["receipt_date"] in columns else 0, format_func=format_receipt_column_option, key="receipt_map_date"),
+                    "receipt_number": c7.selectbox("Номер документа", columns, index=columns.index(detected["receipt_number"]) if detected["receipt_number"] in columns else 0, format_func=format_receipt_column_option, key="receipt_map_number"),
+                    "receipt_document": c8.selectbox("Документ прихода", columns, index=columns.index(detected["receipt_document"]) if detected["receipt_document"] in columns else 0, format_func=format_receipt_column_option, key="receipt_map_document"),
+                    "warehouse": c9.selectbox("Склад", columns, index=columns.index(detected["warehouse"]) if detected["warehouse"] in columns else 0, format_func=format_receipt_column_option, key="receipt_map_warehouse"),
+                    "warehouse_zone": c10.selectbox("Складская зона", columns, index=columns.index(detected["warehouse_zone"]) if detected["warehouse_zone"] in columns else 0, format_func=format_receipt_column_option, key="receipt_map_zone"),
+                    "characteristic_code": c11.selectbox("Код характеристики", columns, index=columns.index(detected["characteristic_code"]) if detected["characteristic_code"] in columns else 0, format_func=format_receipt_column_option, key="receipt_map_char_code"),
+                    "characteristic_name": c12.selectbox("Характеристика", columns, index=columns.index(detected["characteristic_name"]) if detected["characteristic_name"] in columns else 0, format_func=format_receipt_column_option, key="receipt_map_char_name"),
+                    "batch": c13.selectbox("Партия", columns, index=columns.index(detected["batch"]) if detected["batch"] in columns else 0, format_func=format_receipt_column_option, key="receipt_map_batch"),
+                    "expiry_date": c14.selectbox("Срок годности", columns, index=columns.index(detected["expiry_date"]) if detected["expiry_date"] in columns else 0, format_func=format_receipt_column_option, key="receipt_map_expiry"),
+                    "comment": c15.selectbox("Комментарий", columns, index=columns.index(detected["comment"]) if detected["comment"] in columns else 0, format_func=format_receipt_column_option, key="receipt_map_comment"),
+                    "weight_class": None,
+                }
+                # Every selector below maps optional receipt metadata.  The shared
+                # options list and formatter make its None value visible instead of
+                # coercing an undetected field to the first Excel column.
+                st.subheader("Правила определения зоны товара")
+                st.caption("Используются только подтверждённые весовые диапазоны и явная зона источника; неподтверждённые веса остаются без зоны.")
+                zc1, zc2, zc3 = st.columns(3)
+                mapping["source_weight"] = zc1.selectbox("Вес товара — необязательно", columns, index=optional_receipt_column_index(columns, zone_detected["weight_column"]), format_func=format_receipt_column_option, help="Используется для определения весовой зоны SKU, если зона не подтверждена другим источником.", key="receipt_map_source_weight")
+                mapping["fragile_flag"] = zc2.selectbox("Признак хрупкости — необязательно", columns, index=optional_receipt_column_index(columns, zone_detected["fragile_column"]), format_func=format_receipt_column_option, key="receipt_map_fragile_flag")
+                mapping["source_zone"] = zc3.selectbox("Исходная зона — необязательно", columns, index=optional_receipt_column_index(columns, zone_detected["source_zone_column"]), format_func=format_receipt_column_option, key="receipt_map_source_zone")
+                zone_settings = default_zone_classification_settings()
+                zone_settings.update({"weight_column": mapping.get("source_weight"), "fragile_column": mapping.get("fragile_flag"), "source_zone_column": mapping.get("source_zone")})
+                normalized_receipts, receipt_diagnostics, receipt_messages = normalize_receipt_table_cached(receipt_df.to_json(orient="split", force_ascii=False), json.dumps(mapping, ensure_ascii=False))
+                if receipt_messages:
+                    st.dataframe(pd.DataFrame(receipt_messages), use_container_width=True)
+                if st.button("Загрузить приходы", type="primary", key="receipt_import_button"):
+                    if any(item.get("level") == "error" for item in receipt_messages):
+                        st.error("Исправьте обязательные колонки или ошибки данных перед загрузкой приходов.")
+                    elif not replace_current and receipts:
+                        st.error("Подтвердите замену текущих загруженных приходов или очистите их вручную.")
+                    else:
+                        new_state = make_receipts_state(model, receipt_file.name, receipt_hash, normalized_receipts, receipt_diagnostics, mapping, zone_settings)
+                        save_receipts_state(new_state)
+                        if not update_data_revisions(model, ["receipts"], "save_receipts"):
+                            return
+                        st.success("Приходы загружены и сохранены. Все строки имеют статус ‘Не размещено’.")
+                        st.rerun()
 
     with data_tab:
         if not receipts:
@@ -1239,23 +1326,28 @@ def render_receipts_section(model: dict) -> None:
             if saved_settings_hash and saved_settings_hash != current_settings_hash:
                 st.warning("Источники классификации изменились. Пересчитайте зоны товаров.")
             if st.button("Рассчитать зоны товаров", key="receipt_zone_calculate_button"):
-                state, state_warning = load_receipts_state(model)
-                if state_warning:
-                    st.warning(state_warning)
-                vgh_view = load_effective_rows("vgh", registry=load_registry(), strict=False)
-                updated_receipts, zone_diag = calculate_receipt_zones(
-                    state.get("receipts", []), current_zone_settings, vgh_view.get("rows", []))
+                if source_mode == "Factual Data Layer":
+                    factual = build_factual_weight_classifications(
+                        selected_date, selected_warehouse, registry=registry,
+                        rules={"bands": current_zone_settings.get("weight_bands", {})})
+                    updated_receipts, zone_diag = factual["rows"], factual["diagnostics"]
+                else:
+                    state, state_warning = load_receipts_state(model)
+                    if state_warning: st.warning(state_warning)
+                    vgh_view = load_effective_rows("vgh", registry=registry, strict=False)
+                    updated_receipts, zone_diag = calculate_receipt_zones(
+                        state.get("receipts", []), current_zone_settings, vgh_view.get("rows", []))
                 current_zone_settings["settings_hash"] = zone_diag.get("settings_hash", current_settings_hash)
                 current_zone_settings["calculated_at"] = pd.Timestamp.now(tz="UTC").isoformat()
                 state["receipts"] = updated_receipts
                 state["zone_classification_settings"] = current_zone_settings
                 state["zone_classification_diagnostics"] = zone_diag
                 state["diagnostics"] = build_receipt_diagnostics(updated_receipts, len(updated_receipts))
-                save_receipts_state(state)
-                if not update_data_revisions(model, ["receipts"], "calculate_receipt_zones"):
-                    return
+                if source_mode != "Factual Data Layer":
+                    save_receipts_state(state)
+                    if not update_data_revisions(model, ["receipts"], "calculate_receipt_zones"): return
                 st.success("Вес обогащён из ВГХ и весовые категории рассчитаны для доступных SKU.")
-                st.rerun()
+                if source_mode != "Factual Data Layer": st.rerun()
             _render_zone_classification_result(state)
             receipts = state.get("receipts", [])
             zone_summary = _receipt_zone_summary(receipts)
@@ -1264,7 +1356,7 @@ def render_receipts_section(model: dict) -> None:
             z1.metric("С зоной", classified)
             z2.metric("Без зоны", zone_summary.get("unclassified", 0))
             z3.metric("Тяжёлое", zone_summary.get("heavy", 0))
-            z4.metric("Среднее/лёгкое", zone_summary.get("medium", 0) + zone_summary.get("light", 0))
+            z4.metric("Среднее/лёгкое", _receipt_visible_medium_light_total(zone_summary))
             z5.metric("Хрупкое", zone_summary.get("fragile", 0))
             if classified == 0 and not rules.get("bands"):
                 st.info(f"Вес найден для {zone_diagnostics.get('Вес найден', 0)} SKU, но диапазоны весовых категорий ещё не настроены.")
@@ -1285,9 +1377,12 @@ def render_receipts_section(model: dict) -> None:
                 placement_state, placement_warning = load_placement_state(model)
                 if placement_warning:
                     st.warning(placement_warning)
-                state, state_warning = load_receipts_state(model)
-                if state_warning:
-                    st.warning(state_warning)
+                if source_mode == "Ручной fallback":
+                    state, state_warning = load_receipts_state(model)
+                    if state_warning: st.warning(state_warning)
+                if source_mode == "Factual Data Layer":
+                    state = {**state, "receipts": [row for row in state.get("receipts", [])
+                                                   if row.get("placement_eligible") is True]}
                 model = apply_active_boundaries_to_model(model)
                 save_geometry_model(model)
                 save_pre_placement_snapshot(model, placement_state, state, trigger="receipt_placement")
@@ -1349,65 +1444,97 @@ def _current_warehouse_state(model: dict) -> None:
 
 
 def render_outbound_picking(model: dict) -> None:
+    from warehouse_factual_scenario_inputs import (
+        available_source_dates, available_warehouses, load_outbound_for_day,
+    )
     with measure_step("load_outbound_state"):
-        orders_state = load_outbound_orders_cached(model)
         execution_state = load_outbound_execution_state_cached(model)
         execution_log = load_outbound_execution_log_cached(model)
-    rows = orders_state.get("rows", [])
+    with st.spinner("Однократная подготовка индекса складов factual outbound…"):
+        registry = ensure_compact_scope_indexes(load_registry(), source_types=("outbound",))
+    source_mode = st.radio("Источник расходных ордеров", ["Factual Data Layer", "Ручной fallback"],
+                           horizontal=True, key="outbound_picking_source")
+    factual_ready = True
+    if source_mode == "Ручной fallback":
+        orders_state = load_outbound_orders_cached(model)
+        rows = orders_state.get("rows", [])
+    else:
+        rows = []
+    if source_mode == "Factual Data Layer":
+        warehouses = available_warehouses(source_types=("outbound",), registry=registry)
+        selected_warehouse = st.selectbox("Склад РО", warehouses, key="outbound_picking_warehouse") if warehouses else None
+        dates = available_source_dates("outbound", warehouse=selected_warehouse, registry=registry)
+        selected_day = st.selectbox("Операционный день РО", dates, key="outbound_picking_day") if dates else None
+        factual = (load_outbound_for_day(selected_day, selected_warehouse, registry=registry)
+                   if selected_day and selected_warehouse else {"rows": [], "blockers": []})
+        binding_blockers = factual_outbound_binding_blockers(model, selected_warehouse)
+        factual["blockers"] = [*factual.get("blockers", []), *binding_blockers]
+        factual_ready = bool(factual.get("authoritative")) and not factual.get("blockers")
+        rows = factual["rows"] if factual_ready else []
+        st.success("Источник demand: ✅ factual outbound · исполнение: текущее mutable placement")
+        if factual.get("blockers"): st.error(f"Диагностика factual source: {factual['blockers']}")
+    else:
+        st.warning("Источник данных: ⚠ ручной/legacy fallback выбран явно.")
     st.caption("Сборка выполняется последовательно в целых qty_units. Вес, масса и весовые коэффициенты не используются.")
-    uploaded = st.file_uploader("Excel с расходными ордерами", type=["xlsx"], key="outbound_orders_upload")
-    if uploaded is not None:
-        file_bytes = uploaded.getvalue()
-        sheet_names = get_outbound_sheet_names(file_bytes)
-        sheet_name = st.selectbox("Лист с расходными ордерами", sheet_names, key="outbound_sheet")
-        header_rows = st.radio("Строк заголовка РО", [1, 2], horizontal=True, key="outbound_header_rows")
-        source_table = read_outbound_table(file_bytes, sheet_name, header_rows)
-        detected = detect_outbound_columns(source_table)
-        columns = [None, *source_table.columns.tolist()]
-        mapping: dict[str, str | None] = {}
-        labels = {
-            "outbound_order_number": "Номер РО",
-            "created_at": "Дата создания",
-            "nomenclature": "Номенклатура",
-            "characteristic": "Характеристика",
-            "qty_units": "Количество юнитов",
-            "unit_name": "Единица измерения",
-            "warehouse": "Склад",
-        }
-        mapping_columns = st.columns(4)
-        for index, (field, label) in enumerate(labels.items()):
-            detected_column = detected.get(field)
-            mapping[field] = mapping_columns[index % 4].selectbox(
-                label,
-                columns,
-                index=columns.index(detected_column) if detected_column in columns else 0,
-                key=f"outbound_map_{field}",
-            )
-        normalized_rows, diagnostics = normalize_outbound_table(source_table, mapping)
-        with st.expander("Предпросмотр распознанных расходных ордеров"):
-            st.dataframe(pd.DataFrame(normalized_rows).head(200), use_container_width=True)
-            if diagnostics:
-                st.dataframe(pd.DataFrame(diagnostics), use_container_width=True)
-        if st.button("Загрузить расходные ордера", type="primary", key="outbound_save_upload"):
-            if any(item.get("level") == "error" for item in diagnostics):
-                st.error("Исправьте сопоставление обязательных колонок.")
-            else:
-                orders_state = {
-                    "model_id": model.get("model_id"),
-                    "loaded_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
-                    "source_file_name": uploaded.name,
-                    "source_file_hash": file_hash(file_bytes),
-                    "rows": normalized_rows,
-                }
-                save_outbound_orders(orders_state)
-                if not update_data_revisions(model, ["outbound"], "save_outbound_orders"):
-                    return
-                st.success(f"Загружено строк РО: {len(normalized_rows)}.")
-                st.rerun()
-
-    order_summary = summarize_outbound_orders(rows, execution_state)
+    if source_mode == "Ручной fallback":
+        uploaded = st.file_uploader("Excel с расходными ордерами", type=["xlsx"], key="outbound_orders_upload")
+        if uploaded is not None:
+            file_bytes = uploaded.getvalue()
+            sheet_names = get_outbound_sheet_names(file_bytes)
+            sheet_name = st.selectbox("Лист с расходными ордерами", sheet_names, key="outbound_sheet")
+            header_rows = st.radio("Строк заголовка РО", [1, 2], horizontal=True, key="outbound_header_rows")
+            source_table = read_outbound_table(file_bytes, sheet_name, header_rows)
+            detected = detect_outbound_columns(source_table)
+            columns = [None, *source_table.columns.tolist()]
+            mapping: dict[str, str | None] = {}
+            labels = {
+                "outbound_order_number": "Номер РО",
+                "created_at": "Дата создания",
+                "nomenclature": "Номенклатура",
+                "characteristic": "Характеристика",
+                "qty_units": "Количество юнитов",
+                "unit_name": "Единица измерения",
+                "warehouse": "Склад",
+            }
+            mapping_columns = st.columns(4)
+            for index, (field, label) in enumerate(labels.items()):
+                detected_column = detected.get(field)
+                mapping[field] = mapping_columns[index % 4].selectbox(
+                    label,
+                    columns,
+                    index=columns.index(detected_column) if detected_column in columns else 0,
+                    key=f"outbound_map_{field}",
+                )
+            normalized_rows, diagnostics = normalize_outbound_table(source_table, mapping)
+            with st.expander("Предпросмотр распознанных расходных ордеров"):
+                st.dataframe(pd.DataFrame(normalized_rows).head(200), use_container_width=True)
+                if diagnostics:
+                    st.dataframe(pd.DataFrame(diagnostics), use_container_width=True)
+            if st.button("Загрузить расходные ордера", type="primary", key="outbound_save_upload"):
+                if any(item.get("level") == "error" for item in diagnostics):
+                    st.error("Исправьте сопоставление обязательных колонок.")
+                else:
+                    orders_state = {
+                        "model_id": model.get("model_id"),
+                        "loaded_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+                        "source_file_name": uploaded.name,
+                        "source_file_hash": file_hash(file_bytes),
+                        "rows": normalized_rows,
+                    }
+                    save_outbound_orders(orders_state)
+                    if not update_data_revisions(model, ["outbound"], "save_outbound_orders"):
+                        return
+                    st.success(f"Загружено строк РО: {len(normalized_rows)}.")
+                    st.rerun()
+    display_execution_state, display_execution_log = ((scope_outbound_execution_view(rows, execution_state, execution_log))
+        if source_mode == "Factual Data Layer" else (execution_state, execution_log))
+    order_summary = summarize_outbound_orders(rows, display_execution_state)
     if not order_summary:
         st.info("Расходные ордера пока не загружены.")
+        if source_mode == "Factual Data Layer" and not factual_ready:
+            blocked_columns = st.columns(2)
+            blocked_columns[0].button("Собрать выбранные РО", disabled=True, key="outbound_execute_selected")
+            blocked_columns[1].button("Собрать все необработанные РО", disabled=True, key="outbound_execute_all")
         return
     st.markdown("**Расходные ордера**")
     st.dataframe(pd.DataFrame(order_summary), use_container_width=True, hide_index=True)
@@ -1417,7 +1544,6 @@ def render_outbound_picking(model: dict) -> None:
     selected_keys = [option_to_key[label] for label in selected_labels]
 
     def execute(keys: list[str]) -> None:
-        current_orders = load_outbound_orders(model)
         current_execution = load_outbound_execution_state(model)
         current_log = load_outbound_execution_log(model)
         placement_state, warning = load_placement_state(model)
@@ -1427,7 +1553,7 @@ def render_outbound_picking(model: dict) -> None:
         updated_placements, updated_execution, updated_log, summary = execute_outbound_orders(
             model,
             placement_state,
-            current_orders.get("rows", []),
+            rows,
             current_execution,
             current_log,
             keys,
@@ -1459,8 +1585,8 @@ def render_outbound_picking(model: dict) -> None:
         else:
             st.error(result["message"])
 
-    line_results = execution_state.get("line_results", [])
-    summary = outbound_execution_summary(rows, execution_state, line_results)
+    line_results = display_execution_state.get("line_results", [])
+    summary = outbound_execution_summary(rows, display_execution_state, line_results)
     metric_columns = st.columns(5)
     for index, (label, value) in enumerate(summary.items()):
         metric_columns[index % 5].metric(label, value)
@@ -1470,9 +1596,9 @@ def render_outbound_picking(model: dict) -> None:
         shortages = [item for item in line_results if int(item.get("shortage_units", 0) or 0) > 0 or item.get("line_status") not in {"completed"}]
         with st.expander("Дефицитные и отклонённые строки"):
             st.dataframe(pd.DataFrame(shortages), use_container_width=True)
-    if execution_log:
+    if display_execution_log:
         with st.expander("Журнал списаний по ячейкам"):
-            st.dataframe(pd.DataFrame(execution_log), use_container_width=True)
+            st.dataframe(pd.DataFrame(display_execution_log), use_container_width=True)
 
 
 @st.fragment

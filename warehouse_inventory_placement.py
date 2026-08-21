@@ -13,7 +13,11 @@ import pandas as pd
 from warehouse_persistence import read_json
 
 from warehouse_placement_diagnostics import placement_reason_text
-from warehouse_business_identity import canonical_sku_key
+from warehouse_business_identity import (
+    canonical_sku_key, normalize_warehouse, physical_warehouse_key, same_physical_warehouse,
+)
+from warehouse_placement_zones import (get_assignable_placement_zones, get_placement_zone_label,
+    is_assignable_placement_zone, normalize_placement_zone)
 
 PLACEMENTS_PATH = Path("data/last_import/placements.json")
 
@@ -26,8 +30,9 @@ ROW_ALIASES = ["ряд", "row", "row_number"]
 CELL_ALIASES = ["ячейка", "cell_number", "номер ячейки"]
 TIER_ALIASES = ["ярус", "tier"]
 WEIGHT_CLASS_ALIASES = ["weight_class", "weight_zone", "зона", "весоваякатегория", "весовая категория", "категориявеса", "зонаразмещения", "зона размещения"]
-WEIGHT_CLASS_LABELS = {"heavy": "Тяжёлое", "medium": "Среднее", "light": "Лёгкое", "fragile": "Хрупкое", "unclassified": "Не классифицировано"}
-WEIGHT_ZONE_LABELS = {"heavy": "Тяжёлое", "medium": "Среднее", "light": "Лёгкое", "fragile": "Хрупкое", "unassigned": "Не назначено"}
+WEIGHT_CLASS_LABELS = {zone: get_placement_zone_label(zone) for zone in ("heavy", "medium", "medium_light", "light", "fragile")}
+WEIGHT_CLASS_LABELS["unclassified"] = "Не классифицировано"
+WEIGHT_ZONE_LABELS = {**WEIGHT_CLASS_LABELS, "unassigned": "Не назначено"}
 OPTIONAL_ALIASES = {
     "expiry_date": ["дата срока годности", "срок годности", "expiry", "expiry_date"],
     "batch": ["партия", "batch"],
@@ -68,6 +73,8 @@ def normalize_weight_class(value: Any) -> str:
         return "heavy"
     if text in {"medium", "среднее", "средний"}:
         return "medium"
+    if text in {"medium_light", "mediumlight", "среднелегкое", "среднелегкий"}:
+        return "medium_light"
     if text in {"light", "легкое", "легкий"}:
         return "light"
     if text in {"fragile", "хрупкое", "хрупкий"}:
@@ -294,6 +301,8 @@ def _placement_record(row: dict[str, Any], cell: dict[str, Any], qty_pallets: fl
         "weight_zone": _display_value(cell.get("weight_zone")) or "unassigned",
         "occupied_capacity_pallets": qty_pallets,
         "source": source,
+        "source_authority": _display_value(row.get("source_authority")),
+        "source_warehouse": normalize_warehouse(row.get("source_warehouse") or row.get("warehouse")),
         "confidence": confidence,
         "placement_mode": placement_mode,
         "placement_status": "placed",
@@ -937,13 +946,14 @@ def _sku_weight_classes(items: list[dict[str, Any]]) -> tuple[dict[str, str], di
 def _row_zones(model: dict[str, Any]) -> dict[str, str]:
     zones = {}
     for row in model.get("rows", []):
-        zone = _display_value(row.get("weight_zone"))
-        zones[_display_value(row.get("row_number"))] = zone if zone in {"heavy", "medium", "light", "fragile"} else "unassigned"
+        zone = normalize_placement_zone(row.get("weight_zone"))
+        zones[_display_value(row.get("row_number"))] = zone if is_assignable_placement_zone(zone) else "unassigned"
     return zones
 
 
 def _zone_capacity(model: dict[str, Any], occupied: dict[str, float]) -> dict[str, float]:
-    free = {"heavy": 0.0, "medium": 0.0, "light": 0.0, "fragile": 0.0, "unassigned": 0.0}
+    free = {zone: 0.0 for zone in get_assignable_placement_zones()}
+    free["unassigned"] = 0.0
     for cell in model.get("cells", []):
         zone = _display_value(cell.get("weight_zone")) or "unassigned"
         if zone not in free:
@@ -975,6 +985,8 @@ def _unplaced_record(item: dict[str, Any], qty: float, reason: str, source: str,
         "weight_zone": weight_zone,
         "qty_pallets": round(qty, 4),
         "source": source,
+        "source_authority": _display_value(item.get("source_authority")),
+        "source_warehouse": normalize_warehouse(item.get("source_warehouse") or item.get("warehouse")),
         "placement_status": "not_placed",
         "placement_mode": "not_calculated",
         "unplaced_reason": reason,
@@ -1018,7 +1030,8 @@ def _same_item(a: dict[str, Any], b: dict[str, Any]) -> bool:
 
 
 def calculate_basic_weight_placement(model: dict[str, Any], state: dict[str, Any], receipts_state: dict[str, Any] | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
-    receipts = [dict(item) for item in (receipts_state or {}).get("receipts", [])]
+    receipts = [dict(item) for item in (receipts_state or {}).get("receipts", [])
+                if item.get("placement_eligible") is not False]
     for item in receipts:
         item.setdefault("source", "receipt")
         item["sku_key"] = _display_value(item.get("sku_key")) or make_sku_key(item)
@@ -1029,6 +1042,32 @@ def calculate_basic_weight_placement(model: dict[str, Any], state: dict[str, Any
         item["sku_key"] = _display_value(item.get("sku_key")) or make_sku_key(item)
     factual = [dict(p) for p in state.get("placements", []) if p.get("placement_mode") == "factual" or p.get("source") == "inventory_with_cell"]
     manual = [dict(p) for p in state.get("placements", []) if p.get("placement_mode") == "manual" or p.get("source") == "manual"]
+    incoming_ids = {str(item.get("receipt_line_id")) for item in receipts if item.get("receipt_line_id")}
+    factual_warehouses = {normalize_warehouse(item.get("source_warehouse") or item.get("warehouse"))
+        for item in receipts if item.get("source_authority") == "factual"}
+    factual_warehouses.discard("")
+    factual_physical_scopes = {physical_warehouse_key(scope) for scope in factual_warehouses}
+    factual_scope = min(factual_warehouses) if len(factual_physical_scopes) == 1 and factual_warehouses else ""
+    unknown_factual_provenance: list[Any] = []
+
+    def retain_prior_receipt(placement: dict[str, Any]) -> bool:
+        if set(map(str, placement.get("receipt_line_ids", []) or [])) & incoming_ids:
+            return False
+        if not factual_warehouses:
+            return True
+        if not factual_scope:
+            return False
+        prior_scope = normalize_warehouse(placement.get("source_warehouse"))
+        if placement.get("source_authority") != "factual" or not prior_scope:
+            unknown_factual_provenance.append(placement.get("placement_id"))
+            return False
+        return same_physical_warehouse(prior_scope, factual_scope)
+
+    prior_receipts = [dict(p) for p in state.get("placements", [])
+        if p.get("placement_mode") == "calculated"
+        and p.get("source") == "receipt"
+        and retain_prior_receipt(p)]
+    manual.extend(prior_receipts)
     all_items = factual + source_unplaced + receipts
     sku_classes, conflicts = _sku_weight_classes(all_items)
     row_zones = _row_zones(model)
@@ -1066,7 +1105,7 @@ def calculate_basic_weight_placement(model: dict[str, Any], state: dict[str, Any
                 "quantity_added": 0.0,
                 "quantity_after": before_qty + qty,
             })
-            if weight_class in {"heavy", "medium", "light", "fragile"} and zone != weight_class:
+            if weight_class in {"heavy", "medium_light", "medium", "light", "fragile"} and zone != weight_class:
                 placement["zone_mismatch"] = True
                 placement["unplaced_reason"] = "zone_mismatch"
                 zone_mismatches.append({"sku_key": sku, "sku_code": placement.get("sku_code", ""), "cell_key": key, "weight_class": weight_class, "weight_zone": zone})
@@ -1076,7 +1115,12 @@ def calculate_basic_weight_placement(model: dict[str, Any], state: dict[str, Any
 
     def merge_or_append(record: dict[str, Any]) -> None:
         for existing in placed:
-            if existing.get("cell_key") == record.get("cell_key") and _same_item(existing, record) and existing.get("source") == record.get("source") and existing.get("placement_mode") == record.get("placement_mode"):
+            same_receipt_identity = (existing.get("source") != "receipt" or
+                set(map(str, existing.get("receipt_line_ids", []) or [])) ==
+                set(map(str, record.get("receipt_line_ids", []) or [])))
+            if (same_receipt_identity and existing.get("cell_key") == record.get("cell_key")
+                    and _same_item(existing, record) and existing.get("source") == record.get("source")
+                    and existing.get("placement_mode") == record.get("placement_mode")):
                 existing["qty_pallets"] = round(_safe_float(existing.get("qty_pallets")) + _safe_float(record.get("qty_pallets")), 4)
                 existing["occupied_capacity_pallets"] = round(_safe_float(existing.get("occupied_capacity_pallets")) + _safe_float(record.get("occupied_capacity_pallets")), 4)
                 existing["quantity_added"] = round(_safe_float(existing.get("quantity_added")) + _safe_float(record.get("quantity_added")), 4)
@@ -1242,6 +1286,8 @@ def calculate_basic_weight_placement(model: dict[str, Any], state: dict[str, Any
         "Конфликты категорий SKU": conflicts,
         "Фактические остатки с zone_mismatch": zone_mismatches,
         "Неразмещённые позиции": unplaced,
+        "Исключено calculated receipts без warehouse provenance": len(unknown_factual_provenance),
+        "Factual warehouse scope": factual_scope or None,
     }
     state["placements"] = placed
     state["unplaced_inventory"] = unplaced

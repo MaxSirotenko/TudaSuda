@@ -300,3 +300,48 @@ def test_nested_heavy_renderers_are_not_hidden_in_tabs_or_expanders():
 
     assert "st.tabs(" not in operations
     assert "st.expander(" not in map_tab + settings
+
+def test_pr191_confirmed_physical_binding_aliases():
+    assert app.factual_outbound_binding_blockers(
+        {"factual_warehouse_binding": "Овощи Фрукты"},
+        "Комплектация Овощи Фрукты",
+    ) == []
+    blockers = app.factual_outbound_binding_blockers(
+        {"factual_warehouse_binding": "Овощи Фрукты"}, "Другой склад")
+    assert blockers[0]["code"] == "mutable_placement_warehouse_binding_mismatch"
+
+
+@pytest.mark.parametrize("field", ["source_warehouse", "normalized_warehouse", "warehouse"])
+def test_pr191_factual_placement_provenance_can_establish_physical_binding(monkeypatch, field):
+    monkeypatch.setattr(app, "load_placement_state_cached", lambda _model: ({
+        "placements": [{"source_authority": "factual", field: "Овощи Фрукты"}]
+    }, None))
+    assert app.factual_outbound_binding_blockers({}, "Комплектация Овощи Фрукты") == []
+
+
+def test_pr191_mixed_or_nonfactual_placement_provenance_fails_closed(monkeypatch):
+    monkeypatch.setattr(app, "load_placement_state_cached", lambda _model: ({
+        "placements": [
+            {"source_authority": "factual", "source_warehouse": "Овощи Фрукты"},
+            {"source": "factual_inventory", "source_warehouse": "Другой склад"},
+        ]
+    }, None))
+    blockers = app.factual_outbound_binding_blockers({}, "Комплектация Овощи Фрукты")
+    assert blockers[0]["code"] == "mutable_placement_warehouse_binding_mismatch"
+
+    monkeypatch.setattr(app, "load_placement_state_cached", lambda _model: ({
+        "placements": [{"source": "manual", "source_warehouse": "Овощи Фрукты"}]
+    }, None))
+    blockers = app.factual_outbound_binding_blockers({}, "Комплектация Овощи Фрукты")
+    assert blockers[0]["code"] == "mutable_placement_warehouse_binding_required"
+
+
+def test_pr191_missing_factual_placement_provenance_requires_binding(monkeypatch):
+    monkeypatch.setattr(app, "load_placement_state_cached", lambda _model: ({"placements": []}, None))
+    blockers = app.factual_outbound_binding_blockers({}, "Комплектация Овощи Фрукты")
+    assert blockers[0]["code"] == "mutable_placement_warehouse_binding_required"
+
+
+def test_pr191_row_zone_options_include_canonical_medium_light():
+    assert app.WEIGHT_ZONE_LABELS["medium_light"] == "Средне-лёгкое"
+    assert "medium_light" in app.WEIGHT_ZONE_VALUES

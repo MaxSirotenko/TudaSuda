@@ -107,3 +107,81 @@ def test_receipt_units_are_preserved_once_when_pallets_span_multiple_cells(tmp_p
     assert len(placements) == 3
     assert sum(placement["qty_units"] for placement in placements) == 12
     assert all(placement["unit_name"] == "короб" for placement in placements)
+
+def _pr191_prior_calculated(source="receipt", warehouse=None, factual=False, sku="old-sku"):
+    value = {
+        "placement_id": f"prior-{sku}",
+        "cell_key": "158|1|1",
+        "row_number": "158",
+        "cell_number": "1",
+        "tier": "1",
+        "sku_key": sku,
+        "sku_code": sku,
+        "sku_name": sku,
+        "qty_pallets": 1,
+        "occupied_capacity_pallets": 1,
+        "source": source,
+        "placement_mode": "calculated",
+        "weight_class": "light",
+        "receipt_line_ids": [f"OLD-{sku}"],
+        "receipt_numbers": ["OLD"],
+    }
+    if warehouse is not None:
+        value["source_warehouse"] = warehouse
+    if factual:
+        value["source_authority"] = "factual"
+    return value
+
+
+def test_pr191_equivalent_physical_receipt_scope_is_retained(tmp_path, monkeypatch):
+    monkeypatch.setattr(placement_module, "PLACEMENTS_PATH", tmp_path / "placements.json")
+    model = _model(cells_per_row=2)
+    state = empty_placement_state(model)
+    state["placements"] = [_pr191_prior_calculated(warehouse="Овощи Фрукты", factual=True)]
+    incoming = _receipt("new-medium", 1, "medium")
+    incoming.update({"source_authority": "factual", "source_warehouse": "Комплектация Овощи Фрукты"})
+
+    new_state, _ = calculate_basic_weight_placement(model, state, {"receipts": [incoming]})
+
+    assert any("OLD-old-sku" in (p.get("receipt_line_ids") or []) for p in new_state["placements"])
+
+
+def test_pr191_different_physical_receipt_scope_is_not_retained(tmp_path, monkeypatch):
+    monkeypatch.setattr(placement_module, "PLACEMENTS_PATH", tmp_path / "placements.json")
+    model = _model(cells_per_row=2)
+    state = empty_placement_state(model)
+    state["placements"] = [_pr191_prior_calculated(warehouse="Другой склад", factual=True)]
+    incoming = _receipt("new-medium", 1, "medium")
+    incoming.update({"source_authority": "factual", "source_warehouse": "Овощи Фрукты"})
+
+    new_state, _ = calculate_basic_weight_placement(model, state, {"receipts": [incoming]})
+
+    assert not any("OLD-old-sku" in (p.get("receipt_line_ids") or []) for p in new_state["placements"])
+
+
+def test_pr191_calculated_inventory_is_regenerated_once_not_retained(tmp_path, monkeypatch):
+    monkeypatch.setattr(placement_module, "PLACEMENTS_PATH", tmp_path / "placements.json")
+    model = _model(cells_per_row=2)
+    state = empty_placement_state(model)
+    state["placements"] = [_pr191_prior_calculated(source="inventory_without_cell", sku="inv-sku")]
+    state["source_unplaced_inventory"] = [{
+        "sku_key": "inv-sku", "sku_code": "inv-sku", "sku_name": "inv-sku",
+        "qty_pallets": 1, "qty_units": 0, "calculated_zone": "light",
+        "weight_class": "light", "source": "inventory_without_cell",
+    }]
+
+    new_state, _ = calculate_basic_weight_placement(model, state, {"receipts": []})
+
+    inventory_rows = [p for p in new_state["placements"] if p.get("source") == "inventory_without_cell"]
+    assert sum(float(p.get("qty_pallets", 0)) for p in inventory_rows) == 1
+
+
+def test_pr191_manual_fallback_keeps_legitimate_prior_calculated_receipt(tmp_path, monkeypatch):
+    monkeypatch.setattr(placement_module, "PLACEMENTS_PATH", tmp_path / "placements.json")
+    model = _model(cells_per_row=2)
+    state = empty_placement_state(model)
+    state["placements"] = [_pr191_prior_calculated()]
+
+    new_state, _ = calculate_basic_weight_placement(model, state, {"receipts": []})
+
+    assert any("OLD-old-sku" in (p.get("receipt_line_ids") or []) for p in new_state["placements"])

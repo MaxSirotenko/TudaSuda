@@ -101,8 +101,8 @@ def _opening_and_authority(rows: list[dict[str, Any]], access: set[str]) -> tupl
     lots = []
     for ordinal, row in enumerate(rows):
         sku, cell = str(row.get("sku_key") or ""), row.get("resolved_geometry_cell_key")
-        if sku: by_sku[sku].append(row)
         qty = _number(row.get("source_stock_quantity"))
+        if sku and qty > 0: by_sku[sku].append(row)
         if sku and cell and qty and str(cell) in access:
             lots.append({"stock_lot_id": f"fact:{ordinal}:{row.get('dataset_id')}:{row.get('source_row')}",
                          "sku_key": sku, "cell_key": str(cell), "qty_boxes": qty,
@@ -134,6 +134,24 @@ def _residual_control(working: Mapping[str, Any], next_rows: list[dict[str, Any]
             "unsupported_comparison_count": unsupported, "differences": differences[:100]}
 
 
+def resolve_factual_route_order(candidates: list[Mapping[str, Any]], *,
+                                routable_cells: set[str] | None = None) -> dict[str, Any]:
+    """Shared one-day/monthly authority for factual SKU source and pick order."""
+    factual_cells = sorted({str(r.get("source_cell") or r.get("cell")) for r in candidates})
+    resolved = sorted({str(r.get("resolved_geometry_cell_key")) for r in candidates if r.get("resolved_geometry_cell_key")})
+    raw_orders = [r.get("cell_picking_order") for r in candidates]
+    valid_orders = [value for value in raw_orders if isinstance(value, (int, float)) and not isinstance(value, bool)
+                    and float(value).is_integer() and value >= 0]
+    orders = set(valid_orders)
+    code = ("fact_sku_not_in_opening_snapshot" if not candidates else
+            "fact_source_location_ambiguous" if len(factual_cells) != 1 else
+            "historical_cell_unresolved" if len(resolved) != 1 else
+            "fact_cell_not_routable" if routable_cells is not None and resolved[0] not in routable_cells else
+            "fact_cell_picking_order_missing_or_conflicting" if len(orders) != 1 or len(valid_orders) != len(raw_orders) else None)
+    return {"code": code, "factual_source_cells": factual_cells, "factual_geometry_cells": resolved,
+            "cell_picking_order": next(iter(orders)) if len(orders) == 1 else None}
+
+
 def _replay_day(day: str, placement: dict[str, Any], outbound: dict[str, Any], next_placement: dict[str, Any],
                 model: Mapping[str, Any], graph: dict[str, Any]) -> dict[str, Any]:
     access = {str(x["cell_key"]) for x in graph.get("cell_access_links", [])}
@@ -145,22 +163,15 @@ def _replay_day(day: str, placement: dict[str, Any], outbound: dict[str, Any], n
         demands, blockers, evidence = [], [], []
         for line in lines:
             sku = str(line.get("sku_key") or ""); candidates = by_sku.get(sku, [])
-            factual_cells = sorted({str(r.get("source_cell") or r.get("cell")) for r in candidates})
-            resolved = sorted({str(r.get("resolved_geometry_cell_key")) for r in candidates if r.get("resolved_geometry_cell_key")})
-            code = None
-            if not candidates: code = "fact_sku_not_in_opening_snapshot"
-            elif len(factual_cells) != 1: code = "fact_source_location_ambiguous"
-            elif len(resolved) != 1: code = "historical_cell_unresolved"
-            elif resolved[0] not in access: code = "fact_cell_not_routable"
-            orders = {r.get("cell_picking_order") for r in candidates if r.get("cell_picking_order") is not None}
-            if code is None and len(orders) != 1: code = "fact_cell_picking_order_missing_or_conflicting"
+            authority = resolve_factual_route_order(candidates, routable_cells=access); code = authority["code"]
             item = {"sku_key": sku, "requested_boxes": line.get("quantity"), "demand_key": line.get("line_number"),
                     "source_evidence": {"dataset_id": line.get("dataset_id"), "source_row": line.get("source_row"),
                                         "document_ref": line.get("document_ref"), "document_number": line.get("document_number")},
-                    "factual_source_cells": factual_cells, "factual_geometry_cells": resolved}
+                    "factual_source_cells": authority["factual_source_cells"],
+                    "factual_geometry_cells": authority["factual_geometry_cells"]}
             evidence.append(item)
             if code: blockers.append({"code": code, "sku_key": sku, "source_row": line.get("source_row")})
-            else: demands.append({**item, "cell_picking_order": next(iter(orders))})
+            else: demands.append({**item, "cell_picking_order": authority["cell_picking_order"]})
         # Cell order is authority; source row order is deliberately irrelevant.
         demands.sort(key=lambda x: (x["cell_picking_order"], x["factual_geometry_cells"][0], str(x["demand_key"])))
         # Engine identity is deterministic and collision-safe; the factual

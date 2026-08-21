@@ -340,7 +340,7 @@ def build_actual_inventory_placement_state(
     return state, diagnostics
 
 
-def _classify_physical_pallet_evidence(
+def classify_physical_pallet_evidence(
     model: dict[str, Any], state: dict[str, Any], diagnostics: dict[str, Any],
 ) -> None:
     """Annotate exact pallet footprints; never choose among conflicting facts."""
@@ -416,6 +416,10 @@ def _classify_physical_pallet_evidence(
         counts["inventory_total_mismatches"] == 0)
     diagnostics.update(counts)
     state["physical_opening_readiness"] = counts
+
+
+# Compatibility alias; factual scenario code uses the public pure boundary.
+_classify_physical_pallet_evidence = classify_physical_pallet_evidence
 
 
 def _cross_check_inventory_totals(

@@ -103,6 +103,8 @@ def _normalize_weight_class(value: Any) -> str:
         return "heavy"
     if text in {"medium", "среднее", "средний"}:
         return "medium"
+    if text in {"medium_light", "mediumlight", "среднелегкое", "среднелегкий"}:
+        return "medium_light"
     if text in {"light", "легкое", "легкий"}:
         return "light"
     if text in {"fragile", "хрупкое", "хрупкий"}:

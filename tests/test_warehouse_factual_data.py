@@ -360,3 +360,169 @@ def test_vgh_business_key_keeps_characteristics_distinct(tmp_path):
             for value in ("Красный", "Синий")]
     imported = import_excel_dataset(_xlsx(rows), "ВГХ.xlsx", root=tmp_path)
     assert len({row["sku_key"] for row in load_dataset_rows(imported)}) == 2
+
+
+def _effective_registry(tmp_path, source_type, datasets):
+    import gzip, json
+    entries = []
+    for index, rows in enumerate(datasets):
+        artifact = tmp_path / f"artifact-{index}"
+        target = artifact / "canonical" / "date=2026-07-15.jsonl.gz"
+        target.parent.mkdir(parents=True)
+        with gzip.open(target, "wt", encoding="utf-8") as stream:
+            for row_number, row in enumerate(rows, 2):
+                stream.write(json.dumps({"dataset_id": f"d{index}", "source_file_name": f"f{index}.xlsx",
+                    "source_row": row_number, "source_type": source_type, **row}, ensure_ascii=False) + "\n")
+        entries.append({"dataset_id": f"d{index}", "source_type": source_type, "active": True,
+            "artifact": str(artifact), "partitions": ["2026-07-15"], "index": {"dates": ["2026-07-15"]}})
+    return {"datasets": entries, "diagnostics": []}
+
+
+def test_vgh_weight_is_material_conflict_not_arbitrary_duplicate(tmp_path):
+    from warehouse_factual_data import load_effective_rows
+    base = {"sku_key": "sku", "boxes_per_layer": 2, "layers_per_pallet": 3,
+            "quantity_per_box": 1, "source_boxes_per_pallet": 6}
+    registry = _effective_registry(tmp_path, "vgh", [[{**base, "weight": 5}], [{**base, "weight": 15}]])
+    result = load_effective_rows("vgh", registry=registry, root=tmp_path, strict=False)
+    assert not result["authoritative"] and result["conflicts"]
+
+
+def test_historical_exact_evidence_dedup_does_not_double_stock(tmp_path):
+    from warehouse_factual_data import load_effective_rows
+    row = {"snapshot_at": "2026-07-15", "sku_key": "sku", "nomenclature": "N", "characteristic": "C",
+           "source_stock_quantity": 4, "source_pallet_ref": "P", "cell": "A", "cell_picking_order": 1}
+    registry = _effective_registry(tmp_path, "historical_placement", [[row, row]])
+    result = load_effective_rows("historical_placement", "2026-07-15", registry=registry, root=tmp_path)
+    assert len(result["rows"]) == 1 and result["rows"][0]["source_stock_quantity"] == 4
+    assert result["duplicates"][0]["code"] == "duplicate_historical_exact_evidence_collapsed"
+
+
+def test_outbound_number_date_fallback_identity_dedup_and_conflict(tmp_path):
+    from warehouse_factual_data import load_effective_rows
+    base = {"document_ref": None, "document_number": "RO", "occurred_at": "2026-07-15T10:00:00",
+            "line_number": 1, "warehouse": "W", "sku_key": "sku", "quantity": 4, "source_pick_order": None}
+    same = load_effective_rows("outbound", "2026-07-15",
+        registry=_effective_registry(tmp_path / "same", "outbound", [[base], [base]]), root=tmp_path / "same", strict=False)
+    assert same["authoritative"] and len(same["rows"]) == 1 and same["duplicates"]
+    conflict = load_effective_rows("outbound", "2026-07-15", registry=_effective_registry(
+        tmp_path / "conflict", "outbound", [[base], [{**base, "quantity": 5}]]), root=tmp_path / "conflict", strict=False)
+    assert not conflict["authoritative"] and conflict["conflicts"]
+    lines = load_effective_rows("outbound", "2026-07-15", registry=_effective_registry(
+        tmp_path / "lines", "outbound", [[base], [{**base, "line_number": 2}]]), root=tmp_path / "lines", strict=False)
+    assert lines["authoritative"] and len(lines["rows"]) == 2
+
+
+def test_warehouse_scoped_outbound_conflict_only_blocks_related_scope(tmp_path):
+    from warehouse_factual_data import load_effective_rows
+    clean = {"document_ref": "A", "line_number": 1, "occurred_at": "2026-07-15", "warehouse": "A",
+             "sku_key": "sku-a", "quantity": 1}
+    conflict = {"document_ref": "B", "line_number": 1, "occurred_at": "2026-07-15", "warehouse": "B",
+                "sku_key": "sku-b", "quantity": 1}
+    registry = _effective_registry(tmp_path, "outbound", [[clean, conflict], [{**conflict, "quantity": 2}]])
+    warehouse_a = load_effective_rows("outbound", "2026-07-15", registry=registry, root=tmp_path,
+                                      warehouse="A", strict=False)
+    warehouse_b = load_effective_rows("outbound", "2026-07-15", registry=registry, root=tmp_path,
+                                      warehouse="B", strict=False)
+    assert warehouse_a["authoritative"] and [row["sku_key"] for row in warehouse_a["rows"]] == ["sku-a"]
+    assert not warehouse_b["authoritative"] and warehouse_b["conflicts"]
+
+
+def test_cross_warehouse_business_key_conflict_blocks_both_scopes(tmp_path):
+    from warehouse_factual_data import load_effective_rows
+    base = {"document_ref": "X", "line_number": 1, "occurred_at": "2026-07-15",
+            "sku_key": "sku", "quantity": 1}
+    registry = _effective_registry(tmp_path, "outbound", [[{**base, "warehouse": "A"}], [{**base, "warehouse": "B"}]])
+    for warehouse in ("A", "B"):
+        result = load_effective_rows("outbound", "2026-07-15", registry=registry, root=tmp_path,
+                                     warehouse=warehouse, strict=False)
+        assert not result["authoritative"] and result["conflicts"]
+
+
+def test_business_evidence_index_upgrade_is_persisted_and_versioned(tmp_path, monkeypatch):
+    import warehouse_factual_data as factual
+    row = {"document_ref": "X", "line_number": 1, "occurred_at": "2026-07-15", "warehouse": "A",
+           "sku_key": "sku", "quantity": 1}
+    registry = _effective_registry(tmp_path, "outbound", [[row]])
+    dataset = registry["datasets"][0]
+    artifact = Path(dataset["artifact"])
+    calls = []
+    original = factual._iter_jsonl
+
+    def counted(path):
+        if "/canonical/" in str(path):
+            calls.append(str(path))
+        yield from original(path)
+
+    monkeypatch.setattr(factual, "_iter_jsonl", counted)
+    factual.load_effective_rows("outbound", "2026-07-15", registry=registry, root=tmp_path, strict=False)
+    assert len(calls) == 1 and (artifact / "business_index.meta.json").exists()
+    factual.load_effective_rows("outbound", "2026-07-15", registry=registry, root=tmp_path, strict=False)
+    assert len(calls) == 1
+    monkeypatch.setattr(factual, "EVIDENCE_SEMANTICS_VERSION", factual.EVIDENCE_SEMANTICS_VERSION + 1)
+    factual.load_effective_rows("outbound", "2026-07-15", registry=registry, root=tmp_path, strict=False)
+    assert len(calls) == 2
+
+
+def test_day_scoped_effective_view_reads_only_selected_evidence_partition(tmp_path, monkeypatch):
+    import warehouse_factual_data as factual
+    days = ["2026-07-14", "2026-07-15", "2026-07-16"]
+    rows = [{"document_ref": day, "line_number": 1, "occurred_at": day, "warehouse": "A",
+             "sku_key": day, "quantity": 1} for day in days]
+    registry = _effective_registry(tmp_path, "outbound", [[rows[1]]])
+    dataset = registry["datasets"][0]; artifact = Path(dataset["artifact"])
+    canonical = artifact / "canonical"
+    for day, row in zip(days, rows):
+        target = canonical / f"date={day}.jsonl.gz"
+        with gzip.open(target, "wt", encoding="utf-8") as stream:
+            stream.write(json.dumps({"dataset_id": "d0", **row}) + "\n")
+    dataset["partitions"] = days; dataset["index"]["dates"] = days
+    factual._ensure_business_evidence_index(dataset, "outbound")
+    reads = []; original = factual._read_jsonl
+    monkeypatch.setattr(factual, "_read_jsonl", lambda path: reads.append(Path(path).name) or original(path))
+    factual.load_effective_rows("outbound", "2026-07-15", registry=registry, root=tmp_path, strict=False)
+    evidence_reads = [name for name in reads if name.startswith("date=")]
+    assert evidence_reads.count("date=2026-07-15.jsonl.gz") == 2  # evidence + canonical
+    assert "date=2026-07-14.jsonl.gz" not in evidence_reads and "date=2026-07-16.jsonl.gz" not in evidence_reads
+
+
+def test_warehouse_scope_uses_shared_yo_normalization(tmp_path):
+    from warehouse_factual_data import load_effective_rows
+    base = {"document_ref": "X", "line_number": 1, "occurred_at": "2026-07-15",
+            "warehouse": "Склад Ёлка", "sku_key": "sku", "quantity": 1}
+    registry = _effective_registry(tmp_path, "outbound", [[base], [{**base, "quantity": 2}]])
+    result = load_effective_rows("outbound", "2026-07-15", registry=registry, root=tmp_path,
+                                 warehouse="склад елка", strict=False)
+    assert not result["authoritative"] and result["conflicts"]
+
+
+def test_concurrent_evidence_index_first_access_is_serialized(tmp_path, monkeypatch):
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+    import warehouse_factual_data as factual
+    row = {"document_ref": "X", "line_number": 1, "occurred_at": "2026-07-15",
+           "warehouse": "A", "sku_key": "sku", "quantity": 1}
+    registry = _effective_registry(tmp_path, "outbound", [[row]])
+    dataset = registry["datasets"][0]; calls = []
+    original = factual._iter_jsonl
+    def slow(path):
+        if "/canonical/" in str(path): calls.append(str(path)); time.sleep(.02)
+        yield from original(path)
+    monkeypatch.setattr(factual, "_iter_jsonl", slow)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        paths = list(pool.map(lambda _: factual._ensure_business_evidence_index(dataset, "outbound"), range(2)))
+    assert paths[0] == paths[1] and paths[0].is_dir() and len(calls) == 1
+
+
+def test_compact_upgrade_skips_inactive_and_incompatible_datasets(tmp_path, monkeypatch):
+    import warehouse_factual_data as factual
+    healthy = {"dataset_id": "active", "source_type": "outbound", "active": True,
+        "parser_version": factual.PARSER_VERSION, "artifact": str(tmp_path / "active"),
+        "partitions": [], "index": {"dates": [], "warehouses": [], "warehouses_by_date": {}}}
+    inactive = {"dataset_id": "inactive", "source_type": "outbound", "active": False,
+        "artifact": str(tmp_path / "missing-inactive"), "partitions": ["2026-07-15"], "index": {"dates": ["2026-07-15"]}}
+    incompatible = {**inactive, "dataset_id": "incompatible", "active": True,
+                    "parser_version": "obsolete", "artifact": str(tmp_path / "missing-incompatible")}
+    touched = []
+    monkeypatch.setattr(factual, "_ensure_business_evidence_index", lambda dataset, source: touched.append(dataset["dataset_id"]) or Path(dataset["artifact"]))
+    factual.ensure_compact_scope_indexes({"datasets": [healthy, inactive, incompatible]}, source_types=("outbound",), root=tmp_path)
+    assert touched == ["active"]

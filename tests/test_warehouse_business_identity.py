@@ -10,6 +10,8 @@ from warehouse_business_identity import (
     normalize_business_text,
     normalize_unit_name,
     normalize_warehouse,
+    physical_warehouse_key,
+    same_physical_warehouse,
     validate_box_quantity,
 )
 from warehouse_inventory_placement import make_sku_key
@@ -65,6 +67,15 @@ def test_missing_name_fails_closed_even_when_code_exists():
 def test_warehouse_normalization_is_exact():
     assert normalize_warehouse(" ДОЛГОСРОК ВЁШКИ ") == normalize_warehouse("долгосрок вешки")
     assert normalize_warehouse("Вешки") != normalize_warehouse("Долгосрок Вешки")
+
+
+def test_confirmed_veshki_frov_physical_equivalence_keeps_source_scopes_exact():
+    receipt_scope = normalize_warehouse("Овощи Фрукты")
+    outbound_scope = normalize_warehouse("Комплектация Овощи Фрукты")
+    assert receipt_scope != outbound_scope
+    assert physical_warehouse_key(receipt_scope) == physical_warehouse_key(outbound_scope)
+    assert same_physical_warehouse(receipt_scope, outbound_scope) is True
+    assert same_physical_warehouse(receipt_scope, "Другой склад") is False
 
 
 @pytest.mark.parametrize("value", ["короб", "короба", "коробов", " КОРОБОВ "])

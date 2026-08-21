@@ -15,6 +15,7 @@ import os
 import sqlite3
 import tempfile
 import shutil
+import threading
 import time
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping
@@ -33,7 +34,9 @@ from warehouse_factual_artifacts import (
     write_jsonl as _artifact_write_jsonl,
 )
 
-from warehouse_business_identity import build_canonical_sku_identity, find_canonical_identity_collisions
+from warehouse_business_identity import (
+    build_canonical_sku_identity, find_canonical_identity_collisions, normalize_warehouse,
+)
 
 PARSER_VERSION = "factual-july-v5"
 # Level 6 retained ~97% of level-9 compression in the 10k-row benchmark while
@@ -541,6 +544,38 @@ def active_datasets(registry: Mapping[str, Any], source_type: str | None = None)
             and (source_type is None or item.get("source_type") == source_type)]
 
 
+def ensure_compact_scope_indexes(registry: dict[str, Any], *, source_types: Iterable[str] | None = None,
+                                 root: Path = DATA_ROOT) -> dict[str, Any]:
+    """Persist a one-time compact warehouse index for pre-index datasets.
+
+    Old partitions are streamed rather than materialized. Once upgraded,
+    normal UI reruns read registry metadata only.
+    """
+    changed = False; requested = set(source_types or {"outbound", "receipts", "inventory"})
+    effective = active_datasets(registry)
+    for dataset in effective:
+        if dataset.get("source_type") not in requested: continue
+        index = dataset.setdefault("index", {})
+        if "warehouses" in index and "warehouses_by_date" in index: continue
+        by_date: dict[str, list[str]] = {}; all_warehouses: set[str] = set()
+        artifact = Path(str(dataset.get("artifact") or root / str(dataset.get("dataset_id", "")).removeprefix("dataset:")))
+        for raw_day in index.get("dates", dataset.get("partitions", [])):
+            day = normalize_operational_day(raw_day) or str(raw_day)
+            path = artifact / "canonical" / f"date={raw_day}.jsonl.gz"
+            warehouses = sorted({str(row.get("warehouse")) for row in _iter_jsonl(path) if row.get("warehouse")}) if path.exists() else []
+            by_date[day] = warehouses; all_warehouses.update(warehouses)
+            index.setdefault("daily", {}).setdefault(day, {})["warehouses"] = warehouses
+        index["warehouses"] = sorted(all_warehouses); index["warehouses_by_date"] = by_date; changed = True
+    # The same source-specific UI spinner also owns the one-time derived
+    # business-evidence upgrade. It never rewrites canonical source rows.
+    for dataset in effective:
+        source_type = str(dataset.get("source_type") or "")
+        if source_type in requested and source_type in BUSINESS_KEYS:
+            _ensure_business_evidence_index(dataset, source_type)
+    if changed: _atomic_json(root / "registry.json", registry)
+    return registry
+
+
 def _import_excel_dataset_buffered(data: bytes, filename: str, *, sheet: str | None = None, root: Path = DATA_ROOT,
                          geometry_cells: Iterable[str] | None = None, reimport: bool = False,
                          parser_version: str = PARSER_VERSION) -> dict[str, Any]:
@@ -598,7 +633,11 @@ def _import_excel_dataset_buffered(data: bytes, filename: str, *, sheet: str | N
         daily[day] = {"rows": len(rows), "sku": len({r.get("sku_key") for r in rows if r.get("sku_key")}),
             "cells": len({r.get("cell") for r in rows if r.get("cell")}), "documents": len(docs),
             "positive_quantity": sum(positive), "positive_sku_keys": sorted({r.get("sku_key") for r in rows if r.get("sku_key") and isinstance(r.get("quantity"), (int, float)) and r.get("quantity") > 0})}
-    index = {"sku_keys": sku_index, "dates": sorted(partitions), "daily": daily, "document_keys": sorted(document_keys)}
+    index = {"sku_keys": sku_index, "dates": sorted(partitions), "daily": daily,
+             "warehouses": sorted({str(row.get("warehouse")) for row in canonical if row.get("warehouse")}),
+             "warehouses_by_date": {day: sorted({str(row.get("warehouse")) for row in rows if row.get("warehouse")})
+                                    for day, rows in partitions.items()},
+             "document_keys": sorted(document_keys)}
     metadata = {"dataset_id": dataset_id, "source_file_name": filename, "content_hash": digest, "source_type": source_type,
         "source_label": SOURCE_LABELS[source_type], "parser_version": parser_version, "sheet": selected, "rows": len(raw),
         "period_from": diagnostics["period_from"], "period_to": diagnostics["period_to"], "unique_sku": diagnostics["unique_sku"],
@@ -647,8 +686,10 @@ MATERIAL_FIELDS = {
     "receipts": ("occurred_at", "warehouse", "sku_key", "box_quantity", "reported_pallets",
                  "terminal_completed", "expected_receipt"),
     "inventory": ("occurred_at", "warehouse", "sku_key", "actual_quantity", "accounting_quantity"),
-    "vgh": ("boxes_per_layer", "layers_per_pallet", "quantity_per_box", "source_boxes_per_pallet"),
+    "vgh": ("weight", "length", "width", "height", "boxes_per_layer", "layers_per_pallet",
+            "quantity_per_box", "source_boxes_per_pallet"),
 }
+EVIDENCE_SEMANTICS_VERSION = 2
 
 
 def _fingerprint(values: Any) -> str:
@@ -658,6 +699,8 @@ def _fingerprint(values: Any) -> str:
 
 def _business_evidence(row: Mapping[str, Any], source_type: str) -> dict[str, Any] | None:
     fields = BUSINESS_KEYS.get(source_type)
+    if source_type == "outbound" and not row.get("document_ref"):
+        fields = ("document_number", "occurred_at", "line_number")
     if not fields:
         return None
     key_values = [row.get(field) for field in fields]
@@ -668,6 +711,88 @@ def _business_evidence(row: Mapping[str, Any], source_type: str) -> dict[str, An
             "payload_fingerprint": _fingerprint(payload), "payload": payload,
             "day": _day(row), "dataset_id": row.get("dataset_id"),
             "source_file_name": row.get("source_file_name"), "source_row": row.get("source_row")}
+
+
+def factual_receipt_line_identity(row: Mapping[str, Any]) -> str:
+    """Stable mutable identity from the authoritative receipt business key."""
+    evidence = _business_evidence(row, "receipts")
+    if evidence is None:
+        return ""
+    return "factual-receipt:" + hashlib.sha256(
+        str(evidence["business_key"]).encode("utf-8")).hexdigest()[:24]
+
+
+def _evidence_semantics_signature(dataset: Mapping[str, Any], source_type: str) -> str:
+    return _fingerprint({"version": EVIDENCE_SEMANTICS_VERSION, "source_type": source_type,
+        "business_keys": BUSINESS_KEYS.get(source_type), "material_fields": MATERIAL_FIELDS.get(source_type),
+        "dataset_id": dataset.get("dataset_id"), "content_hash": dataset.get("content_hash")})
+
+
+_EVIDENCE_INDEX_LOCKS: defaultdict[str, threading.Lock] = defaultdict(threading.Lock)
+
+
+def _ensure_business_evidence_index(dataset: Mapping[str, Any], source_type: str,
+                                    progress_callback: ImportProgressCallback | None = None) -> Path:
+    artifact = Path(str(dataset["artifact"]))
+    with _EVIDENCE_INDEX_LOCKS[str(artifact.resolve())]:
+        return _ensure_business_evidence_index_locked(dataset, source_type, progress_callback)
+
+
+def _ensure_business_evidence_index_locked(dataset: Mapping[str, Any], source_type: str,
+                                           progress_callback: ImportProgressCallback | None = None) -> Path:
+    """Persist a derived evidence upgrade once; canonical source data stays immutable."""
+    artifact = Path(str(dataset["artifact"])); target = artifact / "business_index"
+    metadata_path = artifact / "business_index.meta.json"
+    signature = _evidence_semantics_signature(dataset, source_type)
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        metadata = {}
+    if target.exists() and metadata.get("signature") == signature:
+        return target
+    canonical = artifact / "canonical"
+    if not canonical.exists():
+        legacy = artifact / "business_index.jsonl.gz"
+        return legacy if legacy.exists() else target
+    temporary = Path(tempfile.mkdtemp(prefix=".business-index-", dir=artifact))
+    processed = 0
+    try:
+        for day in dataset.get("partitions", dataset.get("index", {}).get("dates", [])):
+            partition_target = temporary / f"date={day}.jsonl.gz"
+            with gzip.open(partition_target, "wt", encoding="utf-8", compresslevel=FACTUAL_GZIP_COMPRESSLEVEL) as stream:
+                for row in _iter_jsonl(canonical / f"date={day}.jsonl.gz"):
+                    evidence = _business_evidence(row, source_type)
+                    if evidence is not None:
+                        stream.write(json.dumps(evidence, ensure_ascii=False, separators=(",", ":"), default=str) + "\n")
+                    processed += 1
+                    if progress_callback and processed % IMPORT_PROGRESS_ROW_INTERVAL == 0:
+                        progress_callback({"stage": "business_evidence_index_upgrade", "source_type": source_type,
+                                           "dataset_id": dataset.get("dataset_id"), "processed_rows": processed})
+        old = Path(tempfile.mkdtemp(prefix=".business-index-old-", dir=artifact))
+        old.rmdir()
+        if target.exists(): os.replace(target, old)
+        os.replace(temporary, target)
+        shutil.rmtree(old, ignore_errors=True)
+        _atomic_json(metadata_path, {"signature": signature, "evidence_semantics_version": EVIDENCE_SEMANTICS_VERSION,
+            "dataset_id": dataset.get("dataset_id"), "content_hash": dataset.get("content_hash"), "rows_scanned": processed})
+    finally:
+        shutil.rmtree(temporary, ignore_errors=True)
+    return target
+
+
+def _business_evidence_partitions(index: Path, day: str | None = None) -> list[Path]:
+    if index.is_file():
+        return [index]
+    if not index.exists():
+        return []
+    if day is not None:
+        partition = index / f"date={day}.jsonl.gz"
+        return [partition] if partition.exists() else []
+    return sorted(index.glob("date=*.jsonl.gz"))
+
+
+def _scope_warehouse(value: Any) -> str:
+    return normalize_warehouse(value)
 
 
 def _stream_xlsx_dataset(data: bytes, filename: str, *, sheet: str | None, root: Path,
@@ -732,7 +857,7 @@ def _stream_xlsx_dataset(data: bytes, filename: str, *, sheet: str | None, root:
         writers: dict[str, Any] = {}
         raw_writer = index_writer = None
         row_count = missing_sku = duplicate_raw = zero = negative = missing_qty = 0
-        raw_hashes: set[str] = set(); sku_keys: set[str] = set(); days: set[str] = set()
+        raw_hashes: set[str] = set(); sku_keys: set[str] = set(); days: set[str] = set(); warehouses: set[str] = set()
         daily: dict[str, dict[str, Any]] = defaultdict(lambda: {"rows": 0, "sku_keys": set(), "cells": set(),
             "documents": set(), "positive_quantity": 0, "positive_sku_keys": set()})
         placement_sku_cells: dict[tuple[Any, Any], set[str]] = defaultdict(set)
@@ -821,6 +946,9 @@ def _stream_xlsx_dataset(data: bytes, filename: str, *, sheet: str | None, root:
                 started = time.perf_counter()
                 sku = record.get("sku_key"); missing_sku += not bool(sku)
                 if sku: sku_keys.add(sku); daily[day]["sku_keys"].add(sku)
+                if record.get("warehouse") not in (None, ""):
+                    warehouse = str(record["warehouse"]); warehouses.add(warehouse)
+                    daily[day].setdefault("warehouses", set()).add(warehouse)
                 daily[day]["rows"] += 1
                 if record.get("cell") not in (None, ""): daily[day]["cells"].add(str(record["cell"]))
                 doc = (record.get("document_ref") or record.get("inventory_ref"),
@@ -887,8 +1015,11 @@ def _stream_xlsx_dataset(data: bytes, filename: str, *, sheet: str | None, root:
         diagnostics["warnings"].append("historical_cell_not_resolved_to_geometry")
     index_daily = {day: {"rows": values["rows"], "sku": len(values["sku_keys"]), "cells": len(values["cells"]),
         "documents": len(values["documents"]), "positive_quantity": values["positive_quantity"],
-        "positive_sku_keys": sorted(values["positive_sku_keys"])} for day, values in daily.items()}
+        "positive_sku_keys": sorted(values["positive_sku_keys"]),
+        "warehouses": sorted(values.get("warehouses", set()))} for day, values in daily.items()}
     index = {"sku_keys": sorted(sku_keys), "dates": sorted(days), "daily": index_daily,
+             "warehouses": sorted(warehouses),
+             "warehouses_by_date": {day: values["warehouses"] for day, values in index_daily.items()},
              "business_key_count": business_key_count, "business_index_artifact": "business_index.jsonl.gz"}
     stage_seconds["final_metadata_publication"] += time.perf_counter() - finalization_started
     elapsed = time.perf_counter() - import_started
@@ -1015,12 +1146,14 @@ def activate_dataset_version(dataset_id: str, *, root: Path = DATA_ROOT) -> dict
     return dict(selected)
 
 
-def _source_conflicts(registry: Mapping[str, Any], source_type: str, day: str | None = None) -> dict[str, Any]:
+def _source_conflicts(registry: Mapping[str, Any], source_type: str, day: str | None = None,
+                      warehouse: str | None = None) -> dict[str, Any]:
     groups: dict[str, dict[str, list[dict[str, Any]]]] = defaultdict(lambda: defaultdict(list))
     for dataset in active_datasets(registry, source_type):
-        path = Path(str(dataset["artifact"])) / "business_index.jsonl.gz"
-        if path.exists():
-            evidence_rows = _read_jsonl(path)
+        path = _ensure_business_evidence_index(dataset, source_type)
+        partitions = _business_evidence_partitions(path, day if source_type != "vgh" else None)
+        if partitions:
+            evidence_rows = [row for partition in partitions for row in _read_jsonl(partition)]
         else:
             evidence_rows = [e for row in load_dataset_rows(dataset, day) if (e := _business_evidence(row, source_type))]
         for evidence in evidence_rows:
@@ -1029,6 +1162,12 @@ def _source_conflicts(registry: Mapping[str, Any], source_type: str, day: str | 
     duplicates, conflicts = [], []
     for key, payloads in sorted(groups.items()):
         occurrences = [item for values in payloads.values() for item in values]
+        relates_to_scope = (not warehouse or source_type == "vgh" or any(
+            not _scope_warehouse((item.get("payload") or {}).get("warehouse"))
+            or _scope_warehouse((item.get("payload") or {}).get("warehouse")) == warehouse
+            for item in occurrences))
+        if not relates_to_scope:
+            continue
         if len(payloads) > 1:
             conflicts.append({"code": "conflicting_factual_business_key", "source_type": source_type,
                 "business_key": json.loads(key), "occurrences": occurrences})
@@ -1061,11 +1200,13 @@ def _readiness_source_conflicts(registry: Mapping[str, Any], source_type: str,
 
         for dataset in active_datasets(registry, source_type):
             artifact = Path(str(dataset["artifact"]))
-            business_index = artifact / "business_index.jsonl.gz"
-            if business_index.exists():
+            business_index = _ensure_business_evidence_index(dataset, source_type)
+            partitions = _business_evidence_partitions(business_index)
+            if partitions:
                 with measure(f"factual.readiness_business_index_scan.{source_type}"):
-                    for evidence in _iter_jsonl(business_index):
-                        add(evidence)
+                    for partition in partitions:
+                        for evidence in _iter_jsonl(partition):
+                            add(evidence)
             else:
                 # Legacy artifacts are deliberately visited one partition at a time.
                 for day in dataset.get("partitions", dataset.get("index", {}).get("dates", [])):
@@ -1158,7 +1299,7 @@ def build_data_contract_diagnostics(registry: Mapping[str, Any], *, root: Path =
 
 @profiled("factual.load_effective_rows")
 def load_effective_rows(source_type: str, day: str | None = None, *, registry: Mapping[str, Any] | None = None,
-                        root: Path = DATA_ROOT, strict: bool = True) -> dict[str, Any]:
+                        root: Path = DATA_ROOT, strict: bool = True, warehouse: str | None = None) -> dict[str, Any]:
     """Authoritative replay boundary: active evidence in, deduplicated factual rows out."""
     registry = registry or load_registry(root)
     if source_type == "historical_placement":
@@ -1170,13 +1311,30 @@ def load_effective_rows(source_type: str, day: str | None = None, *, registry: M
             if strict: raise ValueError("multiple_active_placement_sources_for_snapshot")
             return {"rows": [], "duplicates": [], "conflicts": [conflict], "authoritative": False}
         rows = [row for dataset in candidates for row in load_dataset_rows(dataset, day)]
-        return {"rows": rows, "duplicates": [], "conflicts": [], "authoritative": len(candidates) <= 1}
-    analysis = _source_conflicts(registry, source_type, day)
+        provenance = {"dataset_id", "source_file_name", "content_hash", "source_type", "parser_version", "sheet",
+                      "source_row", "source_index", "imported_at", "duplicate_source_count",
+                      "duplicate_source_ids", "duplicate_source_filenames", "duplicate_row_evidence"}
+        representatives: dict[str, dict[str, Any]] = {}; evidence: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for row in rows:
+            payload = {key: value for key, value in row.items() if key not in provenance}
+            fingerprint = _fingerprint(payload)
+            evidence[fingerprint].append({"dataset_id": row.get("dataset_id"), "source_file_name": row.get("source_file_name"),
+                                          "source_row": row.get("source_row")})
+            representatives.setdefault(fingerprint, dict(row))
+        duplicates = [{"code": "duplicate_historical_exact_evidence_collapsed", "occurrences": occurrences}
+                      for occurrences in evidence.values() if len(occurrences) > 1]
+        return {"rows": list(representatives.values()), "duplicates": duplicates, "conflicts": [],
+                "authoritative": len(candidates) <= 1}
+    target_warehouse = _scope_warehouse(warehouse)
+    analysis = _source_conflicts(registry, source_type, day, target_warehouse or None)
     if analysis["conflicts"] and strict:
         raise ValueError("conflicting_factual_business_key")
     representatives: dict[str, dict[str, Any]] = {}
     for dataset in sorted(active_datasets(registry, source_type), key=lambda x: x["dataset_id"]):
         for row in load_dataset_rows(dataset, day):
+            row_warehouse = _scope_warehouse(row.get("warehouse"))
+            if target_warehouse and source_type != "vgh" and row_warehouse and row_warehouse != target_warehouse:
+                continue
             evidence = _business_evidence(row, source_type)
             if evidence is None:
                 representatives[f"unkeyed:{dataset['dataset_id']}:{row.get('source_row')}"] = dict(row)
