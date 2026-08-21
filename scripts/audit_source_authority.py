@@ -32,6 +32,8 @@ COMPATIBILITY_MODULES = {"warehouse_state_cache.py", "warehouse_outbound_orders.
 SYMBOL_ALLOW = {
     ("virtual_warehouse_app.py", "render_receipts_section", "load_placement_state"):
         "derived mutable placement target",
+    ("virtual_warehouse_app.py", "factual_outbound_binding_blockers", "load_placement_state_cached"):
+        "derived mutable-placement provenance for operational physical warehouse validation",
 }
 
 class Calls(ast.NodeVisitor):

@@ -32,7 +32,8 @@ This table is the production contract. Effective views in `warehouse_factual_dat
 * Completed receipts require canonical SKU identity; any completed invalid row blocks application of the entire factual receipt input.
 * Mutable factual receipt identity is the authoritative `document_ref + line_number` business key; dataset/version/source-row values remain provenance only.
 * Calculated factual receipt placements are warehouse-scoped. A new factual calculation retains prior receipt lines only from the same normalized warehouse; unknown provenance is excluded with diagnostics.
-* Operational factual outbound may mutate placement only when the selected warehouse equals the explicit model factual warehouse binding; missing or mismatched binding fails closed.
+* Factual warehouse source scopes remain exact and separate for filtering, registry scoping and evidence identity. The confirmed Veshki FROV operational scopes `Овощи Фрукты` (receipts/intake) and `Комплектация Овощи Фрукты` (outbound/picking) share one physical warehouse only at mutable placement/execution boundaries; no other aliases are inferred.
+* Operational factual outbound may mutate placement only when an explicit factual model binding or factual mutable-placement provenance resolves to the same confirmed physical warehouse. Manual/legacy placement cannot establish this provenance; missing or mismatched factual provenance fails closed.
 * Active undated outbound evidence blocks only its proven warehouse scope, while missing warehouse scope blocks all potentially affected operational-day calculations.
 * Outbound execution persistence remains global history, but factual screen summaries, line results and logs are projected to the selected day/warehouse order keys.
 * Mutable placement, execution logs, model/geometry, gates, rules, render settings and comparison artifacts are derived state/configuration/results, not competing factual sources.

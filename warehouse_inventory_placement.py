@@ -13,7 +13,9 @@ import pandas as pd
 from warehouse_persistence import read_json
 
 from warehouse_placement_diagnostics import placement_reason_text
-from warehouse_business_identity import canonical_sku_key, normalize_warehouse
+from warehouse_business_identity import (
+    canonical_sku_key, normalize_warehouse, physical_warehouse_key, same_physical_warehouse,
+)
 from warehouse_placement_zones import (get_assignable_placement_zones, get_placement_zone_label,
     is_assignable_placement_zone, normalize_placement_zone)
 
@@ -1044,22 +1046,26 @@ def calculate_basic_weight_placement(model: dict[str, Any], state: dict[str, Any
     factual_warehouses = {normalize_warehouse(item.get("source_warehouse") or item.get("warehouse"))
         for item in receipts if item.get("source_authority") == "factual"}
     factual_warehouses.discard("")
-    factual_scope = next(iter(factual_warehouses)) if len(factual_warehouses) == 1 else ""
+    factual_physical_scopes = {physical_warehouse_key(scope) for scope in factual_warehouses}
+    factual_scope = min(factual_warehouses) if len(factual_physical_scopes) == 1 and factual_warehouses else ""
     unknown_factual_provenance: list[Any] = []
 
     def retain_prior_receipt(placement: dict[str, Any]) -> bool:
         if set(map(str, placement.get("receipt_line_ids", []) or [])) & incoming_ids:
             return False
-        if not factual_scope:
+        if not factual_warehouses:
             return True
+        if not factual_scope:
+            return False
         prior_scope = normalize_warehouse(placement.get("source_warehouse"))
         if placement.get("source_authority") != "factual" or not prior_scope:
             unknown_factual_provenance.append(placement.get("placement_id"))
             return False
-        return prior_scope == factual_scope
+        return same_physical_warehouse(prior_scope, factual_scope)
 
     prior_receipts = [dict(p) for p in state.get("placements", [])
         if p.get("placement_mode") == "calculated"
+        and p.get("source") == "receipt"
         and retain_prior_receipt(p)]
     manual.extend(prior_receipts)
     all_items = factual + source_unplaced + receipts

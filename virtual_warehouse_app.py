@@ -154,7 +154,8 @@ from warehouse_outbound_orders import (
     scope_outbound_execution_view,
     summarize_outbound_orders,
 )
-from warehouse_business_identity import normalize_warehouse
+from warehouse_business_identity import normalize_warehouse, same_physical_warehouse
+from warehouse_placement_zones import get_placement_zone_label
 from warehouse_state_cache import (
     load_outbound_execution_log_cached,
     load_outbound_execution_state_cached,
@@ -267,7 +268,10 @@ def render_data_revisions(model: dict | object | None) -> None:
     st.caption(f"Причина: {change.get('reason') or '—'}")
     st.caption(f"Домены последней операции: {', '.join(change.get('domains', [])) or '—'}")
 
-WEIGHT_ZONE_LABELS = {"heavy": "Тяжёлое", "medium": "Среднее", "light": "Лёгкое", "fragile": "Хрупкое", "unassigned": "Не назначено"}
+WEIGHT_ZONE_LABELS = {
+    zone: get_placement_zone_label(zone)
+    for zone in ("heavy", "medium", "medium_light", "light", "fragile", "unassigned")
+}
 WEIGHT_ZONE_VALUES = list(WEIGHT_ZONE_LABELS)
 WEIGHT_ZONE_LABEL_TO_VALUE = {label: value for value, label in WEIGHT_ZONE_LABELS.items()}
 STORAGE_TYPE_LABELS = {"normal": "Обычная", "deep_lane": "Набивная"}
@@ -1024,13 +1028,50 @@ def _receipt_visible_medium_light_total(summary: dict[str, int]) -> int:
 
 
 def factual_outbound_binding_blockers(model: dict, selected_warehouse: object) -> list[dict]:
-    binding = normalize_warehouse(model.get("factual_warehouse_binding"))
     selected = normalize_warehouse(selected_warehouse)
-    if binding and binding == selected:
+    binding = normalize_warehouse(model.get("factual_warehouse_binding"))
+    if binding:
+        if same_physical_warehouse(binding, selected):
+            return []
+        return [{
+            "code": "mutable_placement_warehouse_binding_mismatch",
+            "binding": binding,
+            "selected_warehouse": selected or None,
+            "discovered_scopes": [binding],
+        }]
+
+    placement_state, _placement_warning = load_placement_state_cached(model)
+    discovered_scopes: list[str] = []
+    for placement in placement_state.get("placements", []):
+        source = placement.get("source")
+        is_factual = placement.get("source_authority") == "factual" or (
+            isinstance(source, str) and source.startswith("factual_")
+        )
+        if not is_factual:
+            continue
+        scope = normalize_warehouse(
+            placement.get("source_warehouse")
+            or placement.get("normalized_warehouse")
+            or placement.get("warehouse")
+        )
+        if scope and scope not in discovered_scopes:
+            discovered_scopes.append(scope)
+
+    if not discovered_scopes:
+        return [{
+            "code": "mutable_placement_warehouse_binding_required",
+            "binding": None,
+            "selected_warehouse": selected or None,
+            "discovered_scopes": [],
+        }]
+    if all(same_physical_warehouse(scope, selected) for scope in discovered_scopes):
         return []
-    return [{"code": "mutable_placement_warehouse_binding_required" if not binding
-        else "mutable_placement_warehouse_binding_mismatch", "binding": binding or None,
-        "selected_warehouse": selected or None}]
+    return [{
+        "code": "mutable_placement_warehouse_binding_mismatch",
+        "binding": None,
+        "selected_warehouse": selected or None,
+        "discovered_scopes": discovered_scopes,
+    }]
 
 
 def _zone_calculation_dataframe(receipts: list[dict]) -> pd.DataFrame:
