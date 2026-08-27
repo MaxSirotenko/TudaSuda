@@ -25,8 +25,8 @@ from warehouse_ui_messages import get_ui_message, render_ui_message
 from warehouse_workflow_ui_state import state_from_session
 from warehouse_factual_data import (
     SOURCE_LABELS, activate_dataset_version, active_datasets, build_data_contract_diagnostics, build_monthly_data_readiness,
-    cross_source_coverage, date_summary, import_excel_dataset, load_effective_placement, load_registry,
-    save_historical_cell_mapping,
+    cross_source_coverage, date_summary, detect_excel_dataset_source, import_excel_dataset, load_effective_placement,
+    load_registry, replace_excel_dataset, save_historical_cell_mapping,
 )
 from warehouse_perf_diagnostics import ENABLED as PERF_ENABLED, measure, snapshot
 
@@ -179,6 +179,22 @@ def build_data_source_cards(registry: Mapping[str, Any]) -> list[dict[str, Any]]
                       "cells": sum(int(x.get("cells", 0) or 0) for x in daily), "status": status,
                       "load_status": load_status, "warning_count": warnings, "error_count": errors})
     return cards
+
+
+def replacement_target_label(dataset: Mapping[str, Any]) -> str:
+    """Describe an active dataset clearly enough for an explicit replacement choice."""
+    filename = str(dataset.get("source_file_name") or "—")
+    parts = [filename]
+    if dataset.get("period_from") or dataset.get("period_to"):
+        parts.append(format_ui_period(dataset.get("period_from") or "—", dataset.get("period_to") or "—"))
+    elif dataset.get("index", {}).get("dates"):
+        dates = sorted(day for day in dataset.get("index", {}).get("dates", []) if day != "undated")
+        if dates:
+            parts.append(format_ui_period(dates[0], dates[-1]))
+    dataset_id = str(dataset.get("dataset_id") or "")
+    if dataset_id:
+        parts.append(dataset_id.removeprefix("dataset:")[:10])
+    return " · ".join(parts)
 
 
 def structured_warning(*, title: str, cause: str, impact: str,
@@ -611,6 +627,7 @@ def render_factual_data_layer(model: Mapping[str, Any] | None) -> None:
     files = st.file_uploader("Выберите один или несколько Excel-файлов", type=["xlsx", "xls"], accept_multiple_files=True, key="factual_data_uploads")
     if files and st.button("Добавить выбранные файлы", type="primary", key="factual_data_import"):
         progress_area = st.empty()
+        vgh_active_for_generic_import = bool(active_datasets(registry, "vgh"))
         for file_index, uploaded in enumerate(files, 1):
             def show_import_progress(event: Mapping[str, Any], *, _name=uploaded.name,
                                      _index=file_index, _total=len(files)) -> None:
@@ -624,12 +641,24 @@ def render_factual_data_layer(model: Mapping[str, Any] | None) -> None:
                     f"Прошло: {elapsed // 60:02d}:{elapsed % 60:02d} · Этап: {stage}".replace(",", " ")
                 )
             try:
-                result = import_excel_dataset(uploaded.getvalue(), uploaded.name,
+                payload = uploaded.getvalue()
+                detected = detect_excel_dataset_source(payload, uploaded.name)
+                if detected.get("source_type") == "vgh" and detected.get("status") == "detected" \
+                        and vgh_active_for_generic_import:
+                    render_ui_message({"severity": "warning", "title": "ВГХ уже загружен",
+                        "reason": "ВГХ уже загружен. Используйте “Заменить файл” в карточке ВГХ.",
+                        "impact": "Второй активный мастер-файл ВГХ не создан.",
+                        "action": "Откройте карточку ВГХ и замените текущий файл.", "target": "Загрузка данных"})
+                    continue
+                result = import_excel_dataset(payload, uploaded.name,
                                               progress_callback=show_import_progress)
             except (OSError, ValueError) as exc:
                 render_ui_message({"severity": "error", "title": "Файл не загружен", "reason": str(exc),
                     "impact": "Данные из этого файла не участвуют в расчётах.", "action": "Проверьте формат Excel и повторите загрузку.", "target": "Загрузка данных"})
             else:
+                st.session_state.pop("monthly_data_readiness", None)
+                if result.get("source_type") == "vgh" and result.get("active", True):
+                    vgh_active_for_generic_import = True
                 performance = result.get("diagnostics", {}).get("import_performance", {})
                 if performance:
                     st.success(f"Импортировано {int(performance.get('rows') or 0):,} строк за "
@@ -655,17 +684,33 @@ def render_factual_data_layer(model: Mapping[str, Any] | None) -> None:
             if card["sources"]:
                 with st.expander("Заменить текущий файл"):
                     replacement = st.file_uploader("Новый файл", type=["xlsx", "xls"], key=f"replace_{card['source_type']}")
+                    target_dataset_id = None
+                    if len(card["sources"]) == 1:
+                        target_dataset_id = str(card["sources"][0].get("dataset_id") or "")
+                    elif card["source_type"] == "vgh":
+                        st.warning("Найдено несколько активных файлов ВГХ. Это состояние возникло из-за старой логики замены. После успешной замены новый файл станет единственным активным ВГХ; старые версии сохранятся в истории.")
+                        target_dataset_id = str(card["sources"][0].get("dataset_id") or "")
+                    else:
+                        selected = st.selectbox("Какой файл заменить", card["sources"], index=None,
+                                                format_func=replacement_target_label,
+                                                key=f"replace_target_{card['source_type']}")
+                        if selected:
+                            target_dataset_id = str(selected.get("dataset_id") or "")
                     st.markdown(f"""**Текущий файл:** {card['file']}
 
 **Новый файл:** {getattr(replacement, 'name', 'не выбран')}
 
 **Что произойдёт:** новый файл станет использоваться в расчётах. Предыдущая версия сохранится в истории.""")
-                    if replacement and st.button("Заменить файл", key=f"replace_confirm_{card['source_type']}"):
+                    if replacement and not target_dataset_id:
+                        st.info("Выберите, какой активный файл заменить.")
+                    if replacement and st.button("Заменить файл", key=f"replace_confirm_{card['source_type']}",
+                                                 disabled=not bool(target_dataset_id)):
                         try:
-                            result = import_excel_dataset(replacement.getvalue(), replacement.name)
-                        except (OSError, ValueError) as exc:
+                            result = replace_excel_dataset(replacement.getvalue(), replacement.name, target_dataset_id)
+                        except (OSError, ValueError, KeyError) as exc:
                             render_ui_message({"severity": "error", "title": "Не удалось заменить файл", "reason": str(exc), "impact": "Текущий файл продолжает использоваться.", "action": "Исправьте новый файл и повторите замену.", "target": "Загрузка данных"})
                         else:
+                            st.session_state.pop("monthly_data_readiness", None)
                             _render_import_result(result, replacement.name)
             else:
                 st.caption("Действие: добавьте файл через общий загрузчик выше.")

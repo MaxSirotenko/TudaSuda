@@ -4,7 +4,7 @@ from warehouse_workspace_ui import (
     WORKSPACE_TABS, SUPPORTED_RULES, UNSUPPORTED_RULES, RULE_CARDS, MONTHLY_ROUTE_REQUIRED_SOURCES,
     WORKSPACE_PENDING_SECTION_KEY, apply_pending_workspace_navigation,
     build_warehouse_zone_summary, build_workspace_rule_config, normalize_rule_selection,
-    build_data_source_cards, deep_lane_edit_issue, import_status_label,
+    build_data_source_cards, deep_lane_edit_issue, import_status_label, replacement_target_label,
     format_compact_number, format_monthly_readiness_blocker, format_monthly_readiness_check,
     format_ui_date, format_ui_period,
     monthly_readiness_blocker_details, monthly_readiness_message, status_card_html,
@@ -33,6 +33,72 @@ class _WorkspaceStreamlit:
     def button(self, *_args, **_kwargs):
         clicked, self.click = self.click, False
         return clicked
+
+
+class _UploadedFile:
+    def __init__(self, name="file.xlsx", payload=b"payload"):
+        self.name = name
+        self._payload = payload
+
+    def getvalue(self):
+        return self._payload
+
+
+class _ProgressSlot:
+    def __init__(self, ui):
+        self.ui = ui
+
+    def info(self, *args, **kwargs):
+        self.ui.infos.append(args)
+
+    def empty(self):
+        self.ui.empty_called = True
+
+
+class _FactualDataStreamlit:
+    def __init__(self, *, uploads=None, clicked=None, selectbox_values=None):
+        self.session_state = {}
+        self.uploads = uploads or {}
+        self.clicked = set(clicked or ())
+        self.selectbox_values = selectbox_values or {}
+        self.buttons = []
+        self.selectboxes = []
+        self.warnings = []
+        self.infos = []
+        self.successes = []
+        self.empty_called = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def subheader(self, *_args, **_kwargs): pass
+    def caption(self, *_args, **_kwargs): pass
+    def markdown(self, *_args, **_kwargs): pass
+    def write(self, *_args, **_kwargs): pass
+    def json(self, *_args, **_kwargs): pass
+    def success(self, *args, **_kwargs): self.successes.append(args)
+    def warning(self, *args, **_kwargs): self.warnings.append(args)
+    def info(self, *args, **_kwargs): self.infos.append(args)
+    def error(self, *args, **_kwargs): pass
+    def empty(self): return _ProgressSlot(self)
+    def container(self, *_args, **_kwargs): return self
+    def expander(self, *_args, **_kwargs): return self
+
+    def file_uploader(self, _label, **kwargs):
+        return self.uploads.get(kwargs.get("key"))
+
+    def button(self, label, **kwargs):
+        key = kwargs.get("key")
+        disabled = bool(kwargs.get("disabled"))
+        self.buttons.append({"label": label, "key": key, "disabled": disabled})
+        return False if disabled else key in self.clicked or label in self.clicked
+
+    def selectbox(self, label, options, **kwargs):
+        self.selectboxes.append({"label": label, "options": list(options), "kwargs": kwargs})
+        return self.selectbox_values.get(kwargs.get("key"))
 
 
 def test_only_selected_workspace_section_executes(monkeypatch):
@@ -168,6 +234,138 @@ def test_data_upload_cards_cover_five_sources_using_metadata_only():
     assert outbound["period"] == "01.07.2026 — 01.07.2026"
     assert outbound["dates"] == ["2026-07-01"]
     assert all(card["status"] == "⬜ Не загружено" for card in cards if card is not outbound)
+
+
+def test_ui_single_source_replacement_passes_active_dataset_id(monkeypatch):
+    registry = {"datasets": [{"active": True, "source_type": "outbound", "dataset_id": "target",
+        "source_file_name": "РО июль.xlsx", "rows": 1, "warnings": [], "errors": [],
+        "index": {"sku_keys": ["sku"], "dates": ["2026-07-15"], "daily": {"2026-07-15": {"rows": 1}}}}]}
+    fake = _FactualDataStreamlit(
+        uploads={"replace_outbound": _UploadedFile("РО новый.xlsx")},
+        clicked={"replace_confirm_outbound"},
+    )
+    calls = []
+    monkeypatch.setattr(workspace, "st", fake)
+    monkeypatch.setattr(workspace, "load_registry", lambda: registry)
+    monkeypatch.setattr(workspace, "replace_excel_dataset",
+                        lambda data, name, dataset_id: calls.append((data, name, dataset_id))
+                        or {"source_type": "outbound", "reused": False})
+
+    workspace.render_factual_data_layer(None)
+
+    assert calls == [(b"payload", "РО новый.xlsx", "target")]
+
+
+def test_ui_multi_source_non_vgh_requires_target_selection(monkeypatch):
+    registry = {"datasets": [
+        {"active": True, "source_type": "outbound", "dataset_id": "a", "source_file_name": "РО A.xlsx",
+         "rows": 1, "warnings": [], "errors": [], "index": {"dates": ["2026-07-15"], "daily": {}}},
+        {"active": True, "source_type": "outbound", "dataset_id": "b", "source_file_name": "РО B.xlsx",
+         "rows": 1, "warnings": [], "errors": [], "index": {"dates": ["2026-07-16"], "daily": {}}},
+    ]}
+    fake = _FactualDataStreamlit(
+        uploads={"replace_outbound": _UploadedFile("РО новый.xlsx")},
+        clicked={"replace_confirm_outbound"},
+    )
+    calls = []
+    monkeypatch.setattr(workspace, "st", fake)
+    monkeypatch.setattr(workspace, "load_registry", lambda: registry)
+    monkeypatch.setattr(workspace, "replace_excel_dataset",
+                        lambda *_args, **_kwargs: calls.append(_args) or {})
+
+    workspace.render_factual_data_layer(None)
+
+    assert fake.selectboxes and fake.selectboxes[0]["label"] == "Какой файл заменить"
+    assert any(button["key"] == "replace_confirm_outbound" and button["disabled"]
+               for button in fake.buttons)
+    assert calls == []
+
+
+def test_ui_multi_source_non_vgh_replaces_selected_target(monkeypatch):
+    sources = [
+        {"active": True, "source_type": "outbound", "dataset_id": "a", "source_file_name": "РО A.xlsx",
+         "rows": 1, "warnings": [], "errors": [], "index": {"dates": ["2026-07-15"], "daily": {}}},
+        {"active": True, "source_type": "outbound", "dataset_id": "b", "source_file_name": "РО B.xlsx",
+         "rows": 1, "warnings": [], "errors": [], "index": {"dates": ["2026-07-16"], "daily": {}}},
+    ]
+    fake = _FactualDataStreamlit(
+        uploads={"replace_outbound": _UploadedFile("РО новый.xlsx")},
+        clicked={"replace_confirm_outbound"},
+        selectbox_values={"replace_target_outbound": sources[1]},
+    )
+    calls = []
+    monkeypatch.setattr(workspace, "st", fake)
+    monkeypatch.setattr(workspace, "load_registry", lambda: {"datasets": sources})
+    monkeypatch.setattr(workspace, "replace_excel_dataset",
+                        lambda data, name, dataset_id: calls.append((data, name, dataset_id))
+                        or {"source_type": "outbound", "reused": False})
+
+    workspace.render_factual_data_layer(None)
+
+    assert replacement_target_label(sources[1]).startswith("РО B.xlsx")
+    assert calls == [(b"payload", "РО новый.xlsx", "b")]
+
+
+def test_ui_multi_source_vgh_warns_and_does_not_require_target_selection(monkeypatch):
+    registry = {"datasets": [
+        {"active": True, "source_type": "vgh", "dataset_id": "a", "source_file_name": "ВГХ A.xlsx",
+         "rows": 1, "warnings": [], "errors": [], "index": {"sku_keys": ["sku-a"], "dates": ["undated"], "daily": {}}},
+        {"active": True, "source_type": "vgh", "dataset_id": "b", "source_file_name": "ВГХ B.xlsx",
+         "rows": 1, "warnings": [], "errors": [], "index": {"sku_keys": ["sku-b"], "dates": ["undated"], "daily": {}}},
+    ]}
+    fake = _FactualDataStreamlit(
+        uploads={"replace_vgh": _UploadedFile("ВГХ новый.xlsx")},
+        clicked={"replace_confirm_vgh"},
+    )
+    calls = []
+    monkeypatch.setattr(workspace, "st", fake)
+    monkeypatch.setattr(workspace, "load_registry", lambda: registry)
+    monkeypatch.setattr(workspace, "replace_excel_dataset",
+                        lambda data, name, dataset_id: calls.append((data, name, dataset_id))
+                        or {"source_type": "vgh", "reused": False})
+
+    workspace.render_factual_data_layer(None)
+
+    assert not fake.selectboxes
+    assert any("несколько активных файлов ВГХ" in args[0] for args in fake.warnings)
+    assert calls == [(b"payload", "ВГХ новый.xlsx", "a")]
+
+
+def test_generic_upload_blocks_duplicate_vgh_only(monkeypatch):
+    registry = {"datasets": [{"active": True, "source_type": "vgh", "dataset_id": "vgh",
+        "source_file_name": "ВГХ.xlsx", "rows": 1, "warnings": [], "errors": [],
+        "index": {"sku_keys": ["sku"], "dates": ["undated"], "daily": {}}}]}
+    messages = []
+    imports = []
+    monkeypatch.setattr(workspace, "load_registry", lambda: registry)
+    monkeypatch.setattr(workspace, "render_ui_message", lambda message: messages.append(message))
+
+    duplicate_vgh = _FactualDataStreamlit(
+        uploads={"factual_data_uploads": [_UploadedFile("ВГХ новая.xlsx")]},
+        clicked={"factual_data_import"},
+    )
+    monkeypatch.setattr(workspace, "st", duplicate_vgh)
+    monkeypatch.setattr(workspace, "detect_excel_dataset_source",
+                        lambda *_args, **_kwargs: {"source_type": "vgh", "status": "detected"})
+    monkeypatch.setattr(workspace, "import_excel_dataset",
+                        lambda *_args, **_kwargs: imports.append(_args) or {})
+
+    workspace.render_factual_data_layer(None)
+
+    assert not imports
+    assert messages and "ВГХ уже загружен" in messages[0]["reason"]
+
+    outbound = _FactualDataStreamlit(
+        uploads={"factual_data_uploads": [_UploadedFile("РО.xlsx")]},
+        clicked={"factual_data_import"},
+    )
+    monkeypatch.setattr(workspace, "st", outbound)
+    monkeypatch.setattr(workspace, "detect_excel_dataset_source",
+                        lambda *_args, **_kwargs: {"source_type": "outbound", "status": "detected"})
+
+    workspace.render_factual_data_layer(None)
+
+    assert imports
 
 
 def test_ui_date_formatter_is_strict_safe_and_presentation_only():

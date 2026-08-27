@@ -8,7 +8,7 @@ import pytest
 
 from warehouse_factual_data import (
     activate_dataset_version, build_fact_route_readiness, build_monthly_data_readiness, import_excel_dataset,
-    load_effective_rows, load_registry, resolve_historical_cell,
+    load_effective_rows, load_registry, replace_excel_dataset, resolve_historical_cell,
     save_historical_cell_mapping, normalize_operational_day,
 )
 
@@ -224,6 +224,22 @@ def test_conflicting_vgh_warns_and_remains_non_authoritative(tmp_path):
     assert warning["source_type"] == "vgh" and warning["count"] == 1
     with pytest.raises(ValueError, match="conflicting_factual_business_key"):
         load_effective_rows("vgh", registry=registry, root=tmp_path)
+
+
+def test_vgh_replacement_removes_superseded_sources_from_effective_readiness(tmp_path):
+    model = _ready_route_inputs(tmp_path)
+    first = import_excel_dataset(_xlsx([_vgh(layers=1)]), "ВГХ первая.xlsx", root=tmp_path)
+    import_excel_dataset(_xlsx([_vgh(layers=2)]), "ВГХ вторая.xlsx", root=tmp_path)
+
+    replacement = replace_excel_dataset(_xlsx([_vgh(layers=3)]), "ВГХ.xlsx",
+                                        first["dataset_id"], root=tmp_path)
+    registry = load_registry(tmp_path)
+    view = load_effective_rows("vgh", registry=registry, root=tmp_path)
+    result = build_monthly_data_readiness(registry, model, "2026-07-01", "2026-07-31", root=tmp_path)
+
+    assert [row["dataset_id"] for row in view["rows"]] == [replacement["dataset_id"]]
+    assert result["vgh_ready"] is True
+    assert not [item for item in result["warnings"] if item.get("source_type") == "vgh"]
 
 
 def test_complete_vgh_has_no_vgh_warnings(tmp_path):
