@@ -348,6 +348,30 @@ def read_excel_source(data: bytes, sheet: str | None = None) -> tuple[str, pd.Da
     return selected, table.dropna(how="all")
 
 
+def detect_excel_dataset_source(data: bytes, filename: str, *, sheet: str | None = None) -> dict[str, Any]:
+    """Detect an Excel dataset family from headers without publishing it."""
+    suffix = Path(filename).suffix.casefold()
+    if suffix == ".xlsx":
+        from openpyxl import load_workbook
+
+        workbook = load_workbook(BytesIO(data), read_only=True, data_only=True)
+        try:
+            selected = sheet or workbook.sheetnames[0]
+            if selected not in workbook.sheetnames:
+                raise ValueError("sheet_not_found")
+            worksheet = workbook[selected]
+            headers = [str(value).strip() if value is not None else ""
+                       for value in next(worksheet.iter_rows(values_only=True), ())]
+        finally:
+            workbook.close()
+    else:
+        selected, table = read_excel_source(data, sheet)
+        headers = list(table.columns)
+    detection = detect_source_type(headers)
+    return {**detection, "sheet": selected,
+            "source_label": SOURCE_LABELS.get(detection["source_type"], SOURCE_LABELS[UNKNOWN_SOURCE])}
+
+
 def _canonical_record(raw: Mapping[str, Any], mapping: Mapping[str, str], provenance: Mapping[str, Any]) -> dict[str, Any]:
     def get(field: str) -> Any:
         return raw.get(mapping[field]) if field in mapping else None
@@ -1068,6 +1092,119 @@ def import_excel_dataset(data: bytes, filename: str, *, sheet: str | None = None
     if Path(filename).suffix.casefold() == ".xls" and len(data) > 20_000_000:
         result.setdefault("warnings", []).append("large_xls_uses_buffered_import")
     return result
+
+
+_IMPORT_RESULT_ONLY_KEYS = {"duplicate_filename", "reparsed_for_parser_upgrade", "reused", "reuse_state"}
+
+
+def _registry_dataset_from_import(result: Mapping[str, Any], root: Path) -> dict[str, Any]:
+    metadata = {key: value for key, value in result.items() if key not in _IMPORT_RESULT_ONLY_KEYS}
+    metadata["artifact"] = str(root / str(metadata["dataset_id"]).removeprefix("dataset:"))
+    metadata["active"] = True
+    metadata["superseded_by"] = None
+    return metadata
+
+
+def _publish_imported_artifact(result: Mapping[str, Any], root: Path) -> dict[str, Any]:
+    metadata = _registry_dataset_from_import(result, root)
+    source_artifact = Path(str(result["artifact"]))
+    target_artifact = Path(str(metadata["artifact"]))
+    moved = False
+    if not target_artifact.exists():
+        shutil.move(str(source_artifact), str(target_artifact))
+        moved = True
+    if moved:
+        _atomic_json(target_artifact / "metadata.json", metadata)
+    return metadata
+
+
+def _mark_overlapping_active_sources(registry: Mapping[str, Any], metadata: dict[str, Any]) -> None:
+    source_type = str(metadata.get("source_type") or "")
+    overlaps = []
+    for item in active_datasets(registry, source_type):
+        if item.get("dataset_id") == metadata.get("dataset_id"):
+            continue
+        dates = set(item.get("index", {}).get("dates", item.get("partitions", []))) \
+            & set(metadata.get("index", {}).get("dates", []))
+        keys = set(item.get("index", {}).get("document_keys", [])) \
+            & set(metadata.get("index", {}).get("document_keys", []))
+        if dates or keys:
+            overlaps.append({"dataset_id": item["dataset_id"], "dates": sorted(dates),
+                             "duplicate_document_keys": len(keys)})
+    if overlaps:
+        metadata.setdefault("diagnostics", {})["overlapping_active_sources"] = overlaps
+        warnings = metadata.setdefault("warnings", [])
+        if "overlapping_active_sources" not in warnings:
+            warnings.append("overlapping_active_sources")
+
+
+def replace_excel_dataset(data: bytes, filename: str, dataset_id: str, *, sheet: str | None = None,
+                          root: Path = DATA_ROOT, geometry_cells: Iterable[str] | None = None,
+                          reimport: bool = False, parser_version: str = PARSER_VERSION,
+                          progress_callback: ImportProgressCallback | None = None) -> dict[str, Any]:
+    """Replace one explicit dataset; VGH replacement deactivates the whole active VGH family."""
+    root.mkdir(parents=True, exist_ok=True)
+    initial_registry = load_registry(root)
+    initial_target = next((item for item in initial_registry["datasets"]
+                           if item.get("dataset_id") == dataset_id), None)
+    if initial_target is None:
+        raise ValueError("dataset_not_found")
+    target_source_type = initial_target.get("source_type")
+
+    with tempfile.TemporaryDirectory(dir=root, prefix=".replacement-import-") as staging_root_name:
+        staging_root = Path(staging_root_name)
+        parsed = import_excel_dataset(data, filename, sheet=sheet, root=staging_root,
+                                      geometry_cells=geometry_cells, reimport=reimport,
+                                      parser_version=parser_version,
+                                      progress_callback=progress_callback)
+        if parsed.get("source_type") == UNKNOWN_SOURCE or parsed.get("status") in {
+            "unknown_schema", "ambiguous_schema", "mapping_required",
+        }:
+            raise ValueError(str(parsed.get("status") or "replacement_source_not_detected"))
+        if parsed.get("source_type") != target_source_type:
+            raise ValueError("replacement_source_type_mismatch")
+        metadata = _publish_imported_artifact(parsed, root)
+
+    registry = load_registry(root)
+    target = next((item for item in registry["datasets"] if item.get("dataset_id") == dataset_id), None)
+    if target is None:
+        raise ValueError("dataset_not_found")
+    if target.get("source_type") != metadata.get("source_type"):
+        raise ValueError("replacement_source_type_mismatch")
+
+    new_dataset_id = str(metadata["dataset_id"])
+    replaced_ids: set[str] = set()
+    if metadata.get("source_type") == "vgh":
+        replaced_ids.update(str(item.get("dataset_id")) for item in active_datasets(registry, "vgh")
+                            if item.get("dataset_id") != new_dataset_id)
+        if dataset_id != new_dataset_id:
+            replaced_ids.add(dataset_id)
+    elif dataset_id != new_dataset_id:
+        replaced_ids.add(dataset_id)
+
+    replaced_logicals = {str(item.get("logical_source_id")) for item in registry["datasets"]
+                         if str(item.get("dataset_id")) in replaced_ids and item.get("logical_source_id")}
+    predecessor_id = dataset_id if dataset_id != new_dataset_id else target.get("supersedes")
+    metadata["supersedes"] = predecessor_id
+    metadata["superseded_by"] = None
+    metadata["active"] = True
+    metadata["replacement_scope"] = "vgh_family" if metadata.get("source_type") == "vgh" else "dataset"
+    metadata["replaced_dataset_ids"] = sorted(replaced_ids)
+
+    for item in registry["datasets"]:
+        if str(item.get("dataset_id")) in replaced_ids:
+            item["active"] = False
+            item["superseded_by"] = new_dataset_id
+    registry["datasets"] = [item for item in registry["datasets"] if item.get("dataset_id") != new_dataset_id] + [metadata]
+    _mark_overlapping_active_sources(registry, metadata)
+    registry["datasets"].sort(key=lambda item: (item.get("imported_at", ""), item["dataset_id"]))
+    registry["diagnostics"] = [item for item in registry.get("diagnostics", [])
+                               if not (item.get("code") == "registry_activation_review_required"
+                                       and item.get("logical_source_id") in replaced_logicals)]
+    registry["registry_version"] = max(int(registry.get("registry_version", 0) or 0), 3)
+    registry["readiness_invalidated_at"] = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+    _atomic_json(root / "registry.json", registry)
+    return {**metadata, "reused": False}
 
 
 def load_dataset_rows(dataset: Mapping[str, Any], day: str | None = None, *, raw: bool = False) -> list[dict[str, Any]]:

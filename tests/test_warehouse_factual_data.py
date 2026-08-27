@@ -13,7 +13,7 @@ import pytest
 from warehouse_factual_data import (
     AUTHORITATIVE_CONTRACTS, CONTRACT_ALIAS_STATUS, CONTRACTS, LEGACY_CONTRACT_ALIASES, PARSER_VERSION,
     build_data_contract_diagnostics, cross_source_coverage, date_summary, detect_source_type,
-    import_excel_dataset, load_dataset_rows, load_registry, positive_outbound,
+    import_excel_dataset, load_dataset_rows, load_registry, positive_outbound, replace_excel_dataset,
     normalize_source_datetime,
 )
 import warehouse_factual_data as factual
@@ -233,6 +233,11 @@ def _outbound(qty=1, day="2026-07-15"):
             "Номенклатура": "N", "Характеристика": "C", "РасчетноеОтгруженоКоробок": qty}
 
 
+def _vgh(name="N", characteristic="C", layers=1, weight=1):
+    return {"Номенклатура": name, "Характеристика": characteristic, "Вес": weight,
+            "КоличествоКоробовВОдномСлоеНаПаллете": 2, "КоличествоСлоевНаПаллете": layers}
+
+
 def test_lifecycle_parser_upgrade_multifile_and_renamed_duplicate(tmp_path):
     a = import_excel_dataset(_xlsx([_outbound(1)]), "РО июль.xlsx", root=tmp_path, parser_version="factual-july-v2")
     b = import_excel_dataset(_xlsx([_outbound(2)]), "РО июль.xlsx", root=tmp_path, parser_version="factual-july-v2")
@@ -252,6 +257,87 @@ def test_lifecycle_parser_upgrade_multifile_and_renamed_duplicate(tmp_path):
     assert upgraded["reparsed_for_parser_upgrade"] is True
     assert upgraded["parser_version"] == PARSER_VERSION
     assert len([x for x in registry["datasets"] if x["active"] and x["logical_source_id"] == upgraded["logical_source_id"]]) == 1
+
+
+def test_vgh_rename_replacement_supersedes_target_without_deleting_artifact(tmp_path):
+    first = import_excel_dataset(_xlsx([_vgh(layers=1)]), "паллеты финал .xlsx", root=tmp_path)
+
+    replacement = replace_excel_dataset(_xlsx([_vgh(layers=4)]), "ВГХ.xlsx", first["dataset_id"],
+                                        root=tmp_path)
+
+    registry = load_registry(tmp_path)
+    first_entry = next(item for item in registry["datasets"] if item["dataset_id"] == first["dataset_id"])
+    replacement_entry = next(item for item in registry["datasets"]
+                             if item["dataset_id"] == replacement["dataset_id"])
+    active_vgh = [item for item in registry["datasets"] if item.get("active") and item["source_type"] == "vgh"]
+    assert active_vgh == [replacement_entry]
+    assert first_entry["active"] is False
+    assert first_entry["superseded_by"] == replacement["dataset_id"]
+    assert replacement_entry["active"] is True
+    assert replacement_entry["supersedes"] == first["dataset_id"]
+    assert Path(first["artifact"]).exists()
+
+
+def test_vgh_family_replacement_cleans_broken_multiple_active_state(tmp_path):
+    first = import_excel_dataset(_xlsx([_vgh(name="A", layers=1)]), "паллеты финал .xlsx", root=tmp_path)
+    second = import_excel_dataset(_xlsx([_vgh(name="B", layers=2)]), "ВГХ старая.xlsx", root=tmp_path)
+    assert len([item for item in load_registry(tmp_path)["datasets"]
+                if item.get("active") and item["source_type"] == "vgh"]) == 2
+
+    replacement = replace_excel_dataset(_xlsx([_vgh(name="C", layers=3)]), "ВГХ.xlsx",
+                                        first["dataset_id"], root=tmp_path)
+
+    registry = load_registry(tmp_path)
+    active_vgh = [item for item in registry["datasets"] if item.get("active") and item["source_type"] == "vgh"]
+    assert [item["dataset_id"] for item in active_vgh] == [replacement["dataset_id"]]
+    for old in (first, second):
+        entry = next(item for item in registry["datasets"] if item["dataset_id"] == old["dataset_id"])
+        assert entry["active"] is False
+        assert entry["superseded_by"] == replacement["dataset_id"]
+        assert Path(entry["artifact"]).exists()
+    view = factual.load_effective_rows("vgh", registry=registry, root=tmp_path)
+    assert [row["nomenclature"] for row in view["rows"]] == ["c"]
+
+
+def test_failed_replacement_leaves_registry_and_active_target_unchanged(tmp_path):
+    current = import_excel_dataset(_xlsx([_vgh(layers=1)]), "ВГХ.xlsx", root=tmp_path)
+    before = load_registry(tmp_path)
+
+    with pytest.raises(ValueError, match="replacement_source_type_mismatch"):
+        replace_excel_dataset(_xlsx([_outbound()]), "РО.xlsx", current["dataset_id"], root=tmp_path)
+
+    after = load_registry(tmp_path)
+    assert after == before
+    assert next(item for item in after["datasets"] if item["dataset_id"] == current["dataset_id"])["active"]
+    assert len(after["datasets"]) == 1
+    assert not list(tmp_path.glob(".replacement-import-*"))
+
+
+def test_outbound_generic_import_keeps_multifile_semantics(tmp_path):
+    first = import_excel_dataset(_xlsx([{**_outbound(1), "СсылкаРО": "ref-a"}]), "РО июль.xlsx", root=tmp_path)
+    second = import_excel_dataset(_xlsx([{**_outbound(2), "СсылкаРО": "ref-b"}]), "РО продолжение.xlsx", root=tmp_path)
+
+    active_outbound = [item for item in load_registry(tmp_path)["datasets"]
+                       if item.get("active") and item["source_type"] == "outbound"]
+    assert {item["dataset_id"] for item in active_outbound} == {first["dataset_id"], second["dataset_id"]}
+
+
+def test_explicit_outbound_replacement_only_replaces_selected_dataset(tmp_path):
+    first = import_excel_dataset(_xlsx([{**_outbound(1), "СсылкаРО": "ref-a"}]), "РО июль.xlsx", root=tmp_path)
+    second = import_excel_dataset(_xlsx([{**_outbound(2), "СсылкаРО": "ref-b"}]), "РО продолжение.xlsx", root=tmp_path)
+
+    replacement = replace_excel_dataset(_xlsx([{**_outbound(3), "СсылкаРО": "ref-c"}]), "РО исправленный.xlsx",
+                                        first["dataset_id"], root=tmp_path)
+
+    registry = load_registry(tmp_path)
+    first_entry = next(item for item in registry["datasets"] if item["dataset_id"] == first["dataset_id"])
+    second_entry = next(item for item in registry["datasets"] if item["dataset_id"] == second["dataset_id"])
+    replacement_entry = next(item for item in registry["datasets"] if item["dataset_id"] == replacement["dataset_id"])
+    assert first_entry["active"] is False
+    assert first_entry["superseded_by"] == replacement["dataset_id"]
+    assert replacement_entry["active"] is True
+    assert replacement_entry["supersedes"] == first["dataset_id"]
+    assert second_entry["active"] is True
 
 
 def test_duplicate_hash_precedes_parse_and_indexes_avoid_full_load(tmp_path, monkeypatch):
@@ -449,7 +535,7 @@ def test_business_evidence_index_upgrade_is_persisted_and_versioned(tmp_path, mo
     original = factual._iter_jsonl
 
     def counted(path):
-        if "/canonical/" in str(path):
+        if "canonical" in Path(path).parts:
             calls.append(str(path))
         yield from original(path)
 
@@ -505,7 +591,7 @@ def test_concurrent_evidence_index_first_access_is_serialized(tmp_path, monkeypa
     dataset = registry["datasets"][0]; calls = []
     original = factual._iter_jsonl
     def slow(path):
-        if "/canonical/" in str(path): calls.append(str(path)); time.sleep(.02)
+        if "canonical" in Path(path).parts: calls.append(str(path)); time.sleep(.02)
         yield from original(path)
     monkeypatch.setattr(factual, "_iter_jsonl", slow)
     with ThreadPoolExecutor(max_workers=2) as pool:
